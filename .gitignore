@@ -207,4 +207,4 @@ run_human_examine.sh
 quick_start.py
 *.log
 *.out
-# evaluation_examples/settings
+evaluation_examples/settings
