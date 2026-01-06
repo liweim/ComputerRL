@@ -11,7 +11,11 @@ def create_vm_manager_and_provider(provider_name: str, region: str, use_proxy: b
         use_proxy (bool): Whether to use proxy-enabled providers (currently only supported for AWS)
     """
     provider_name = provider_name.lower().strip()
-    if provider_name in ["aws", "amazon web services"]:
+    if provider_name == "vmware":
+        from desktop_env.providers.vmware.manager import VMwareVMManager
+        from desktop_env.providers.vmware.provider import VMwareProvider
+        return VMwareVMManager(), VMwareProvider(region)
+    elif provider_name in ["aws", "amazon web services"]:
         from desktop_env.providers.aws.manager import AWSVMManager
         from desktop_env.providers.aws.provider import AWSProvider
         return AWSVMManager(), AWSProvider(region)
