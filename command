@@ -29,12 +29,13 @@ sudo usermod -aG docker $USER
 newgrp docker
 
 # 运行
-export OPENAI_BASE_URL="http://localhost:30000/v1"
-export OPENAI_API_KEY="EMPTY"
+# export OPENAI_BASE_URL="http://localhost:30000/v1"
+# export OPENAI_API_KEY="EMPTY"
 conda activate spider2v
 python run_autoglm_v.py \
     --provider_name docker \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+    --result_dir results/autoglm-os_baseline \
     --headless \
     --max_steps 15 \
     --test_all_meta_path ./evaluation_examples/test_one.json

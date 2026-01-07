@@ -14,15 +14,15 @@ import time
 import backoff
 import httpx
 import requests
-from openai import APIConnectionError, APIError, RateLimitError
 from requests.exceptions import SSLError
 from tqdm import tqdm
+from json_repair import repair_json
 
 import lib_run_single
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
 from typing import Optional, Dict, Any
-from openai import OpenAI
+from utils import summary
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
 
@@ -36,12 +36,10 @@ os.makedirs("logs", exist_ok=True)
 file_handler = logging.FileHandler(os.path.join("logs", "normal-{:}.log".format(datetime_str)), encoding="utf-8")
 debug_handler = logging.FileHandler(os.path.join("logs", "debug-{:}.log".format(datetime_str)), encoding="utf-8")
 stdout_handler = logging.StreamHandler(sys.stdout)
-sdebug_handler = logging.FileHandler(os.path.join("logs", "sdebug-{:}.log".format(datetime_str)), encoding="utf-8")
 
 file_handler.setLevel(logging.INFO)
 debug_handler.setLevel(logging.DEBUG)
 stdout_handler.setLevel(logging.INFO)
-sdebug_handler.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter(
     fmt="\x1b[1;33m[%(asctime)s \x1b[31m%(levelname)s \x1b[32m%(module)s/%(lineno)d-%(processName)s\x1b[1;33m] \x1b[0m%(message)s"
@@ -49,15 +47,12 @@ formatter = logging.Formatter(
 file_handler.setFormatter(formatter)
 debug_handler.setFormatter(formatter)
 stdout_handler.setFormatter(formatter)
-sdebug_handler.setFormatter(formatter)
 
 stdout_handler.addFilter(logging.Filter("desktopenv"))
-sdebug_handler.addFilter(logging.Filter("desktopenv"))
 
 logger.addHandler(file_handler)
 logger.addHandler(debug_handler)
 logger.addHandler(stdout_handler)
-logger.addHandler(sdebug_handler)
 #  }}} Logger Configs #
 
 logger = logging.getLogger("desktopenv.experiment")
@@ -114,6 +109,11 @@ def config() -> argparse.Namespace:
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
+    
+    # rerun related
+    parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
+    parser.add_argument("--rerun_fail", action="store_true", help="Rerun only failed tasks (score == 0)")
+    
     args = parser.parse_args()
 
     return args
@@ -394,11 +394,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}"
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
         }
         
         # Get API base URL from environment or use default
-        base_url = os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+        base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
         url = f"{base_url}/chat/completions"
         
         response = requests.post(
@@ -411,8 +411,66 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         
         result = response.json()
         logger.info("LLM called successfully.")
-        return result['choices'][0]['message']['content']
+        
+        # Return both content and usage information
+        content = result['choices'][0]['message']['content']
+        
+        usage = result.get('usage', {})
+        
+        return {
+            'content': content,
+            'usage': {
+                'prompt_tokens': usage.get('prompt_tokens', 0),
+                'completion_tokens': usage.get('completion_tokens', 0),
+                'total_tokens': usage.get('total_tokens', 0)
+            }
+        }
 
+    # Create a wrapper to track token usage and image count
+    class TokenTracker:
+        def __init__(self):
+            self.total_prompt_tokens = 0
+            self.total_completion_tokens = 0
+            self.total_tokens = 0
+            self.total_image_count = 0
+            self.last_usage = {}
+        
+        def __call__(self, messages):
+            result = call_llm(messages)
+            
+            # Count images in the messages
+            image_count = 0
+            for msg in messages:
+                if isinstance(msg.get('content'), list):
+                    for item in msg['content']:
+                        if item.get('type') in ['image_url', 'input_image']:
+                            image_count += 1
+            
+            # Store usage info with image count
+            self.last_usage = {
+                **result['usage'],
+                'image_count': image_count
+            }
+            self.total_prompt_tokens += result['usage']['prompt_tokens']
+            self.total_completion_tokens += result['usage']['completion_tokens']
+            self.total_tokens += result['usage']['total_tokens']
+            self.total_image_count += image_count
+            
+            # Return only content for compatibility with AutoGLMAgent
+            return result['content']
+        
+        def get_last_usage(self):
+            return self.last_usage
+        
+        def reset(self):
+            self.total_prompt_tokens = 0
+            self.total_completion_tokens = 0
+            self.total_tokens = 0
+            self.total_image_count = 0
+            self.last_usage = {}
+    
+    token_tracker = TokenTracker()
+    
     env = DesktopEnv(
         provider_name=args.provider_name,
         region=args.region,
@@ -431,8 +489,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         image_size=(args.image_width, args.image_height),
         max_trajectory_length=args.max_trajectory_length,
         client_password=args.client_password,
-        gen_func=call_llm,
+        gen_func=token_tracker,
     )
+    
+    # Attach token_tracker to agent for access in run_single_example_autoglm
+    agent.token_tracker = token_tracker
 
     for domain in tqdm(test_all_meta, desc="Domain"):
         for example_id in tqdm(test_all_meta[domain], desc="Example", leave=False):
@@ -481,13 +542,34 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
                     f.write("\n")
 
     env.close()
-    logger.info(f"Average score: {sum(scores) / len(scores)}")
+    if len(scores) > 0:
+        logger.info(f"Average score: {sum(scores) / len(scores)}")
+    else:
+        logger.info("No tasks completed")
 
 
-def get_unfinished(action_space, use_model, observation_type, result_dir, total_file_json):
+def get_unfinished(action_space, use_model, observation_type, result_dir, total_file_json, rerun=False, rerun_fail=False):
+    """Get unfinished tasks."""
     target_dir = os.path.join(result_dir, action_space, observation_type, use_model)
-
+    
     if not os.path.exists(target_dir):
+        return total_file_json
+
+    # If rerun is True, return all tasks (ignore existing results)
+    if rerun:
+        # Clear all existing results
+        for domain in os.listdir(target_dir):
+            domain_path = os.path.join(target_dir, domain)
+            if os.path.isdir(domain_path):
+                for example_id in os.listdir(domain_path):
+                    if example_id == "onboard":
+                        continue
+                    example_path = os.path.join(domain_path, example_id)
+                    if os.path.isdir(example_path):
+                        # Remove all files in the example directory
+                        import shutil
+                        shutil.rmtree(example_path)
+                        os.makedirs(example_path, exist_ok=True)
         return total_file_json
 
     finished = {}
@@ -500,11 +582,30 @@ def get_unfinished(action_space, use_model, observation_type, result_dir, total_
                     continue
                 example_path = os.path.join(domain_path, example_id)
                 if os.path.isdir(example_path):
+                    result_file = os.path.join(example_path, "result.txt")
                     if "result.txt" not in os.listdir(example_path):
                         # empty all files under example_id
-                        for file in os.listdir(example_path):
-                            os.remove(os.path.join(example_path, file))
+                        import shutil
+                        shutil.rmtree(example_path)
+                        os.makedirs(example_path, exist_ok=True)
                     else:
+                        # Check if we should rerun failed tasks
+                        if rerun_fail:
+                            try:
+                                with open(result_file, "r") as f:
+                                    score = float(f.read().strip())
+                                if score == 0.0:
+                                    # Failed task, clear it and don't mark as finished
+                                    import shutil
+                                    shutil.rmtree(example_path)
+                                    os.makedirs(example_path, exist_ok=True)
+                                    continue
+                            except Exception:
+                                # Error reading result, clear it
+                                import shutil
+                                shutil.rmtree(example_path)
+                                os.makedirs(example_path, exist_ok=True)
+                                continue
                         finished[domain].append(example_id)
 
     if not finished:
@@ -518,6 +619,7 @@ def get_unfinished(action_space, use_model, observation_type, result_dir, total_
 
 
 def get_result(action_space, use_model, observation_type, result_dir, total_file_json):
+    """Get results."""
     target_dir = os.path.join(result_dir, action_space, observation_type, use_model)
     if not os.path.exists(target_dir):
         print("New experiment, no result yet.")
@@ -588,6 +690,8 @@ if __name__ == "__main__":
         args.observation_type,
         args.result_dir,
         test_all_meta,
+        rerun=args.rerun,
+        rerun_fail=args.rerun_fail,
     )
     left_info = ""
     for domain in test_file_list:
@@ -602,3 +706,13 @@ if __name__ == "__main__":
         test_all_meta,
     )
     test(args, test_file_list)
+    
+    # Call summary() from utils.py after all tasks are completed
+    result_dir = os.path.join(
+        args.result_dir,
+        args.action_space,
+        args.observation_type,
+        args.model,
+    )
+    logger.info("Generating summary...")
+    summary(result_dir, test_all_meta)

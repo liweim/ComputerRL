@@ -190,6 +190,11 @@ class AutoGLMAgent:
         try:
             actions = parse_code_from_string(response)
             action = actions[0]
+            
+            action = re.sub(r'^python\s*(\\+n|\n)+', '', action, flags=re.IGNORECASE)
+            action = re.sub(r'^(\\+n|\n)+', '', action)
+            action = re.sub(r'(\\+n|\n)+$', '', action)
+            
             logger.info(f"The pesudo action is {action}")
 
             if "Agent." in action:
