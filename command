@@ -37,5 +37,8 @@ python run_autoglm_v.py \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
     --result_dir results/autoglm-os_baseline \
     --headless \
-    --max_steps 15 \
-    --test_all_meta_path ./evaluation_examples/test_one.json
+    --max_steps 100 \
+    --test_all_meta_path ./evaluation_examples/test_all.json
+
+# 杀进程
+pkill -f run_autoglm_v.py

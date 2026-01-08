@@ -22,41 +22,10 @@ import lib_run_single
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
 from typing import Optional, Dict, Any
-from utils import summary
+from utils import summary, setup_logger
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
-
-#  Logger Configs {{{ #
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-
-datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
-
-os.makedirs("logs", exist_ok=True)
-file_handler = logging.FileHandler(os.path.join("logs", "normal-{:}.log".format(datetime_str)), encoding="utf-8")
-debug_handler = logging.FileHandler(os.path.join("logs", "debug-{:}.log".format(datetime_str)), encoding="utf-8")
-stdout_handler = logging.StreamHandler(sys.stdout)
-
-file_handler.setLevel(logging.INFO)
-debug_handler.setLevel(logging.DEBUG)
-stdout_handler.setLevel(logging.INFO)
-
-formatter = logging.Formatter(
-    fmt="\x1b[1;33m[%(asctime)s \x1b[31m%(levelname)s \x1b[32m%(module)s/%(lineno)d-%(processName)s\x1b[1;33m] \x1b[0m%(message)s"
-)
-file_handler.setFormatter(formatter)
-debug_handler.setFormatter(formatter)
-stdout_handler.setFormatter(formatter)
-
-stdout_handler.addFilter(logging.Filter("desktopenv"))
-
-logger.addHandler(file_handler)
-logger.addHandler(debug_handler)
-logger.addHandler(stdout_handler)
-#  }}} Logger Configs #
-
-logger = logging.getLogger("desktopenv.experiment")
-
+logger = None  # Will be initialized in main
 
 def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
@@ -89,8 +58,9 @@ def config() -> argparse.Namespace:
     # lm config
     parser.add_argument("--model", type=str, default="autoglm-os")
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--top_p", type=float, default=0.1)
-    parser.add_argument("--max_tokens", type=int, default=2048)
+    parser.add_argument("--top_p", type=float, default=0.1) # default=0.9
+    parser.add_argument("--max_tokens", type=int, default=256)
+    parser.add_argument("--repetition_penalty", type=float, default=1.1) # default=1
     parser.add_argument("--stop_token", type=str, default=None)
     parser.add_argument("--image_width", type=int, default=1280)
     parser.add_argument("--image_height", type=int, default=720)
@@ -109,6 +79,7 @@ def config() -> argparse.Namespace:
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
+    parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
     
     # rerun related
     parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
@@ -373,6 +344,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
         "stop_token": args.stop_token,
+        "repetition_penalty": args.repetition_penalty,
         "result_dir": args.result_dir,
     }
 
@@ -386,6 +358,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
+            "repetition_penalty": args.repetition_penalty,
             "skip_special_tokens": False,
             "stream": False,
             "include_stop_str_in_output": True,
@@ -513,9 +486,6 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
             example_result_dir = os.path.join(
                 args.result_dir,
-                args.action_space,
-                args.observation_type,
-                args.model,
                 domain,
                 example_id,
             )
@@ -548,9 +518,8 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         logger.info("No tasks completed")
 
 
-def get_unfinished(action_space, use_model, observation_type, result_dir, total_file_json, rerun=False, rerun_fail=False):
+def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
     """Get unfinished tasks."""
-    target_dir = os.path.join(result_dir, action_space, observation_type, use_model)
     
     if not os.path.exists(target_dir):
         return total_file_json
@@ -618,9 +587,8 @@ def get_unfinished(action_space, use_model, observation_type, result_dir, total_
     return total_file_json
 
 
-def get_result(action_space, use_model, observation_type, result_dir, total_file_json):
+def get_result(target_dir):
     """Get results."""
-    target_dir = os.path.join(result_dir, action_space, observation_type, use_model)
     if not os.path.exists(target_dir):
         print("New experiment, no result yet.")
         return None
@@ -658,6 +626,10 @@ if __name__ == "__main__":
     ####### The complete version of the list of examples #######
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = config()
+    
+    # Initialize logger after args are parsed
+    result_name = os.path.basename(args.result_dir)
+    logger = setup_logger(result_name, args.log_level)
     if args.client_password == "":
         if args.provider_name == "aws":
             args.client_password = "osworld-public-evaluation"
@@ -669,9 +641,6 @@ if __name__ == "__main__":
     # save args to json in result_dir/action_space/observation_type/model/args.json
     path_to_args = os.path.join(
         args.result_dir,
-        args.action_space,
-        args.observation_type,
-        args.model,
         "args.json",
     )
     os.makedirs(os.path.dirname(path_to_args), exist_ok=True)
@@ -685,9 +654,6 @@ if __name__ == "__main__":
         test_all_meta = {args.domain: test_all_meta[args.domain]}
 
     test_file_list = get_unfinished(
-        args.action_space,
-        args.model,
-        args.observation_type,
         args.result_dir,
         test_all_meta,
         rerun=args.rerun,
@@ -698,21 +664,9 @@ if __name__ == "__main__":
         left_info += f"{domain}: {len(test_file_list[domain])}\n"
     logger.info(f"Left tasks:\n{left_info}")
 
-    get_result(
-        args.action_space,
-        args.model,
-        args.observation_type,
-        args.result_dir,
-        test_all_meta,
-    )
+    get_result(args.result_dir)
     test(args, test_file_list)
     
     # Call summary() from utils.py after all tasks are completed
-    result_dir = os.path.join(
-        args.result_dir,
-        args.action_space,
-        args.observation_type,
-        args.model,
-    )
     logger.info("Generating summary...")
-    summary(result_dir, test_all_meta)
+    summary(args.result_dir, test_all_meta)

@@ -208,3 +208,4 @@ quick_start.py
 *.log
 *.out
 evaluation_examples/settings
+tmp*

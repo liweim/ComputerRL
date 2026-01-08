@@ -1,6 +1,52 @@
 import os
 import json
 import numpy as np
+import datetime
+import logging
+import sys
+
+def setup_logger(result_name, log_level):
+    datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+
+    logger = logging.getLogger()
+
+    log_level = getattr(logging, log_level.upper())
+    logger.setLevel(log_level)
+
+    datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+
+    log_folder = f"logs/{result_name}"
+    os.makedirs(log_folder, exist_ok=True)
+    error_handler = logging.FileHandler(
+        os.path.join(log_folder, "error-{:}.log".format(datetime_str)),
+        encoding="utf-8",
+    )
+    debug_handler = logging.FileHandler(
+        os.path.join(log_folder, "debug-{:}.log".format(datetime_str)),
+        encoding="utf-8",
+    )
+    stdout_handler = logging.StreamHandler(sys.stdout)
+
+    error_handler.setLevel(logging.ERROR)
+    debug_handler.setLevel(logging.DEBUG)
+    stdout_handler.setLevel(log_level)
+
+    formatter = logging.Formatter(
+        fmt="\x1b[1;33m[%(asctime)s \x1b[31m%(levelname)s \x1b[32m%(module)s/%(lineno)d-%(processName)s\x1b[1;33m] \x1b[0m%(message)s"
+    )
+    error_handler.setFormatter(formatter)
+    debug_handler.setFormatter(formatter)
+    stdout_handler.setFormatter(formatter)
+
+    stdout_handler.addFilter(logging.Filter("desktopenv"))
+
+    logger.addHandler(error_handler)
+    logger.addHandler(debug_handler)
+    logger.addHandler(stdout_handler)
+
+    logger = logging.getLogger("desktopenv")
+    return logger
+
 
 def summary(result_dir, test_all_meta):
     """
@@ -87,6 +133,7 @@ def summary(result_dir, test_all_meta):
             # Logic reaches here only if err_reason.txt does not exist.
             
             if os.path.exists(execution_log_file):
+                print(f"execution_log_file: {execution_log_file}")
                 with open(execution_log_file, "r", encoding="utf-8") as f:
                     execution_log = json.load(f)
                     execution_stats = execution_log.get("statistics", {})
@@ -240,4 +287,4 @@ def summary(result_dir, test_all_meta):
     return detailed_stats
 
 if __name__ == "__main__":
-    summary('/data1/lwm/projects/ComputerRL/results/autoglm_computer_use/a11y_tree/autoglm-os', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
