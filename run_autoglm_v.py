@@ -16,13 +16,51 @@ import httpx
 import requests
 from requests.exceptions import SSLError
 from tqdm import tqdm
-from json_repair import repair_json
+import shutil
 
 import lib_run_single
+import docker
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
 from typing import Optional, Dict, Any
 from utils import summary, setup_logger
+
+
+def cleanup_osworld_containers(remove_running=False):
+    """Clean up osworld docker containers before starting.
+    
+    Args:
+        remove_running: If True, also stop and remove running containers.
+                       If False (default), only remove exited containers.
+    """
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=True, filters={"ancestor": "happysixd/osworld-docker"})
+        if containers:
+            removed_count = 0
+            skipped_count = 0
+            for container in containers:
+                try:
+                    if container.status == "running":
+                        if remove_running:
+                            container.stop(timeout=5)
+                            container.remove(force=True)
+                            print(f"  Stopped and removed running container: {container.name}")
+                            removed_count += 1
+                        else:
+                            skipped_count += 1
+                    else:
+                        # Remove exited/stopped containers
+                        container.remove(force=True)
+                        print(f"  Removed exited container: {container.name}")
+                        removed_count += 1
+                except Exception as e:
+                    print(f"  Failed to remove container {container.name}: {e}")
+            print(f"Cleanup completed. Removed: {removed_count}, Skipped (running): {skipped_count}")
+        else:
+            print("No existing osworld containers found.")
+    except Exception as e:
+        print(f"Warning: Failed to cleanup containers: {e}")
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
 logger = None  # Will be initialized in main
@@ -57,10 +95,10 @@ def config() -> argparse.Namespace:
 
     # lm config
     parser.add_argument("--model", type=str, default="autoglm-os")
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--top_p", type=float, default=0.1) # default=0.9
-    parser.add_argument("--max_tokens", type=int, default=256)
-    parser.add_argument("--repetition_penalty", type=float, default=1.1) # default=1
+    parser.add_argument("--temperature", type=float, default=0.2) # original: 0.2
+    parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
+    parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
+    parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
     parser.add_argument("--stop_token", type=str, default=None)
     parser.add_argument("--image_width", type=int, default=1280)
     parser.add_argument("--image_height", type=int, default=720)
@@ -101,7 +139,7 @@ class DesktopEnv(DesktopEnvBase):
         reward = 0  # todo: Define reward calculation for each example
         done = False  # todo: Define episode termination condition for each example
         info = {}
-        logger.info(f"Step {self._step_no} in trajectory {self._traj_no} with action: {action}")
+        logger.info(f"[Step] {self._step_no} in trajectory {self._traj_no} with action: {action}")
 
         # handle the special actions
         if action in ['WAIT', 'FAIL', 'DONE']:
@@ -536,7 +574,6 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                     example_path = os.path.join(domain_path, example_id)
                     if os.path.isdir(example_path):
                         # Remove all files in the example directory
-                        import shutil
                         shutil.rmtree(example_path)
                         os.makedirs(example_path, exist_ok=True)
         return total_file_json
@@ -553,8 +590,8 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                 if os.path.isdir(example_path):
                     result_file = os.path.join(example_path, "result.txt")
                     if "result.txt" not in os.listdir(example_path):
-                        # empty all files under example_id
-                        import shutil
+                        # Task incomplete (no result.txt), clear and re-run
+                        print(f"[Cleanup] Removing incomplete task directory: {example_path}")
                         shutil.rmtree(example_path)
                         os.makedirs(example_path, exist_ok=True)
                     else:
@@ -564,17 +601,14 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                                 with open(result_file, "r") as f:
                                     score = float(f.read().strip())
                                 if score == 0.0:
-                                    # Failed task, clear it and don't mark as finished
-                                    import shutil
+                                    # Failed task, clear and re-run
+                                    print(f"[Cleanup] Removing failed task (score=0) directory: {example_path}")
                                     shutil.rmtree(example_path)
                                     os.makedirs(example_path, exist_ok=True)
                                     continue
-                            except Exception:
-                                # Error reading result, clear it
-                                import shutil
-                                shutil.rmtree(example_path)
-                                os.makedirs(example_path, exist_ok=True)
-                                continue
+                            except Exception as e:
+                                # Error reading result, report and exit instead of silently deleting
+                                raise RuntimeError(f"Error reading result file {result_file}: {e}. Please check the file manually.")
                         finished[domain].append(example_id)
 
     if not finished:
@@ -626,6 +660,10 @@ if __name__ == "__main__":
     ####### The complete version of the list of examples #######
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = config()
+    
+    # Clean up existing osworld containers before starting (docker only)
+    if args.provider_name == "docker":
+        cleanup_osworld_containers()
     
     # Initialize logger after args are parsed
     result_name = os.path.basename(args.result_dir)

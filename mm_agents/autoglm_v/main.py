@@ -14,6 +14,16 @@ logger = logging.getLogger("desktopenv.agent")
 
 pure_text_settings = ["a11y_tree"]
 
+# Prompt template for fixing parsing errors
+FIX_RESPONSE_PROMPT = """Your previous response could not be parsed correctly. Please fix the format issue and try again.
+
+Error message: {error_message}
+
+Your previous response:
+{response}
+
+Please provide a corrected response with proper format."""
+
 def resize_image(image, w, h):
     img = Image.open(BytesIO(image))
     # resize to max_pixel_num max_pixels
@@ -74,6 +84,7 @@ class AutoGLMAgent:
         client_password="password",
         gen_func=None,
         tool_in_sys_msg: bool = True,
+        max_parse_retries: int = 3,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -90,6 +101,9 @@ class AutoGLMAgent:
         self.client_password = client_password
         self.gen_func = gen_func
         self.tool_in_sys_msg = tool_in_sys_msg
+        self.max_parse_retries = max_parse_retries
+        self.last_error_feedback = None
+        self.last_parse_error = None
 
         self.tool_list = {
             "libreoffice_calc": "CalcTools",
@@ -187,6 +201,7 @@ class AutoGLMAgent:
         return messages
 
     def execute(self, response, obs):
+        self.last_parse_error = None  # Reset error before each attempt
         try:
             actions = parse_code_from_string(response)
             action = actions[0]
@@ -194,6 +209,15 @@ class AutoGLMAgent:
             action = re.sub(r'^python\s*(\\+n|\n)+', '', action, flags=re.IGNORECASE)
             action = re.sub(r'^(\\+n|\n)+', '', action)
             action = re.sub(r'(\\+n|\n)+$', '', action)
+
+            # Fix text parameter with escaped quotes (e.g. text=\'I\'m happy\')
+            match = re.search(r"text=\\'(.*)\\'(?=[,)])", action)
+            if match:
+                content = match.group(1).replace("\\'", "'")
+                action = action[:match.start()] + f"text={repr(content)}" + action[match.end():]
+            
+            # Fix other simple escaped quotes (e.g. button_type=\'left\')
+            action = re.sub(r"=\\'([^'\\]*)\\'", r"='\1'", action)
             
             logger.info(f"The pesudo action is {action}")
 
@@ -209,7 +233,8 @@ class AutoGLMAgent:
                 actions = Agent.tool_commands(action, obs["cur_app"].strip().replace("-", "_").lower())
                 logger.info(f"The grounded action is {actions[0]}")
         except Exception as e:
-            print("Failed to parse action from response", e)
+            self.last_parse_error = str(e)  # Store error message for retry feedback
+            logger.error(f"Failed to parse action from response: {e}")
             actions = []
 
         return actions
@@ -240,18 +265,59 @@ class AutoGLMAgent:
         messages = self.prepare(instruction, obs, history)
 
         assert self.gen_func is not None, "gen_func is not set"
-        for _ in range(3):
-            try:
-                response = self.gen_func(messages)
+        
+        response = None
+        actions = []
+        parse_error_msg = None
+        
+        # Retry loop for parsing errors
+        for attempt in range(self.max_parse_retries):
+            # Add error feedback if this is a retry
+            if attempt > 0 and self.last_error_feedback:
+                logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries} due to parsing error")
+                retry_messages = messages.copy()
+                retry_messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": self.last_error_feedback}]
+                })
+            else:
+                retry_messages = messages
+            
+            # Call gen_func with network retry
+            for _ in range(3):
+                try:
+                    response = self.gen_func(retry_messages)
+                    break
+                except Exception as e:
+                    logger.error("Failed to call gen_func, Error: " + str(e))
+            else:
+                raise RuntimeError("Failed to call gen_func after retries")
+
+            logger.info("RESPONSE: %s", response)
+
+            # Try to execute/parse the response
+            actions = self.execute(response, obs)
+            
+            if actions:
+                # Successfully parsed, clear error feedback
+                self.last_error_feedback = None
                 break
-            except Exception as e:
-                logger.error("Failed to call gen_func, Error: " + str(e))
-        else:
-            raise RuntimeError("Failed to call gen_func after retries")
-
-        logger.info("RESPONSE: %s", response)
-
-        actions = self.execute(response, obs)
+            else:
+                # Parsing failed, use stored error or generic message
+                parse_error_msg = self.last_parse_error or "Failed to parse action from response"
+                logger.error(f"Action parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {parse_error_msg}")
+                
+                # If not last attempt, set error feedback for retry
+                if attempt < self.max_parse_retries - 1:
+                    self.last_error_feedback = FIX_RESPONSE_PROMPT.format(
+                        error_message=parse_error_msg,
+                        response=response
+                    )
+                else:
+                    # Last attempt failed, mark task as FAIL
+                    logger.error("All retry attempts exhausted, cannot parse valid action. Marking task as FAIL.")
+                    self.last_error_feedback = None
+                    actions = ["FAIL"]
 
         # update the contents
         self.contents.append(

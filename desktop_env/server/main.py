@@ -1537,9 +1537,17 @@ def start_recording():
 def end_recording():
     global recording_process
 
-    if not recording_process or recording_process.poll() is not None:
-        recording_process = None  # Clean up stale process object
+    if not recording_process:
         return jsonify({'status': 'error', 'message': 'No recording in progress to stop.'}), 400
+    
+    # Check if ffmpeg process has already exited unexpectedly
+    exit_code = recording_process.poll()
+    if exit_code is not None:
+        # Process already terminated, get the error output
+        error_output = recording_process.stderr.read() if recording_process.stderr else "No stderr available"
+        logger.error(f"ffmpeg exited unexpectedly with code {exit_code}. Stderr: {error_output}")
+        recording_process = None
+        return jsonify({'status': 'error', 'message': f'ffmpeg exited unexpectedly with code {exit_code}. Error: {error_output}'}), 500
 
     error_output = ""
     try:

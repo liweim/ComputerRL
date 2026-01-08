@@ -444,14 +444,12 @@ class PythonController:
                                 f.write(chunk)
                     return
                 else:
-                    logger.error("Failed to stop recording. Status code: %d", response.status_code)
-                    logger.info("Retrying to stop recording.")
+                    error_detail = response.json().get('message', response.text) if response.headers.get('content-type', '').startswith('application/json') else response.text
+                    logger.error("Recording stop failed (code %d): %s. This does not affect task evaluation.", response.status_code, error_detail)
+                    return  # Don't retry - recording probably failed earlier
             except Exception as e:
-                logger.error("An error occurred while trying to stop recording: %s", e)
-                logger.info("Retrying to stop recording.")
-            time.sleep(self.retry_interval)
-
-        logger.error("Failed to stop recording.")
+                logger.error("Error stopping recording: %s. This does not affect task evaluation.", e)
+                return
 
     # Additional info
     def get_vm_platform(self):
