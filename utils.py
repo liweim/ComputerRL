@@ -133,9 +133,10 @@ def summary(result_dir, test_all_meta):
             # Logic reaches here only if err_reason.txt does not exist.
             
             if os.path.exists(execution_log_file):
-                print(f"execution_log_file: {execution_log_file}")
-                with open(execution_log_file, "r", encoding="utf-8") as f:
-                    execution_log = json.load(f)
+                try:
+                    with open(execution_log_file, "r", encoding="utf-8") as f:
+                        execution_log = json.load(f)
+
                     execution_stats = execution_log.get("statistics", {})
                     
                     # Extract basic data
@@ -185,6 +186,9 @@ def summary(result_dir, test_all_meta):
                         all_scores_50.append(0)
                     else:
                         all_scores_50.append(score)
+                except:
+                    print(f"error loading execution_log_file: {execution_log_file}")
+                    continue
             else:
                 if os.path.exists(score_file):
                     print(f"not found: {execution_log_file}")
@@ -193,7 +197,7 @@ def summary(result_dir, test_all_meta):
     num_tasks = len(all_scores)
     num_tasks_with_log = len(all_costs)  # Number of tasks with execution_log
     avg_score = np.mean(all_scores)
-    # avg_score_50 = np.sum(all_scores_50) / num_tasks
+    avg_score_50 = np.sum(all_scores_50) / num_tasks
     total_cost = sum(all_costs)
 
     # Calculate total operations and tokens
@@ -225,7 +229,7 @@ def summary(result_dir, test_all_meta):
     detailed_stats = {
         "summary": {
             "score": avg_score,
-            # "score_50": avg_score_50,
+            "score_50": avg_score_50,
             "total_tasks": num_tasks,
             "completed_tasks": num_tasks_with_log,
             "left_tasks": count_remain,  # All incomplete tasks
@@ -243,7 +247,7 @@ def summary(result_dir, test_all_meta):
             },
             "average": {
                 "score": avg_score,
-                # "score_50": avg_score_50,
+                "score_50": avg_score_50,
                 "cost": avg_cost,
                 "tokens": avg_total_tokens,
                 "prompt_tokens": avg_prompt_tokens,
@@ -283,8 +287,24 @@ def summary(result_dir, test_all_meta):
     with open(os.path.join(result_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(detailed_stats, f, indent=2, ensure_ascii=False)
 
-    print(json.dumps(detailed_stats['summary'], indent=2, ensure_ascii=False))
+    summary_stats = detailed_stats['summary']
+    # print(json.dumps(summary_stats, indent=2, ensure_ascii=False))
+
+    total_tasks = summary_stats['total_tasks']
+    left_tasks = summary_stats['left_tasks']
+    error_tasks = summary_stats['error_tasks']
+    avg_score = summary_stats['score']
+    avg_score_50 = summary_stats['score_50']
+    avg_cost = summary_stats['average']['cost']
+    avg_total_tokens = summary_stats['average']['tokens']
+    avg_prompt_tokens = summary_stats['average']['prompt_tokens']
+    avg_completion_tokens = summary_stats['average']['completion_tokens']
+    avg_steps = summary_stats['average']['steps']
+    avg_execution_time = summary_stats['average']['execution_time']
+    print(f"Total tasks: {total_tasks}, Left tasks: {left_tasks}, Error tasks: {error_tasks}")
+    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.3f}\t{avg_score_50:.3f}\t{avg_cost:.3f}\t{avg_total_tokens:.3f}\t{avg_prompt_tokens:.3f}\t{avg_completion_tokens:.3f}\t{avg_steps:.3f}\t{avg_execution_time:.3f}")
+
     return detailed_stats
 
 if __name__ == "__main__":
-    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_test', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')

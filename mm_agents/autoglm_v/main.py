@@ -218,6 +218,8 @@ class AutoGLMAgent:
             
             # Fix other simple escaped quotes (e.g. button_type=\'left\')
             action = re.sub(r"=\\'([^'\\]*)\\'", r"='\1'", action)
+            if 'button=' in action:
+                action = action.replace('button=', 'button_type=')
             
             logger.info(f"The pesudo action is {action}")
 

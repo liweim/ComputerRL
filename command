@@ -32,13 +32,28 @@ newgrp docker
 # export OPENAI_BASE_URL="http://localhost:30000/v1"
 # export OPENAI_API_KEY="EMPTY"
 conda activate spider2v
+nohup \
 python run_autoglm_v.py \
     --provider_name docker \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
     --result_dir results/autoglm-os_baseline \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_all.json
+    --test_all_meta_path ./evaluation_examples/test_all.json \
+    --cleanup_docker \
+    > nohup2.out 2>&1 &
+
+nohup \
+python run_hisa.py \
+  --provider_name docker \
+  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa_test \
+  --headless \
+  --max_steps 100 \
+  --test_all_meta_path ./evaluation_examples/debug.json \
+  --cleanup_docker \
+  > nohup3.out 2>&1 &
 
 # 杀进程
+ps -ef | grep run_autoglm_v.py
 pkill -f run_autoglm_v.py

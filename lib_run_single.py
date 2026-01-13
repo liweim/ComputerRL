@@ -192,15 +192,19 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                 }))
                 f.write("\n")
             
-            # Add to action_logs
+            # Add to action_logs (ensure all values are JSON serializable)
+            exe_result = obs.get("exe_result", "") if "exe_result" in obs else ""
+            if isinstance(exe_result, bytes):
+                exe_result = exe_result.decode('utf-8', errors='replace')
+            response_str = str(response) if response else ""
             action_logs.append({
                 "step": step_idx + 1,
                 "type": action_type,
                 "execution_success": reward >= 0 and not info.get("fail", False),
                 "screenshot": screenshot_file,
                 "action": str(action),
-                "response": response[:500] if response else "",  # Truncate long responses
-                "exe_result": obs.get("exe_result", "") if "exe_result" in obs else "",
+                "response": response_str,  # Truncate long responses
+                "exe_result": str(exe_result) if exe_result else "",
                 "step_time": round(step_time, 2),
                 "token_usage": step_usage
             })
@@ -220,13 +224,14 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
                 _f.write(obs['screenshot'])
             
+            response_str = str(response) if response else ""
             action_logs.append({
                 "step": step_idx + 1,
                 "type": "invalid_action",
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "action": "Parse error or invalid action",
-                "response": response[:500] if response else "",
+                "response": response_str,
                 "exe_result": "Invalid action - no actions returned",
                 "step_time": 0.0,
                 "token_usage": step_usage
@@ -300,8 +305,6 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
         "task_config": example,
         "additional_context": "",
         "action_logs": action_logs,
-        "success": result == 1.0,
-        "failure_reason": failure_reason
     }
     
     # Save execution_log.json

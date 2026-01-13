@@ -1,5 +1,5 @@
-"""Script to run end-to-end evaluation on the benchmark.
-Utils and basic architecture credit to https://github.com/web-arena-x/webarena/blob/main/run.py.
+"""Script to run HiSA agent evaluation on the benchmark.
+Adapted from run_autoglm_v.py with HiSA agent integration.
 """
 
 import argparse
@@ -11,28 +11,19 @@ import sys
 import math
 import ast
 import time
-import backoff
-import httpx
 import requests
-from requests.exceptions import SSLError
 from tqdm import tqdm
 import shutil
-
-import lib_run_single
 import docker
+
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
-from mm_agents.autoglm_v import AutoGLMAgent
+from mm_agents.hisa import HiSAAgent
 from typing import Optional, Dict, Any
 from utils import summary, setup_logger
 
 
 def cleanup_osworld_containers(remove_running=False):
-    """Clean up osworld docker containers before starting.
-    
-    Args:
-        remove_running: If True, also stop and remove running containers.
-                       If False (default), only remove exited containers.
-    """
+    """Clean up osworld docker containers before starting."""
     try:
         client = docker.from_env()
         containers = client.containers.list(all=True, filters={"ancestor": "happysixd/osworld-docker"})
@@ -50,7 +41,6 @@ def cleanup_osworld_containers(remove_running=False):
                         else:
                             skipped_count += 1
                     else:
-                        # Remove exited/stopped containers
                         container.remove(force=True)
                         print(f"  Removed exited container: {container.name}")
                         removed_count += 1
@@ -62,93 +52,92 @@ def cleanup_osworld_containers(remove_running=False):
     except Exception as e:
         print(f"Warning: Failed to cleanup containers: {e}")
 
-# Almost deprecated since it's not multi-env, use run_multienv_*.py instead
-logger = None  # Will be initialized in main
+
+logger = None
+
 
 def config() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
+    parser = argparse.ArgumentParser(description="Run HiSA agent evaluation on the benchmark")
 
-    # environment config
+    # Environment config
     parser.add_argument("--path_to_vm", type=str)
-    parser.add_argument(
-        "--provider_name",
-        type=str,
-        default="docker",
-        help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
-    )
-    parser.add_argument("--headless", action="store_true", default=True, help="Run in headless machine")
-    parser.add_argument("--action_space", type=str, default="autoglm_computer_use", help="Action type")
-    parser.add_argument(
-        "--observation_type",
-        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
-        default="a11y_tree",
-        help="Observation type",
-    )
+    parser.add_argument("--provider_name", type=str, default="docker")
+    parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--action_space", type=str, default="autoglm_computer_use")
+    parser.add_argument("--observation_type", choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"], default="screenshot")
     parser.add_argument("--screen_width", type=int, default=1920)
     parser.add_argument("--screen_height", type=int, default=1080)
     parser.add_argument("--sleep_after_execution", type=float, default=1.0)
-    parser.add_argument("--max_steps", type=int, default=50)
+    parser.add_argument("--max_steps", type=int, default=100)
 
-    # agent config
+    # Agent config
     parser.add_argument("--max_trajectory_length", type=int, default=3)
     parser.add_argument("--test_config_base_dir", type=str, default="evaluation_examples/examples")
 
-    # lm config
+    # LM config
     parser.add_argument("--model", type=str, default="autoglm-os")
-    parser.add_argument("--temperature", type=float, default=0.2) # original: 0.2
-    parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
-    parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
-    parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top_p", type=float, default=0.1)
+    parser.add_argument("--max_tokens", type=int, default=256)
+    parser.add_argument("--repetition_penalty", type=float, default=1)
     parser.add_argument("--stop_token", type=str, default=None)
     parser.add_argument("--image_width", type=int, default=1280)
     parser.add_argument("--image_height", type=int, default=720)
 
-    # example config
+    # State manager LM config (uses same model as main, but different parameters)
+    parser.add_argument("--sm_temperature", type=float, default=0.2, help="Temperature for state manager")
+    parser.add_argument("--sm_top_p", type=float, default=0.9, help="Top-p for state manager")
+    parser.add_argument("--sm_max_tokens", type=int, default=500, help="Max tokens for state manager")
+    parser.add_argument("--sm_repetition_penalty", type=float, default=1, help="Repetition penalty for state manager")
+
+    # HiSA specific config
+    parser.add_argument("--wo_pattern", action="store_true", default=True, help="Disable pattern learning")
+    parser.add_argument("--wo_step", action="store_true", default=False, help="Disable step abstraction")
+    parser.add_argument("--wo_refinement", action="store_true", default=False, help="Disable context refinement")
+    parser.add_argument("--refine_period", type=int, default=5, help="Steps between context refinements")
+    parser.add_argument("--sliding_window_size", type=int, default=5, help="Sliding window size for history")
+
+    # Example config
     parser.add_argument("--domain", type=str, default="all")
     parser.add_argument("--test_all_meta_path", type=str, default="evaluation_examples/test_nogdrive.json")
 
-    # aws config
-    parser.add_argument(
-        "--region", type=str, default="us-east-1", help="AWS region for the VM"
-    )
-    parser.add_argument(
-        "--client_password", type=str, default="", help="Client password"
-    )
+    # AWS config
+    parser.add_argument("--region", type=str, default="us-east-1")
+    parser.add_argument("--client_password", type=str, default="")
 
-    # logging related
+    # Logging
     parser.add_argument("--result_dir", type=str, default="./results")
-    parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
-    
-    # rerun related
-    parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
-    parser.add_argument("--rerun_fail", action="store_true", help="Rerun only failed tasks (score == 0)")
-    
-    # docker related
-    parser.add_argument("--cleanup_docker", action="store_true", default=False, help="Cleanup docker containers before starting")
-    
-    args = parser.parse_args()
+    parser.add_argument("--log_level", type=str, default="INFO")
 
+    # Rerun
+    parser.add_argument("--rerun", action="store_true")
+    parser.add_argument("--rerun_fail", action="store_true")
+
+    # Docker related
+    parser.add_argument("--cleanup_docker", action="store_true", default=False, help="Cleanup docker containers before starting")
+
+    args = parser.parse_args()
     return args
 
 
 class DesktopEnv(DesktopEnvBase):
+    """Extended DesktopEnv with HiSA-compatible step method."""
+
     def step(self, action, pause=2):
         self._step_no += 1
         self.action_history.append(action)
-        
-        # Mark environment as used when step is called
         self.is_environment_used = True
 
-        reward = 0  # todo: Define reward calculation for each example
-        done = False  # todo: Define episode termination condition for each example
+        reward = 0
+        done = False
         info = {}
         logger.info(f"[Step] {self._step_no} in trajectory {self._traj_no} with action: {action}")
 
-        # handle the special actions
+        # Handle special actions
         if action in ['WAIT', 'FAIL', 'DONE']:
             if action == 'WAIT':
                 time.sleep(pause)
-                exe_result = 'Wait ' + str(pause) + ' seconds'
+                exe_result = f'Wait {pause} seconds'
             elif action == 'FAIL':
                 done = True
                 info = {"fail": True}
@@ -157,28 +146,32 @@ class DesktopEnv(DesktopEnvBase):
                 done = True
                 info = {"done": True}
                 exe_result = 'Finish: success'
-        elif type(action) == dict:
-            if action['action_type'] == 'OPEN_APP':
+        elif isinstance(action, dict):
+            if action.get('action_type') == 'OPEN_APP':
                 self.setup_controller._launch_setup(action['parameters']['launch_app_command'], shell=True)
                 exe_result = 'Open ' + action['parameters']['app_name']
-            elif action['action_type'] == 'OPEN_CHROME_TAB':
-                self.setup_controller._chrome_open_tabs_setup(action['parameters']['urls_to_open'])
-                exe_result = 'Open ' + str(action['parameters']['urls_to_open']) + ' in Chrome successfully'
-        else:
-            # the set of all possible python commands insides `pyautogui`
-            result = self.controller.execute_python_command(action)
-            if result is None:
-                exe_result = 'Error: Failed to execute command on server'
-                logger.error(f"execute_python_command returned None for action: {action}")
-            elif result.get('error'):
-                exe_result = result['error'].strip()
+            elif action.get('type') == 'bash':
+                # Handle bash commands from HiSA agent
+                result = self.controller.run_bash_script(action['command'], timeout=60)
+                exe_result = result.get('output', '') if result.get('status') == 'success' else result.get('error', 'Error')
             else:
-                exe_result = result.get('output', '').strip()
+                exe_result = f'Unknown action type: {action}'
+        else:
+            # Execute pyautogui command
+            result = self.controller.execute_python_command(action)
+            try:
+                if result['error']:
+                    exe_result = result['error'].strip()
+                else:
+                    exe_result = result['output'].strip()
+            except Exception as e:
+                exe_result = f'Error Action: {action}'
+                logger.error(f"Error executing action: {e}")
 
         time.sleep(pause)
         observation = self._get_obs()
         observation['exe_result'] = exe_result
-        
+
         return observation, reward, done, info
 
     def _patch_vm_server(self):
@@ -195,67 +188,48 @@ class DesktopEnv(DesktopEnvBase):
             logger.warning(f"Failed to patch VM server (may already be patched): {e}")
 
     def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
-        # Reset to certain task in OSWorld
+        """Reset environment for a new task."""
         logger.info("Resetting environment...")
-        logger.info("Switching task...")
-        logger.info("Setting counters...")
         self._traj_no += 1
         self._step_no = 0
         self.action_history.clear()
 
         for attempt in range(MAX_RETRIES):
-            # Only revert to snapshot if environment has been used (step/setup)
-            # This optimization is especially important for cloud providers like AWS
-            # where unnecessary snapshot operations are costly and time-consuming
-            
             if task_config is not None:
-                # Only consider task proxy requirement if proxy is enabled at system level
                 task_use_proxy = task_config.get("proxy", False) and self.enable_proxy
                 if not self.enable_proxy and task_config.get("proxy", False):
-                    logger.info("Task requires proxy but proxy is disabled at system level, ignoring proxy requirement.")
-                
+                    logger.info("Task requires proxy but proxy is disabled, ignoring.")
                 if task_use_proxy != self.current_use_proxy:
-                    # keep because get_info_from_website depend on this
                     self.current_use_proxy = task_use_proxy
-            
+
             if self.is_environment_used:
-                logger.info("Environment has been used, reverting to snapshot {}...".format(self.snapshot_name))
+                logger.info(f"Reverting to snapshot {self.snapshot_name}...")
                 self._revert_to_snapshot()
-                logger.info("Starting emulator...")
                 self._start_emulator()
                 self._patch_vm_server()  # Fix _append_event issue in VM
-                logger.info("Emulator started.")
-                # Reset the usage flag after reverting
                 self.is_environment_used = False
             else:
-                logger.info("Environment is clean, skipping snapshot revert (provider: {}).".format(self.provider_name))
+                logger.info(f"Environment is clean, skipping snapshot revert (provider: {self.provider_name}).")
 
             if task_config is not None:
                 if task_config.get("proxy", False) and self.enable_proxy:
-                    # If using proxy and proxy is enabled, set up the proxy configuration
                     self.setup_controller._proxy_setup(self.client_password)
                 self._set_task_info(task_config)
                 self.setup_controller.reset_cache_dir(self.cache_dir)
-                logger.info("Setting up environment...")
                 success = self.setup_controller.setup(self.config, task_config.get("proxy", False) and self.enable_proxy)
                 if success:
-                    # Mark environment as used when setup is successfully executed
-                    if self.config:  # Only mark as used if there were actual setup operations
+                    if self.config:
                         self.is_environment_used = True
                     break
                 else:
-                    logger.error(
-                        "Environment setup failed, retrying (%d/%d)...",
-                        attempt + 1,
-                        MAX_RETRIES,
-                    )
+                    logger.error(f"Setup failed, retrying ({attempt + 1}/{MAX_RETRIES})...")
                     time.sleep(5)
             else:
                 break
-            
+
         logger.info("Environment setup complete.")
 
-        # Upload tools from autoglm_v package
+        # Upload tools
         import mm_agents.autoglm_v
         tool_dir = os.path.join(os.path.dirname(mm_agents.autoglm_v.__file__), 'tools', 'package')
         for file in os.listdir(tool_dir):
@@ -266,7 +240,7 @@ class DesktopEnv(DesktopEnvBase):
                 "path": os.path.join('~', file)
             }])
 
-        # start soffice service for office tools
+        # Start soffice service
         self.setup_controller._launch_setup('soffice --accept="socket,host=localhost,port=2002;urp;" --norestore --nologo --nodefault', shell=True)
         time.sleep(5)
 
@@ -286,7 +260,7 @@ print(window_id);"""
         apps = self.controller.execute_python_command(apps_code)['output'].strip()
         apps = ast.literal_eval(apps)
         app_list = {}
-        
+
         for app in apps:
             parts = app.split(maxsplit=4)
             if len(parts) < 4:
@@ -296,13 +270,9 @@ print(window_id);"""
             window_id = parts[0]
             app_name = '.'.join(parts[2].split('.')[-(math.ceil(parts[2].count('.') / 2)):])
             title = parts[3]
-            app_list[window_id] = {
-                'app_name': app_name,
-                'title': title
-            }
-        
-        cur_id = self.controller.execute_python_command(window_code)['output'].strip()
+            app_list[window_id] = {'app_name': app_name, 'title': title}
 
+        cur_id = self.controller.execute_python_command(window_code)['output'].strip()
         return app_list, cur_id
 
     def maximize_window(self):
@@ -315,7 +285,7 @@ print(output);"""
                 self.setup_controller._launch_setup('wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz', shell=True)
                 time.sleep(2)
                 output = self.controller.execute_python_command(window_state)['output'].strip()
-                if '_NET_WM_STATE_FOCUSED' not in output or '_NET_WM_STATE_SKIP_TASKBAR' in output or '_NET_WM_STATE_MODAL' in output or '_NET_WM_STATE_MAXIMIZED' in output: # 没有窗口 or popups or 模态窗口 or 窗口已经最大化
+                if '_NET_WM_STATE_FOCUSED' not in output or '_NET_WM_STATE_SKIP_TASKBAR' in output or '_NET_WM_STATE_MODAL' in output or '_NET_WM_STATE_MAXIMIZED' in output:
                     return
             except Exception as e:
                 logger.error(f"Failed to maximize window: {e}")
@@ -330,21 +300,23 @@ print(output);"""
             "vlc": "VLCTools",
             "google_chrome": "BrowserTools"
         }
-        
+
         self.maximize_window()
-        
+
         for i in range(3):
             try:
                 app_list, cur_id = self.get_current_apps()
+                break
             except Exception as e:
                 if i == 2:
                     raise e
                 logger.error(f"Failed to get current apps: {e}")
                 time.sleep(1)
-        
+
+        cur_app = None
+        app_info = None
         if cur_id in app_list:
             cur_app = app_list[cur_id]['app_name']
-
             tool_name = cur_app.strip().lower().replace('-', '_')
             if tool_name in tool_list:
                 class_name = tool_list[tool_name]
@@ -352,12 +324,7 @@ print(output);"""
                 command += f"{class_name}.env_info(); "
                 command += f"{class_name}.print_result();"
                 app_info = self.controller.execute_python_command(command)['output'].strip()
-            else:
-                app_info = None
-        else:
-            cur_app = None
-            app_info = None
-        
+
         tree = self.controller.get_accessibility_tree()
         screenshot = self.controller.get_screenshot()
         if screenshot is None:
@@ -375,37 +342,208 @@ print(output);"""
         }
 
 
+def run_single_example_hisa(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
+    """Run a single example with HiSA agent."""
+    runtime_logger = logging.getLogger(f"desktopenv.example.{example['id']}")
+    runtime_logger.setLevel(logging.DEBUG)
+    runtime_logger.addHandler(logging.FileHandler(os.path.join(example_result_dir, "runtime.log")))
+
+    try:
+        agent.reset(runtime_logger)
+    except Exception:
+        agent.reset()
+
+    start_time = time.time()
+
+    # Reset token tracker if available
+    if hasattr(agent, 'token_tracker'):
+        agent.token_tracker.reset()
+
+    env.reset(task_config=example)
+    time.sleep(60)  # Wait for environment
+
+    obs = env._get_obs()
+    done = False
+    step_idx = 0
+    action_logs = []
+
+    operations_dir = os.path.join(example_result_dir, "operations")
+    os.makedirs(operations_dir, exist_ok=True)
+
+    env.controller.start_recording()
+
+    while not done and step_idx < max_steps:
+        # Get before screenshot for step abstraction
+        before_screenshot = obs.get('screenshot', b'')
+
+        response, actions = agent.predict(instruction, obs)
+
+        # Get token usage if available
+        step_usage = {}
+        if hasattr(agent, 'token_tracker'):
+            last_usage = agent.token_tracker.get_last_usage()
+            step_usage = {
+                'prompt_tokens': last_usage.get('prompt_tokens', 0),
+                'completion_tokens': last_usage.get('completion_tokens', 0),
+                'total_tokens': last_usage.get('total_tokens', 0),
+                'image_count': last_usage.get('image_count', 0)
+            }
+
+        for action in actions:
+            action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+            step_start_time = time.time()
+
+            obs, reward, done, info = env.step(action, args.sleep_after_execution)
+
+            logger.info(f"Reward: {reward:.2f}")
+            logger.info(f"Done: {done}")
+
+            step_time = time.time() - step_start_time
+            after_screenshot = obs.get('screenshot', b'')
+
+            # Determine action type
+            if isinstance(action, dict):
+                action_type = action.get('type', 'gui_action')
+                screenshot_file = f"step_{step_idx + 1}_{action_type}.png"
+            elif isinstance(action, str):
+                if action in ["WAIT", "DONE", "FAIL"]:
+                    action_type = action.lower()
+                else:
+                    action_type = "gui_action"
+                screenshot_file = f"step_{step_idx + 1}_{action_type}.png"
+            else:
+                action_type = "gui_action"
+                screenshot_file = f"step_{step_idx + 1}_gui_action.png"
+
+            # Save screenshot
+            with open(os.path.join(operations_dir, screenshot_file), "wb") as f:
+                f.write(after_screenshot)
+
+            # Add action log with step abstraction
+            exe_result = obs.get("exe_result", "") if "exe_result" in obs else ""
+            agent.add_action_log(
+                step=step_idx + 1,
+                action_type=action_type,
+                action=str(action),
+                execution_success=reward >= 0 and not info.get("fail", False),
+                screenshot_file=screenshot_file,
+                exe_result=str(exe_result),
+                step_time=step_time,
+                before_screenshot=before_screenshot,
+                after_screenshot=after_screenshot,
+            )
+
+            # Save trajectory
+            with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "step_num": step_idx + 1,
+                    "action_timestamp": action_timestamp,
+                    "action": str(action),
+                    "response": response,
+                    "reward": reward,
+                    "done": done,
+                    "info": info,
+                    "screenshot_file": f"operations/{screenshot_file}",
+                    "thought": agent.current_thought,
+                }))
+                f.write("\n")
+
+            if done:
+                logger.info("Episode done.")
+                break
+
+        if not actions:
+            obs = env._get_obs()
+            action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+            screenshot_file = f"step_{step_idx + 1}_invalid.png"
+
+            with open(os.path.join(operations_dir, screenshot_file), "wb") as f:
+                f.write(obs.get('screenshot', b''))
+
+            agent.add_action_log(
+                step=step_idx + 1,
+                action_type="invalid_action",
+                action="Parse error",
+                execution_success=False,
+                screenshot_file=screenshot_file,
+                exe_result="Invalid action",
+                step_time=0.0,
+            )
+
+        step_idx += 1
+
+    if not done:
+        env.action_history.append('FAIL')
+
+    result = env.evaluate()
+    logger.info(f"Result: {result:.2f}")
+    scores.append(result)
+
+    execution_time = time.time() - start_time
+
+    # Count steps by type
+    action_logs = agent.get_action_logs()
+    gui_steps = len([log for log in action_logs if log["type"] in ["gui_action", "invalid_action"]])
+    bash_steps = len([log for log in action_logs if log["type"] == "bash"])
+    wait_steps = len([log for log in action_logs if log["type"] == "wait"])
+
+    # Token usage
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_image_count = 0
+    if hasattr(agent, 'token_tracker'):
+        total_prompt_tokens = agent.token_tracker.total_prompt_tokens
+        total_completion_tokens = agent.token_tracker.total_completion_tokens
+        total_image_count = agent.token_tracker.total_image_count
+
+    # Build execution log
+    execution_log = {
+        "statistics": {
+            "score": result,
+            "total_steps": step_idx,
+            "cua_steps": gui_steps,
+            "coding_steps": bash_steps,
+            "wait_steps": wait_steps,
+            "image_count": total_image_count,
+            "total_cost": 0,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "execution_time": execution_time,
+            "model_usage": {
+                "model": {
+                    "model_name": args.model,
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "image_count": total_image_count
+                }
+            }
+        },
+        "task_config": example,
+        "additional_context": "",
+        "action_logs": action_logs,
+        "success": result == 1.0,
+        "failure_reason": "" if result == 1.0 else "Task not completed"
+    }
+
+    with open(os.path.join(example_result_dir, "execution_log.json"), "w", encoding="utf-8") as f:
+        json.dump(execution_log, f, indent=2, ensure_ascii=False)
+
+    with open(os.path.join(example_result_dir, "result.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{result}\n")
+
+    env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
+
+
 def test(args: argparse.Namespace, test_all_meta: dict) -> None:
     scores = []
     max_steps = args.max_steps
 
-    # log args
-    logger.info("Args: %s", args)
-    # set wandb project
-    cfg_args = {
-        "path_to_vm": args.path_to_vm,
-        "provider_name": args.provider_name,
-        "headless": args.headless,
-        "action_space": args.action_space,
-        "observation_type": args.observation_type,
-        "screen_width": args.screen_width,
-        "screen_height": args.screen_height,
-        "sleep_after_execution": args.sleep_after_execution,
-        "max_steps": args.max_steps,
-        "max_trajectory_length": args.max_trajectory_length,
-        "model": args.model,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_tokens": args.max_tokens,
-        "stop_token": args.stop_token,
-        "repetition_penalty": args.repetition_penalty,
-        "result_dir": args.result_dir,
-    }
+    logger.info(f"Args: {args}")
 
     def call_llm(messages):
+        """Call LLM with messages."""
         logger.info("Calling LLM...")
-        
-        # Prepare the request data
+
         data = {
             "model": args.model,
             "messages": messages,
@@ -423,27 +561,19 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
         }
-        
-        # Get API base URL from environment or use default
+
         base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
         url = f"{base_url}/chat/completions"
-        
-        response = requests.post(
-            url,
-            json=data,
-            headers=headers,
-            timeout=60.0
-        )
+
+        response = requests.post(url, json=data, headers=headers, timeout=60.0)
         response.raise_for_status()
-        
+
         result = response.json()
         logger.info("LLM called successfully.")
-        
-        # Return both content and usage information
+
         content = result['choices'][0]['message']['content']
-        
         usage = result.get('usage', {})
-        
+
         return {
             'content': content,
             'usage': {
@@ -453,7 +583,6 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             }
         }
 
-    # Create a wrapper to track token usage and image count
     class TokenTracker:
         def __init__(self):
             self.total_prompt_tokens = 0
@@ -461,43 +590,63 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             self.total_tokens = 0
             self.total_image_count = 0
             self.last_usage = {}
-        
+
         def __call__(self, messages):
             result = call_llm(messages)
-            
-            # Count images in the messages
+
             image_count = 0
             for msg in messages:
                 if isinstance(msg.get('content'), list):
                     for item in msg['content']:
                         if item.get('type') in ['image_url', 'input_image']:
                             image_count += 1
-            
-            # Store usage info with image count
-            self.last_usage = {
-                **result['usage'],
-                'image_count': image_count
-            }
+
+            self.last_usage = {**result['usage'], 'image_count': image_count}
             self.total_prompt_tokens += result['usage']['prompt_tokens']
             self.total_completion_tokens += result['usage']['completion_tokens']
             self.total_tokens += result['usage']['total_tokens']
             self.total_image_count += image_count
-            
-            # Return only content for compatibility with AutoGLMAgent
+
             return result['content']
-        
+
         def get_last_usage(self):
             return self.last_usage
-        
+
         def reset(self):
             self.total_prompt_tokens = 0
             self.total_completion_tokens = 0
             self.total_tokens = 0
             self.total_image_count = 0
             self.last_usage = {}
-    
+
     token_tracker = TokenTracker()
+
+    # Create state manager function (uses same model with different parameters)
+    def state_manager_call(messages):
+        """Call LLM for state manager with different parameters."""
+        data = {
+            "model": args.model,
+            "messages": messages,
+            "max_tokens": args.sm_max_tokens,
+            "temperature": args.sm_temperature,
+            "top_p": args.sm_top_p,
+            "repetition_penalty": args.sm_repetition_penalty,
+            "skip_special_tokens": False,
+            "stream": False,
+            "include_stop_str_in_output": True,
+            "stop": ["<|user|>", "<|observation|>", "</answer>"]
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
+        }
+        base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
+        response = requests.post(f"{base_url}/chat/completions", json=data, headers=headers, timeout=60.0)
+        response.raise_for_status()
+        return response.json()['choices'][0]['message']['content']
     
+    state_manager_func = state_manager_call
+
     env = DesktopEnv(
         provider_name=args.provider_name,
         region=args.region,
@@ -509,7 +658,8 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         os_type="Ubuntu",
         require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
     )
-    agent = AutoGLMAgent(
+
+    agent = HiSAAgent(
         action_space=args.action_space,
         observation_type=args.observation_type,
         screen_size=(args.screen_width, args.screen_height),
@@ -517,9 +667,15 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         max_trajectory_length=args.max_trajectory_length,
         client_password=args.client_password,
         gen_func=token_tracker,
+        state_manager_func=state_manager_func,
+        max_steps=args.max_steps,
+        wo_pattern=args.wo_pattern,
+        wo_step=args.wo_step,
+        wo_refinement=args.wo_refinement,
+        refine_period=args.refine_period,
+        sliding_window_size=args.sliding_window_size,
     )
-    
-    # Attach token_tracker to agent for access in run_single_example_autoglm
+
     agent.token_tracker = token_tracker
 
     for domain in tqdm(test_all_meta, desc="Domain"):
@@ -530,47 +686,29 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
             logger.info(f"[Domain]: {domain}")
             logger.info(f"[Example ID]: {example_id}")
+            logger.info(f"[Instruction]: {example['instruction']}")
 
-            instruction = example["instruction"]
-
-            logger.info(f"[Instruction]: {instruction}")
-            # wandb each example config settings
-            cfg_args["instruction"] = instruction
-            cfg_args["start_time"] = datetime.datetime.now().strftime("%Y:%m:%d-%H:%M:%S")
-
-            example_result_dir = os.path.join(
-                args.result_dir,
-                domain,
-                example_id,
-            )
+            example_result_dir = os.path.join(args.result_dir, domain, example_id)
             os.makedirs(example_result_dir, exist_ok=True)
-            # example start running
+
             try:
-                lib_run_single.run_single_example_autoglm(
-                    agent,
-                    env,
-                    example,
-                    max_steps,
-                    instruction,
-                    args,
-                    example_result_dir,
-                    scores,
+                run_single_example_hisa(
+                    agent, env, example, max_steps,
+                    example['instruction'], args, example_result_dir, scores
                 )
             except Exception as e:
                 logger.error(f"Exception in {domain}/{example_id}: {e}")
-                # Only attempt to end recording if controller exists (not Docker provider)
                 if hasattr(env, "controller") and env.controller is not None:
                     env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
                 with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
-                    f.write(json.dumps({"Error": f"Exception in {domain}/{example_id}: {e}"}))
+                    f.write(json.dumps({"Error": f"Exception: {e}"}))
                     f.write("\n")
-                # Write result.txt with score 0 to mark task as completed (failed)
                 with open(os.path.join(example_result_dir, "result.txt"), "w") as f:
                     f.write("0.0\n")
                 scores.append(0.0)
 
     env.close()
-    if len(scores) > 0:
+    if scores:
         logger.info(f"Average score: {sum(scores) / len(scores)}")
     else:
         logger.info("No tasks completed")
@@ -578,13 +716,10 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
 def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
     """Get unfinished tasks."""
-    
     if not os.path.exists(target_dir):
         return total_file_json
 
-    # If rerun is True, return all tasks (ignore existing results)
     if rerun:
-        # Clear all existing results
         for domain in os.listdir(target_dir):
             domain_path = os.path.join(target_dir, domain)
             if os.path.isdir(domain_path):
@@ -593,9 +728,7 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                         continue
                     example_path = os.path.join(domain_path, example_id)
                     if os.path.isdir(example_path):
-                        # Remove all files in the example directory
                         shutil.rmtree(example_path)
-                        os.makedirs(example_path, exist_ok=True)
         return total_file_json
 
     finished = {}
@@ -609,26 +742,20 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                 example_path = os.path.join(domain_path, example_id)
                 if os.path.isdir(example_path):
                     if "result.txt" not in os.listdir(example_path) or 'execution_log.json' not in os.listdir(example_path):
-                        # Task incomplete (no result.txt), clear and re-run
-                        print(f"[Cleanup] Removing incomplete task directory: {example_path}")
+                        print(f"[Cleanup] Removing incomplete: {example_path}")
                         shutil.rmtree(example_path)
-                        os.makedirs(example_path, exist_ok=True)
                     else:
-                        # Check if we should rerun failed tasks
                         if rerun_fail:
                             try:
                                 result_file = os.path.join(example_path, "result.txt")
                                 with open(result_file, "r") as f:
                                     score = float(f.read().strip())
                                 if score == 0.0:
-                                    # Failed task, clear and re-run
-                                    print(f"[Cleanup] Removing failed task (score=0) directory: {example_path}")
+                                    print(f"[Cleanup] Removing failed: {example_path}")
                                     shutil.rmtree(example_path)
-                                    os.makedirs(example_path, exist_ok=True)
                                     continue
                             except Exception as e:
-                                # Error reading result, report and exit instead of silently deleting
-                                raise RuntimeError(f"Error reading result file {result_file}: {e}. Please check the file manually.")
+                                raise RuntimeError(f"Error reading {result_file}: {e}")
                         finished[domain].append(example_id)
 
     if not finished:
@@ -648,7 +775,6 @@ def get_result(target_dir):
         return None
 
     all_result = []
-
     for domain in os.listdir(target_dir):
         domain_path = os.path.join(target_dir, domain)
         if os.path.isdir(domain_path):
@@ -656,14 +782,10 @@ def get_result(target_dir):
                 example_path = os.path.join(domain_path, example_id)
                 if os.path.isdir(example_path):
                     if "result.txt" in os.listdir(example_path):
-                        result_path = os.path.join(example_path, "result.txt")
                         try:
-                            with open(result_path, "r") as rf:
+                            with open(os.path.join(example_path, "result.txt"), "r") as rf:
                                 res = rf.read().strip()
-                                if res.lower() == "true":
-                                    score = 1.0
-                                else:
-                                    score = float(res)
+                                score = 1.0 if res.lower() == "true" else float(res)
                         except Exception:
                             score = 0.0
                         all_result.append(score)
@@ -672,35 +794,25 @@ def get_result(target_dir):
         print("New experiment, no result yet.")
         return None
     else:
-        print("Current Success Rate:", sum(all_result) / len(all_result) * 100, "%")
+        print(f"Current Success Rate: {sum(all_result) / len(all_result) * 100}%")
         return all_result
 
 
 if __name__ == "__main__":
-    ####### The complete version of the list of examples #######
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = config()
-    
+
     # Clean up existing osworld containers before starting (docker only, if requested)
     if args.provider_name == "docker" and args.cleanup_docker:
         cleanup_osworld_containers()
-    
-    # Initialize logger after args are parsed
+
     result_name = os.path.basename(args.result_dir)
     logger = setup_logger(result_name, args.log_level)
-    if args.client_password == "":
-        if args.provider_name == "aws":
-            args.client_password = "osworld-public-evaluation"
-        else:
-            args.client_password = "password"
-    else:
-        args.client_password = args.client_password
 
-    # save args to json in result_dir/action_space/observation_type/model/args.json
-    path_to_args = os.path.join(
-        args.result_dir,
-        "args.json",
-    )
+    if args.client_password == "":
+        args.client_password = "osworld-public-evaluation" if args.provider_name == "aws" else "password"
+
+    path_to_args = os.path.join(args.result_dir, "args.json")
     os.makedirs(os.path.dirname(path_to_args), exist_ok=True)
     with open(path_to_args, "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=4)
@@ -711,12 +823,8 @@ if __name__ == "__main__":
     if args.domain != "all":
         test_all_meta = {args.domain: test_all_meta[args.domain]}
 
-    test_file_list = get_unfinished(
-        args.result_dir,
-        test_all_meta,
-        rerun=args.rerun,
-        rerun_fail=args.rerun_fail,
-    )
+    test_file_list = get_unfinished(args.result_dir, test_all_meta, rerun=args.rerun, rerun_fail=args.rerun_fail)
+
     left_info = ""
     for domain in test_file_list:
         left_info += f"{domain}: {len(test_file_list[domain])}\n"
@@ -724,7 +832,6 @@ if __name__ == "__main__":
 
     get_result(args.result_dir)
     test(args, test_file_list)
-    
-    # Call summary() from utils.py after all tasks are completed
+
     logger.info("Generating summary...")
     summary(args.result_dir, test_all_meta)

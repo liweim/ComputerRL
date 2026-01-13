@@ -414,7 +414,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/start_recording")
+                response = requests.post(self.http_server + "/start_recording", timeout=60)
                 if response.status_code == 200:
                     logger.info("Recording started successfully")
                     return
@@ -435,7 +435,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/end_recording")
+                response = requests.post(self.http_server + "/end_recording", timeout=60)
                 if response.status_code == 200:
                     logger.info("Recording stopped successfully")
                     with open(dest, 'wb') as f:
