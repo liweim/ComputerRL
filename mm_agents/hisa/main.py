@@ -24,10 +24,10 @@ from .prompts import (
     PATTERN_SYNTHESIS_PROMPT,
 )
 
-# Import from autoglm_v for code parsing and grounding
+        # Import from autoglm_v for code parsing and grounding
 from ..autoglm_v.prompt.grounding_agent import GroundingAgent as Agent
 from ..autoglm_v.prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
-from ..autoglm_v.tools.package.google_chrome import BrowserTools
+from ..autoglm_v.tools.package.google_chrome import BrowserTools  # Needed for eval() in execute()
 
 logger = logging.getLogger("desktopenv.hisa")
 
@@ -80,11 +80,11 @@ class HiSAAgent:
     def __init__(
         self,
         action_space: str = "autoglm_computer_use",
-        observation_type: str = "a11y_tree",
         screen_size: Tuple[int, int] = (1920, 1080),
         image_size: Tuple[int, int] = (1280, 720),
         max_trajectory_length: int = 3,
         a11y_tree_max_items: int = 300,
+        with_atree: bool = False,
         client_password: str = "password",
         gen_func=None,
         state_manager_func=None,
@@ -99,19 +99,32 @@ class HiSAAgent:
         bash_timeout: int = 60,
     ):
         self.action_space = action_space
-        self.observation_type = observation_type
         self.screen_size = screen_size
         self.image_size = image_size
         self.max_trajectory_length = max_trajectory_length
         self.a11y_tree_max_items = a11y_tree_max_items
+        self.with_atree = with_atree
         self.client_password = client_password
         self.gen_func = gen_func
         self.state_manager_func = state_manager_func
+
+        # Tool list for application-specific tools
+        self.tool_list = {
+            "libreoffice_calc": "CalcTools",
+            "libreoffice_impress": "ImpressTools",
+            "libreoffice_writer": "WriterTools",
+            "code": "CodeTools",
+            "vlc": "VLCTools",
+            "google_chrome": "BrowserTools",
+        }
+
+        # Pattern induction settings
+        self.wo_pattern = wo_pattern
+
         self.max_parse_retries = max_parse_retries
         self.max_steps = max_steps
-        
+
         # HiSA advanced features
-        self.wo_pattern = wo_pattern
         self.wo_step = wo_step
         self.wo_refinement = wo_refinement
         self.refine_period = refine_period
@@ -131,6 +144,18 @@ class HiSAAgent:
         self.current_thought = ""
         self.past_pattern_text = ""
         self.task_instruction = ""
+
+    def tool_commands(self, code: str, tool_name: str):
+        """Generate tool commands for application-specific tools."""
+        command = f"from {tool_name} import *; "
+        command += code
+
+        tool_class = self.tool_list[tool_name]
+        command += f"; {tool_class}.print_result()"
+
+        return [
+            command,
+        ]
 
     @property
     def turn_number(self) -> int:
@@ -326,6 +351,65 @@ class HiSAAgent:
             logger.error(f"[Step Abstraction] Failed: {e}")
             return "Step abstraction failed."
 
+    def pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[Dict]:
+        """Extract key lessons from task execution (simplified version).
+
+        Returns:
+            List of lesson dicts with 'type' and 'lesson' fields
+        """
+        if self.wo_pattern or not self.state_manager_func:
+            return []
+
+        # Use step_abstract directly (already contains step, action, result)
+        step_abstracts = []
+        for log in action_logs:
+            if "step_abstract" in log:
+                step_abstracts.append(log["step_abstract"])
+
+        prompt = PATTERN_INDUCTION_PROMPT.format(
+            task_instruction=task_instruction,
+            step_abstracts='\n'.join(step_abstracts)
+        )
+
+        try:
+            messages = [
+                {"role": "system", "content": "You are an expert at analyzing task execution patterns and extracting the most critical, reusable lessons. Be highly selective - only extract truly valuable insights. CRITICAL: focus only on the execution process."},
+                {"role": "user", "content": prompt}
+            ]
+
+            response = self.state_manager_func(messages)
+
+            # Try to parse as JSON
+            if "```json" in response:
+                json_start = response.find("```json") + 7
+                json_end = response.find("```", json_start)
+                json_str = response[json_start:json_end].strip()
+            elif "```" in response:
+                json_start = response.find("```") + 3
+                json_end = response.find("```", json_start)
+                json_str = response[json_start:json_end].strip()
+            else:
+                json_str = response.strip()
+
+            import json
+            lessons = json.loads(json_str)
+            if isinstance(lessons, list):
+                # Validate that each item is a dict with 'type' and 'lesson'
+                validated_lessons = []
+                for item in lessons[:3]:  # Max 3 lessons
+                    if isinstance(item, dict) and "type" in item and "lesson" in item:
+                        # Validate type is success or failure
+                        if item["type"] in ["success", "failure"]:
+                            validated_lessons.append(item)
+                return validated_lessons
+            else:
+                logger.warning(f"Expected list, got {type(lessons)}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Failed to extract lessons: {e}")
+            return []
+
     def prepare(self, instruction: str, obs: Dict, last_result: str = "") -> List[Dict]:
         """Prepare messages for the model."""
         self.task_instruction = instruction
@@ -339,8 +423,17 @@ class HiSAAgent:
         # Do context refinement if needed
         self._do_context_refinement()
 
-        # Build system message with prompt
-        system_message = GLOBAL_PLANNER_PROMPT.replace('{client_password}', self.client_password)
+        # Determine current tool/app
+        cur_app = obs.get("cur_app", "").strip().replace("-", "_").lower() if obs.get("cur_app") else None
+        tool_name = cur_app if cur_app in self.tool_list else None
+
+        # Build system message with dynamic prompt construction
+        from .prompt.procedural_memory import Prompt as HiSAPrompt
+        setup_prompt, func_def_prompt, note_prompt = HiSAPrompt.construct_procedural_memory(
+            Agent, app_name=tool_name, client_password=self.client_password, with_image=True, with_atree=self.with_atree, relative_coordinate=True, glm41v_format=True
+        )
+
+        system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
         system_message += f"\n\n**IMPORTANT** You are asked to complete the following task: {instruction}"
 
         messages = [{"role": "system", "content": system_message}]
@@ -357,9 +450,9 @@ class HiSAAgent:
 
         last_result = last_result.strip() if last_result else "None"
 
-        # Process A11y tree
+        # Process A11y tree if enabled
         tree = ""
-        if obs.get("accessibility_tree"):
+        if self.with_atree and obs.get("accessibility_tree"):
             tree = linearize_accessibility_tree(obs["accessibility_tree"], "Ubuntu")
             tree = trim_accessibility_tree(tree, self.a11y_tree_max_items)
 
@@ -454,8 +547,8 @@ class HiSAAgent:
                 actions = [eval(action)]
             else:
                 cur_app = obs.get("cur_app", "").strip().replace("-", "_").lower() if obs.get("cur_app") else None
-                if cur_app and cur_app in Agent.tool_list:
-                    actions = Agent.tool_commands(action, cur_app)
+                if cur_app and cur_app in self.tool_list:
+                    actions = self.tool_commands(action, cur_app)
                 else:
                     # Try direct eval
                     actions = [eval(action)]

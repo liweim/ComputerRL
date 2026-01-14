@@ -64,7 +64,7 @@ def config() -> argparse.Namespace:
     parser.add_argument("--provider_name", type=str, default="docker")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--action_space", type=str, default="autoglm_computer_use")
-    parser.add_argument("--observation_type", choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"], default="screenshot")
+    parser.add_argument("--with_atree", action="store_true", default=False, help="Include accessibility tree in observation")
     parser.add_argument("--screen_width", type=int, default=1920)
     parser.add_argument("--screen_height", type=int, default=1080)
     parser.add_argument("--sleep_after_execution", type=float, default=1.0)
@@ -150,6 +150,9 @@ class DesktopEnv(DesktopEnvBase):
             if action.get('action_type') == 'OPEN_APP':
                 self.setup_controller._launch_setup(action['parameters']['launch_app_command'], shell=True)
                 exe_result = 'Open ' + action['parameters']['app_name']
+            elif action.get('action_type') == 'OPEN_CHROME_TAB':
+                self.setup_controller._chrome_open_tabs_setup(action['parameters']['urls_to_open'])
+                exe_result = 'Open ' + str(action['parameters']['urls_to_open']) + ' in Chrome successfully'
             elif action.get('type') == 'bash':
                 # Handle bash commands from HiSA agent
                 result = self.controller.run_bash_script(action['command'], timeout=60)
@@ -174,19 +177,6 @@ class DesktopEnv(DesktopEnvBase):
 
         return observation, reward, done, info
 
-    def _patch_vm_server(self):
-        """Patch VM server main.py to comment out undefined _append_event calls."""
-        try:
-            result = self.controller.execute_python_command(
-                'import subprocess; '
-                'subprocess.run(["sed", "-i", "/^[[:space:]]*[^#]*_append_event/ { s/^/# /; n; s/^/# /; n; s/^/# /; }", "/home/user/server/main.py"], check=True); '
-                'print("VM server patched")'
-            )
-            if result and result.get('output'):
-                logger.info(f"VM server patch: {result.get('output', '').strip()}")
-        except Exception as e:
-            logger.warning(f"Failed to patch VM server (may already be patched): {e}")
-
     def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
         """Reset environment for a new task."""
         logger.info("Resetting environment...")
@@ -206,7 +196,6 @@ class DesktopEnv(DesktopEnvBase):
                 logger.info(f"Reverting to snapshot {self.snapshot_name}...")
                 self._revert_to_snapshot()
                 self._start_emulator()
-                self._patch_vm_server()  # Fix _append_event issue in VM
                 self.is_environment_used = False
             else:
                 logger.info(f"Environment is clean, skipping snapshot revert (provider: {self.provider_name}).")
@@ -496,6 +485,15 @@ def run_single_example_hisa(agent, env, example, max_steps, instruction, args, e
         total_completion_tokens = agent.token_tracker.total_completion_tokens
         total_image_count = agent.token_tracker.total_image_count
 
+    # Pattern induction
+    lessons = []
+    if not args.wo_pattern:
+        lessons = agent.pattern_induction(instruction, action_logs)
+        if lessons:
+            logger.info(f"Extracted {len(lessons)} lesson(s) from task execution")
+            for i, lesson in enumerate(lessons):
+                logger.info(f"  Lesson {i+1}: [{lesson['type']}] {lesson['lesson']}")
+
     # Build execution log
     execution_log = {
         "statistics": {
@@ -521,8 +519,7 @@ def run_single_example_hisa(agent, env, example, max_steps, instruction, args, e
         "task_config": example,
         "additional_context": "",
         "action_logs": action_logs,
-        "success": result == 1.0,
-        "failure_reason": "" if result == 1.0 else "Task not completed"
+        "lessons": lessons,
     }
 
     with open(os.path.join(example_result_dir, "execution_log.json"), "w", encoding="utf-8") as f:
@@ -656,15 +653,15 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         screen_size=(args.screen_width, args.screen_height),
         headless=args.headless,
         os_type="Ubuntu",
-        require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
+        require_a11y_tree=args.with_atree,  # Get a11y tree if needed
     )
 
     agent = HiSAAgent(
         action_space=args.action_space,
-        observation_type=args.observation_type,
         screen_size=(args.screen_width, args.screen_height),
         image_size=(args.image_width, args.image_height),
         max_trajectory_length=args.max_trajectory_length,
+        with_atree=args.with_atree,
         client_password=args.client_password,
         gen_func=token_tracker,
         state_manager_func=state_manager_func,
@@ -689,6 +686,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             logger.info(f"[Instruction]: {example['instruction']}")
 
             example_result_dir = os.path.join(args.result_dir, domain, example_id)
+            # Clean up old results if this is a rerun task
+            if args.rerun or args.rerun_fail:
+                if os.path.exists(example_result_dir):
+                    logger.info(f"Removing old results for {domain}/{example_id}")
+                    shutil.rmtree(example_result_dir)
             os.makedirs(example_result_dir, exist_ok=True)
 
             try:
@@ -731,6 +733,46 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                         shutil.rmtree(example_path)
         return total_file_json
 
+    # If rerun_fail is True, only rerun failed tasks specified in total_file_json
+    if rerun_fail:
+        tasks_to_rerun = {}
+        for domain in total_file_json:
+            tasks_to_rerun[domain] = []
+            if domain not in os.listdir(target_dir):
+                # Domain doesn't exist, run all tasks in it
+                tasks_to_rerun[domain] = total_file_json[domain]
+                continue
+            domain_path = os.path.join(target_dir, domain)
+            if not os.path.isdir(domain_path):
+                # Domain directory doesn't exist, run all tasks in it
+                tasks_to_rerun[domain] = total_file_json[domain]
+                continue
+            for example_id in total_file_json[domain]:
+                example_path = os.path.join(domain_path, example_id)
+                if not os.path.isdir(example_path):
+                    # Task directory doesn't exist, need to run
+                    tasks_to_rerun[domain].append(example_id)
+                elif "result.txt" not in os.listdir(example_path) or 'execution_log.json' not in os.listdir(example_path):
+                    # Incomplete task, need to rerun
+                    tasks_to_rerun[domain].append(example_id)
+                else:
+                    try:
+                        result_file = os.path.join(example_path, "result.txt")
+                        with open(result_file, "r") as f:
+                            score = float(f.read().strip())
+                        if score == 0.0:
+                            # Failed task, need to rerun
+                            tasks_to_rerun[domain].append(example_id)
+                        # If score > 0, skip (don't add to tasks_to_rerun)
+                    except Exception as e:
+                        raise RuntimeError(f"Error reading {result_file}: {e}")
+
+        # Remove empty domains
+        tasks_to_rerun = {k: v for k, v in tasks_to_rerun.items() if v}
+
+        return tasks_to_rerun
+
+    # Normal case: check all existing directories and find unfinished tasks
     finished = {}
     for domain in os.listdir(target_dir):
         finished[domain] = []
@@ -745,17 +787,6 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                         print(f"[Cleanup] Removing incomplete: {example_path}")
                         shutil.rmtree(example_path)
                     else:
-                        if rerun_fail:
-                            try:
-                                result_file = os.path.join(example_path, "result.txt")
-                                with open(result_file, "r") as f:
-                                    score = float(f.read().strip())
-                                if score == 0.0:
-                                    print(f"[Cleanup] Removing failed: {example_path}")
-                                    shutil.rmtree(example_path)
-                                    continue
-                            except Exception as e:
-                                raise RuntimeError(f"Error reading {result_file}: {e}")
                         finished[domain].append(example_id)
 
     if not finished:
@@ -766,37 +797,6 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
             total_file_json[domain] = [x for x in total_file_json[domain] if x not in examples]
 
     return total_file_json
-
-
-def get_result(target_dir):
-    """Get results."""
-    if not os.path.exists(target_dir):
-        print("New experiment, no result yet.")
-        return None
-
-    all_result = []
-    for domain in os.listdir(target_dir):
-        domain_path = os.path.join(target_dir, domain)
-        if os.path.isdir(domain_path):
-            for example_id in os.listdir(domain_path):
-                example_path = os.path.join(domain_path, example_id)
-                if os.path.isdir(example_path):
-                    if "result.txt" in os.listdir(example_path):
-                        try:
-                            with open(os.path.join(example_path, "result.txt"), "r") as rf:
-                                res = rf.read().strip()
-                                score = 1.0 if res.lower() == "true" else float(res)
-                        except Exception:
-                            score = 0.0
-                        all_result.append(score)
-
-    if not all_result:
-        print("New experiment, no result yet.")
-        return None
-    else:
-        print(f"Current Success Rate: {sum(all_result) / len(all_result) * 100}%")
-        return all_result
-
 
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -830,7 +830,6 @@ if __name__ == "__main__":
         left_info += f"{domain}: {len(test_file_list[domain])}\n"
     logger.info(f"Left tasks:\n{left_info}")
 
-    get_result(args.result_dir)
     test(args, test_file_list)
 
     logger.info("Generating summary...")

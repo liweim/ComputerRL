@@ -83,7 +83,7 @@ def config() -> argparse.Namespace:
         choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
         default="a11y_tree",
         help="Observation type",
-    )
+    )# NOTE: Only supports "a11y_tree" and actually uses screenshot (with_image=True, with_atree=False)
     parser.add_argument("--screen_width", type=int, default=1920)
     parser.add_argument("--screen_height", type=int, default=1080)
     parser.add_argument("--sleep_after_execution", type=float, default=1.0)
@@ -181,19 +181,6 @@ class DesktopEnv(DesktopEnvBase):
         
         return observation, reward, done, info
 
-    def _patch_vm_server(self):
-        """Patch VM server main.py to comment out undefined _append_event calls."""
-        try:
-            result = self.controller.execute_python_command(
-                'import subprocess; '
-                'subprocess.run(["sed", "-i", "/^[[:space:]]*[^#]*_append_event/ { s/^/# /; n; s/^/# /; n; s/^/# /; }", "/home/user/server/main.py"], check=True); '
-                'print("VM server patched")'
-            )
-            if result and result.get('output'):
-                logger.info(f"VM server patch: {result.get('output', '').strip()}")
-        except Exception as e:
-            logger.warning(f"Failed to patch VM server (may already be patched): {e}")
-
     def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
         # Reset to certain task in OSWorld
         logger.info("Resetting environment...")
@@ -223,7 +210,6 @@ class DesktopEnv(DesktopEnvBase):
                 self._revert_to_snapshot()
                 logger.info("Starting emulator...")
                 self._start_emulator()
-                self._patch_vm_server()  # Fix _append_event issue in VM
                 logger.info("Emulator started.")
                 # Reset the usage flag after reverting
                 self.is_environment_used = False
@@ -543,6 +529,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
                 domain,
                 example_id,
             )
+            # Clean up old results if this is a rerun task
+            if args.rerun or args.rerun_fail:
+                if os.path.exists(example_result_dir):
+                    logger.info(f"Removing old results for {domain}/{example_id}")
+                    shutil.rmtree(example_result_dir)
             os.makedirs(example_result_dir, exist_ok=True)
             # example start running
             try:
@@ -578,7 +569,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
 def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
     """Get unfinished tasks."""
-    
+
     if not os.path.exists(target_dir):
         return total_file_json
 
@@ -598,6 +589,46 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                         os.makedirs(example_path, exist_ok=True)
         return total_file_json
 
+    # If rerun_fail is True, only rerun failed tasks specified in total_file_json
+    if rerun_fail:
+        tasks_to_rerun = {}
+        for domain in total_file_json:
+            tasks_to_rerun[domain] = []
+            if domain not in os.listdir(target_dir):
+                # Domain doesn't exist, run all tasks in it
+                tasks_to_rerun[domain] = total_file_json[domain]
+                continue
+            domain_path = os.path.join(target_dir, domain)
+            if not os.path.isdir(domain_path):
+                # Domain directory doesn't exist, run all tasks in it
+                tasks_to_rerun[domain] = total_file_json[domain]
+                continue
+            for example_id in total_file_json[domain]:
+                example_path = os.path.join(domain_path, example_id)
+                if not os.path.isdir(example_path):
+                    # Task directory doesn't exist, need to run
+                    tasks_to_rerun[domain].append(example_id)
+                elif "result.txt" not in os.listdir(example_path) or 'execution_log.json' not in os.listdir(example_path):
+                    # Incomplete task, need to rerun
+                    tasks_to_rerun[domain].append(example_id)
+                else:
+                    try:
+                        result_file = os.path.join(example_path, "result.txt")
+                        with open(result_file, "r") as f:
+                            score = float(f.read().strip())
+                        if score == 0.0:
+                            # Failed task, need to rerun
+                            tasks_to_rerun[domain].append(example_id)
+                        # If score > 0, skip (don't add to tasks_to_rerun)
+                    except Exception as e:
+                        raise RuntimeError(f"Error reading {result_file}: {e}")
+
+        # Remove empty domains
+        tasks_to_rerun = {k: v for k, v in tasks_to_rerun.items() if v}
+
+        return tasks_to_rerun
+
+    # Normal case: check all existing directories and find unfinished tasks
     finished = {}
     for domain in os.listdir(target_dir):
         finished[domain] = []
@@ -614,21 +645,6 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
                         shutil.rmtree(example_path)
                         os.makedirs(example_path, exist_ok=True)
                     else:
-                        # Check if we should rerun failed tasks
-                        if rerun_fail:
-                            try:
-                                result_file = os.path.join(example_path, "result.txt")
-                                with open(result_file, "r") as f:
-                                    score = float(f.read().strip())
-                                if score == 0.0:
-                                    # Failed task, clear and re-run
-                                    print(f"[Cleanup] Removing failed task (score=0) directory: {example_path}")
-                                    shutil.rmtree(example_path)
-                                    os.makedirs(example_path, exist_ok=True)
-                                    continue
-                            except Exception as e:
-                                # Error reading result, report and exit instead of silently deleting
-                                raise RuntimeError(f"Error reading result file {result_file}: {e}. Please check the file manually.")
                         finished[domain].append(example_id)
 
     if not finished:
@@ -639,42 +655,6 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
             total_file_json[domain] = [x for x in total_file_json[domain] if x not in examples]
 
     return total_file_json
-
-
-def get_result(target_dir):
-    """Get results."""
-    if not os.path.exists(target_dir):
-        print("New experiment, no result yet.")
-        return None
-
-    all_result = []
-
-    for domain in os.listdir(target_dir):
-        domain_path = os.path.join(target_dir, domain)
-        if os.path.isdir(domain_path):
-            for example_id in os.listdir(domain_path):
-                example_path = os.path.join(domain_path, example_id)
-                if os.path.isdir(example_path):
-                    if "result.txt" in os.listdir(example_path):
-                        result_path = os.path.join(example_path, "result.txt")
-                        try:
-                            with open(result_path, "r") as rf:
-                                res = rf.read().strip()
-                                if res.lower() == "true":
-                                    score = 1.0
-                                else:
-                                    score = float(res)
-                        except Exception:
-                            score = 0.0
-                        all_result.append(score)
-
-    if not all_result:
-        print("New experiment, no result yet.")
-        return None
-    else:
-        print("Current Success Rate:", sum(all_result) / len(all_result) * 100, "%")
-        return all_result
-
 
 if __name__ == "__main__":
     ####### The complete version of the list of examples #######
@@ -722,7 +702,6 @@ if __name__ == "__main__":
         left_info += f"{domain}: {len(test_file_list[domain])}\n"
     logger.info(f"Left tasks:\n{left_info}")
 
-    get_result(args.result_dir)
     test(args, test_file_list)
     
     # Call summary() from utils.py after all tasks are completed

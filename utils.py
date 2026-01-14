@@ -307,4 +307,6 @@ def summary(result_dir, test_all_meta):
     return detailed_stats
 
 if __name__ == "__main__":
-    summary('/data1/lwm/projects/ComputerRL/results/hisa_test', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    #autoglm-os_baseline, hisa_wo_pattern
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_wo_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')

@@ -89,7 +89,7 @@ class AutoGLMAgent:
         self.action_space = action_space
         self.observation_type = observation_type
         assert action_space in ["autoglm_computer_use"], "Invalid action space"
-        assert observation_type in ["a11y_tree"], "Invalid observation type"
+        # assert observation_type in ["a11y_tree"], "Invalid observation type"
         self.max_trajectory_length = max_trajectory_length
         self.a11y_tree_max_items = a11y_tree_max_items
         self.with_image = with_image

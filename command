@@ -39,7 +39,7 @@ python run_autoglm_v.py \
     --result_dir results/autoglm-os_baseline \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_all.json \
+    --test_all_meta_path ./evaluation_examples/test_small.json \
     --cleanup_docker \
     > nohup2.out 2>&1 &
 
@@ -47,12 +47,14 @@ nohup \
 python run_hisa.py \
   --provider_name docker \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_test \
+  --result_dir ./results/hisa_wo_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/debug.json \
+  --test_all_meta_path ./evaluation_examples/test_small.json \
+  --wo_pattern \
+  --rerun_fail \
   --cleanup_docker \
-  > nohup3.out 2>&1 &
+  > nohup.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v.py
