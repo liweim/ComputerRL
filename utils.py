@@ -1,9 +1,194 @@
+#!/usr/bin/env python3
+"""
+Common utilities for handling context construction including RAG and verbose instruction.
+"""
+
 import os
+from typing import Tuple, Union
 import json
 import numpy as np
 import datetime
 import logging
 import sys
+from PIL import Image
+import cv2
+import re
+import math
+
+
+def get_change_roi(
+    image1: Union[Image.Image, np.ndarray, str],
+    image2: Union[Image.Image, np.ndarray, str],
+    margin: int = 50,
+) -> Union[Tuple[int, int, int, int], Tuple[Tuple[int, int, int, int], Image.Image]]:
+    # Load image
+    def load_image(img):
+        if isinstance(img, str):
+            # File path
+            return cv2.imread(img)
+        elif isinstance(img, Image.Image):
+            # PIL Image
+            return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        elif isinstance(img, np.ndarray):
+            # numpy array
+            return img
+        else:
+            raise ValueError(f"Unsupported image type: {type(img)}")
+
+    img1 = load_image(image1)
+    img2 = load_image(image2)
+
+    # Ensure both images have the same dimensions
+    if img1.shape != img2.shape:
+        raise ValueError(
+            f"Images must have the same dimensions. "
+            f"Got {img1.shape} and {img2.shape}"
+        )
+
+    # Convert to grayscale
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
+
+    # Calculate pixel differences
+    diff = cv2.absdiff(gray1, gray2)
+
+    # Apply threshold to get binary difference map
+    _, binary = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY)
+
+    # Find all changed pixels
+    coords = cv2.findNonZero(binary)
+
+    if coords is None:
+        return None, None
+
+    # Get bounding box of changed region
+    x, y, w, h = cv2.boundingRect(coords)
+
+    # Add margin
+    height, width = img1.shape[:2]
+    x1 = max(0, x - margin)
+    y1 = max(0, y - margin)
+    x2 = min(width, x + w + margin)
+    y2 = min(height, y + h + margin)
+
+    # Crop original image (return ROI from second image)
+    if isinstance(image2, Image.Image):
+        cropped1 = image1.crop((x1, y1, x2, y2))
+        cropped2 = image2.crop((x1, y1, x2, y2))
+    else:
+        # Crop from numpy array and convert to PIL Image
+        img1_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB) if len(img1.shape) == 3 else img1
+        img2_rgb = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB) if len(img2.shape) == 3 else img2
+        cropped1 = Image.fromarray(img1_rgb[y1:y2, x1:x2])
+        cropped2 = Image.fromarray(img2_rgb[y1:y2, x1:x2])
+
+    # print(f"cropped size from {Image.fromarray(img1).size} to {cropped1.size}")
+    # timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    # cropped1.save(f"results/tmp/cropped1_{timestamp}.png")
+    # cropped2.save(f"results/tmp/cropped2_{timestamp}.png")
+    return cropped1, cropped2
+
+
+def count_images_in_messages(messages: list) -> int:
+    """Count the number of images in message list"""
+    count = 0
+    for message in messages:
+        if isinstance(message.get("content"), list):
+            for content in message["content"]:
+                if content.get("type") in ["image_url", "image", "input_image"]:
+                    count += 1
+    return count
+
+
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
+    max_ratio=200,
+) -> tuple[int, int]:
+    """
+    Rescales the image so that the following conditions are met:
+
+    1. Both dimensions (height and width) are divisible by 'factor'.
+
+    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+
+    3. The aspect ratio of the image is maintained as closely as possible.
+    """
+    if max(height, width) / min(height, width) > max_ratio:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than {max_ratio}, got {max(height, width) / min(height, width)}"
+        )
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = floor_by_factor(height / beta, factor)
+        w_bar = floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = ceil_by_factor(height * beta, factor)
+        w_bar = ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def round_by_factor(number: int, factor: int) -> int:
+    """Returns the closest integer to 'number' that is divisible by 'factor'."""
+    return round(number / factor) * factor
+
+
+def ceil_by_factor(number: int, factor: int) -> int:
+    """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
+    return math.ceil(number / factor) * factor
+
+
+def floor_by_factor(number: int, factor: int) -> int:
+    """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
+    return math.floor(number / factor) * factor
+
+
+def serialize_json(obj):
+    """Convert objects to JSON serializable format"""
+    if hasattr(obj, "__dict__"):
+        # For objects with __dict__, convert to dict but exclude non-serializable items
+        result = {}
+        for key, value in obj.__dict__.items():
+            try:
+                json.dumps(value)  # Test if value is serializable
+                result[key] = value
+            except (TypeError, ValueError):
+                result[key] = str(value)  # Convert to string if not serializable
+        return result
+    elif isinstance(obj, dict):
+        result = {}
+        for key, value in obj.items():
+            try:
+                json.dumps(value)  # Test if value is serializable
+                result[key] = value
+            except (TypeError, ValueError):
+                result[key] = str(value)  # Convert to string if not serializable
+        return result
+    elif isinstance(obj, (list, tuple)):
+        return [serialize_json(item) for item in obj]
+    else:
+        try:
+            json.dumps(obj)  # Test if obj is serializable
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)  # Convert to string if not serializable
+
+
+def save_args_to_settings(args):
+    """Save args to settings.txt in the result subdirectory"""
+    os.makedirs(args.result_dir, exist_ok=True)
+    settings_file = os.path.join(args.result_dir, "settings.txt")
+
+    with open(settings_file, "w", encoding="utf-8") as f:
+        args_dict = vars(args)
+        for key, value in sorted(args_dict.items()):
+            f.write(f"{key} = {value}\n")
 
 def setup_logger(result_name, log_level):
     datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
@@ -18,11 +203,11 @@ def setup_logger(result_name, log_level):
     log_folder = f"logs/{result_name}"
     os.makedirs(log_folder, exist_ok=True)
     error_handler = logging.FileHandler(
-        os.path.join(log_folder, "error-{:}.log".format(datetime_str)),
+        os.path.join(log_folder, "{:}-error-{:}.log".format(result_name, datetime_str)),
         encoding="utf-8",
     )
     debug_handler = logging.FileHandler(
-        os.path.join(log_folder, "debug-{:}.log".format(datetime_str)),
+        os.path.join(log_folder, "{:}-debug-{:}.log".format(result_name, datetime_str)),
         encoding="utf-8",
     )
     stdout_handler = logging.StreamHandler(sys.stdout)
@@ -46,6 +231,33 @@ def setup_logger(result_name, log_level):
 
     logger = logging.getLogger("desktopenv")
     return logger
+
+
+def postprocess_action(action):
+    new_action = ""
+    if "pyautogui.scroll" in action:
+        match = re.findall(r"pyautogui\.scroll\((.*?)\)", action)
+        if len(match) > 0:
+            scroll_amount = match[0].split(",")[0].strip()
+            if float(scroll_amount) > 5:
+                new_action = action.replace(scroll_amount, "5")
+            elif float(scroll_amount) < -5:
+                new_action = action.replace(scroll_amount, "-5")
+    if "pyautogui.sleep" in action:
+        match = re.findall(r"pyautogui\.sleep\((.*?)\)", action)
+        for sleep_amount in match:
+            if float(sleep_amount) < 0.5:
+                new_action = action.replace(sleep_amount, "0.5")
+    if "time.sleep" in action:
+        match = re.findall(r"time\.sleep\((.*?)\)", action)
+        for sleep_amount in match:
+            if float(sleep_amount) < 0.5:
+                new_action = action.replace(sleep_amount, "0.5")
+
+    if new_action:
+        return new_action
+    else:
+        return action
 
 
 def summary(result_dir, test_all_meta):

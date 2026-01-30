@@ -1,363 +1,188 @@
-"""
-HiSA (Hierarchical Self-Adaptive) Agent implementation.
-Adapted from GUIAgent/agents/hisa.py with AutoGLM-compatible pseudo-code format.
-"""
-
+#!/usr/bin/env python3
 import base64
 import json
-import logging
 import os
-import re
-import time
+import logging
 import traceback
-from io import BytesIO
-from typing import Dict, List, Optional, Tuple
-
+from typing import Optional, Dict, List
+from utils import serialize_json, get_change_roi
+from json_repair import repair_json
+from utils import postprocess_action
+import re
+from .qdrant import QdrantManager, add_lessons_to_existing
+from .embedding import EmbeddingClient
 from PIL import Image
-
-from .prompts import (
-    GLOBAL_PLANNER_PROMPT,
-    FIX_RESPONSE_PROMPT,
-    STEP_ABSTRACTION_PROMPT,
-    CONTEXT_REFINEMENT_PROMPT,
-    PATTERN_INDUCTION_PROMPT,
-    PATTERN_SYNTHESIS_PROMPT,
-)
-
-        # Import from autoglm_v for code parsing and grounding
-from ..autoglm_v.prompt.grounding_agent import GroundingAgent as Agent
+import io
+import time
+import glob
+from .prompts import GLOBAL_PLANNER_PROMPT, CONTEXT_REFINEMENT_PROMPT, FIX_RESPONSE_PROMPT, FIX_RESPONSE_UNIFY_PROMPT, STEP_ABSTRACTION_PROMPT, PATTERN_INDUCTION_PROMPT, PATTERN_SYNTHESIS_PROMPT
+from ..autoglm_v.prompt.procedural_memory import Prompt as AutoGLMPrompt
+from ..autoglm_v.prompt.grounding_agent import GroundingAgent as AutoGLMAgent
 from ..autoglm_v.prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
-from ..autoglm_v.tools.package.google_chrome import BrowserTools  # Needed for eval() in execute()
+from ..autoglm_v.tools.package.google_chrome import BrowserTools
 
-logger = logging.getLogger("desktopenv.hisa")
+# ==================== PATTERN MANAGER ====================
 
-
-def resize_image(image: bytes, w: int, h: int) -> bytes:
-    """Resize image to specified dimensions."""
-    img = Image.open(BytesIO(image))
-    img = img.resize((w, h))
-    buf = BytesIO()
-    img.save(buf, format='PNG')
-    return buf.getvalue()
-
-
-def parse_code_from_string(input_string: str) -> List[str]:
-    """Parse code from response string (AutoGLM format)."""
-    input_string = input_string.strip()
-    
-    if input_string in ["WAIT", "DONE", "FAIL"]:
-        return [input_string]
-
-    # Match ```python code``` or ```code```
-    pattern = r"```(?:\w+\s+)?(.*?)```"
-    matches = re.findall(pattern, input_string, re.DOTALL)
-
-    codes = []
-    for match in matches:
-        match = match.strip()
-        commands = ["WAIT", "DONE", "FAIL"]
-
-        if match in commands:
-            codes.append(match)
-        elif match.split("\n")[-1] in commands:
-            if len(match.split("\n")) > 1:
-                codes.append("\n".join(match.split("\n")[:-1]))
-            codes.append(match.split("\n")[-1])
-        else:
-            codes.append(match)
-
-    return codes
-
-
-class HiSAAgent:
-    """
-    HiSA Agent with AutoGLM-compatible pseudo-code format.
-    
-    Combines hisa.py's advanced features (pattern learning, step abstraction, 
-    context refinement) with AutoGLM's pseudo-code action format.
-    """
+class PatternManager:
+    """Manage task execution pattern by domain."""
 
     def __init__(
         self,
-        action_space: str = "autoglm_computer_use",
-        screen_size: Tuple[int, int] = (1920, 1080),
-        image_size: Tuple[int, int] = (1280, 720),
-        max_trajectory_length: int = 3,
-        a11y_tree_max_items: int = 300,
-        with_atree: bool = False,
-        client_password: str = "password",
-        gen_func=None,
-        state_manager_func=None,
-        max_parse_retries: int = 3,
-        max_steps: int = 50,
-        # HiSA advanced features
-        wo_pattern: bool = True,  # Disable pattern learning by default
-        wo_step: bool = False,  # Enable step abstraction by default
-        wo_refinement: bool = False,  # Enable context refinement by default
-        refine_period: int = 5,
-        sliding_window_size: int = 5,
-        bash_timeout: int = 60,
+        llm=None,
+        qdrant_path: str = "D:/projects/qdrant/qdrant_storage",
+        embedding_service_url: str = "http://localhost:8000",
+        similarity_threshold: float = 0.7,
+        use_qdrant_server: bool = False,  # Default to server mode for multi-process
+        qdrant_server_url: str = "http://localhost:6333"
     ):
-        self.action_space = action_space
-        self.screen_size = screen_size
-        self.image_size = image_size
-        self.max_trajectory_length = max_trajectory_length
-        self.a11y_tree_max_items = a11y_tree_max_items
-        self.with_atree = with_atree
-        self.client_password = client_password
-        self.gen_func = gen_func
-        self.state_manager_func = state_manager_func
+        self.llm = llm
+        self.similarity_threshold = similarity_threshold
+        self.logger = logging.getLogger("desktopenv.pattern")
+        if not os.path.exists(qdrant_path):
+            for json_file in glob.glob("../GUIAgent/patterns/*.json"):
+                collection_name = os.path.basename(json_file).split(".")[0]
+                add_lessons_to_existing(
+                    json_file=json_file,
+                    collection_name=collection_name,
+                    use_server=False,
+                    path=qdrant_path
+                )
+        self.qdrant = QdrantManager(
+            path=qdrant_path,
+            use_server=use_qdrant_server,
+            server_url=qdrant_server_url
+        )
+        self.embedding_client = EmbeddingClient(service_url=embedding_service_url)
+        mode = "server" if use_qdrant_server else "local"
+        self.logger.info(f"Vector database ({mode} mode) and embedding service initialized")
 
-        # Tool list for application-specific tools
-        self.tool_list = {
-            "libreoffice_calc": "CalcTools",
-            "libreoffice_impress": "ImpressTools",
-            "libreoffice_writer": "WriterTools",
-            "code": "CodeTools",
-            "vlc": "VLCTools",
-            "google_chrome": "BrowserTools",
-        }
-
-        # Pattern induction settings
-        self.wo_pattern = wo_pattern
-
-        self.max_parse_retries = max_parse_retries
-        self.max_steps = max_steps
-
-        # HiSA advanced features
-        self.wo_step = wo_step
-        self.wo_refinement = wo_refinement
-        self.refine_period = refine_period
-        self.sliding_window_size = sliding_window_size
-        self.bash_timeout = bash_timeout
-
-        # Set Agent's coordinate mode
-        Agent.relative_coordinate = True
-
-        # Execution state
-        self.contents = []
-        self.action_logs = []
-        self.last_error_feedback = None
-        self.last_parse_error = None
-        self.last_full_summary = None
-        self.last_summary_step = 0
-        self.current_thought = ""
-        self.past_pattern_text = ""
-        self.task_instruction = ""
-
-    def tool_commands(self, code: str, tool_name: str):
-        """Generate tool commands for application-specific tools."""
-        command = f"from {tool_name} import *; "
-        command += code
-
-        tool_class = self.tool_list[tool_name]
-        command += f"; {tool_class}.print_result()"
-
-        return [
-            command,
-        ]
-
-    @property
-    def turn_number(self) -> int:
-        return len(self.contents)
-
-    def reset(self, _logger=None):
-        """Reset agent state for a new task."""
-        global logger
-        logger = _logger if _logger is not None else logging.getLogger("desktopenv.hisa")
-
-        self.contents = []
-        self.action_logs = []
-        self.last_error_feedback = None
-        self.last_parse_error = None
-        self.last_full_summary = None
-        self.last_summary_step = 0
-        self.current_thought = ""
-        self.past_pattern_text = ""
-        self.task_instruction = ""
-
-    def _build_execution_history(self) -> str:
-        """Build execution history text from action logs."""
-        if not self.action_logs:
-            return ""
-
-        # Apply sliding window if context refinement is disabled
-        logs_to_use = self.action_logs
-        if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
-            logs_to_use = self.action_logs[-self.sliding_window_size:]
-
-        # Build condensed history
-        history_lines = []
-        if not self.wo_refinement and self.last_full_summary:
-            # Use summary + recent logs
-            history_lines.append(self.last_full_summary)
-            for log in self.action_logs[self.last_summary_step:]:
-                if "step_abstract" in log:
-                    history_lines.append(log["step_abstract"])
-        else:
-            # Use logs directly (with sliding window if applicable)
-            for log in logs_to_use:
-                if "step_abstract" in log:
-                    history_lines.append(log["step_abstract"])
-
-        return "\n".join(history_lines)
-
-    def _summarize_history_segment(
-        self, 
-        logs: List[Dict], 
-        start_step: int, 
-        end_step: int, 
-        previous_summary: str = ""
-    ) -> str:
-        """Summarize a segment of action logs with context refinement."""
-        if not logs and not previous_summary:
-            return f"Steps {start_step}~{end_step}: No actions. Suggestion: Continue"
-
-        # Build history text
-        history_lines = []
-        for log in logs:
-            if "step_abstract" in log:
-                history_lines.append(log["step_abstract"])
-
-        if previous_summary:
-            if history_lines:
-                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>\n\n<new_steps>\n" + "\n".join(history_lines) + "\n</new_steps>"
-            else:
-                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>"
-        else:
-            history_text = "\n".join(history_lines) if history_lines else ""
-
-        if not history_text.strip():
-            return f"Steps {start_step}~{end_step}: No detailed records. Suggestion: Continue"
-
-        # Use state_manager to summarize if available
-        if self.state_manager_func:
-            prompt = CONTEXT_REFINEMENT_PROMPT.format(
-                task_instruction=self.task_instruction,
-                start_step=start_step,
-                end_step=end_step,
-                history_text=history_text
-            )
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                summary = self.state_manager_func(messages)
-                # Extract content from <answer> tag if present
-                # First try to match <answer>...</answer>
-                answer_match = re.search(r'<answer>(.*?)</answer>', summary, re.DOTALL)
-                if answer_match:
-                    summary = answer_match.group(1).strip()
-                else:
-                    # If no closing tag, try to get content after first <answer> until next tag or end
-                    answer_match = re.search(r'<answer>([^<]+)', summary, re.DOTALL)
-                    if answer_match:
-                        summary = answer_match.group(1).strip()
-                # Remove code block markers if present
-                summary = re.sub(r'```\w*\s*', '', summary).strip()
-                summary = re.sub(r'```', '', summary).strip()
-                return summary
-            except Exception as e:
-                logger.error(f"Failed to summarize history: {e}")
-
-        # Fallback: simple concatenation
-        if previous_summary:
-            return f"{previous_summary} + Steps {start_step}~{end_step}: {len(logs)} actions. Suggestion: Continue"
-        return f"Steps {start_step}~{end_step}: {len(logs)} actions executed. Suggestion: Continue"
-
-    def _do_context_refinement(self):
-        """Perform context refinement if needed."""
-        total_logs = len(self.action_logs)
-        
-        if self.wo_refinement or total_logs == 0 or total_logs % self.refine_period != 0:
-            return
-
-        logger.info(f"[Context Refinement] Triggered at step {total_logs}")
-        if self.last_full_summary:
-            # Not first time: use previous summary + new logs
-            logs_to_summarize = self.action_logs[self.last_summary_step:]
-            start_step = self.action_logs[0]["step"]
-            end_step = self.action_logs[-1]["step"]
-            summary = self._summarize_history_segment(
-                logs_to_summarize, start_step, end_step,
-                previous_summary=self.last_full_summary
-            )
-        else:
-            # First time: summarize all logs
-            logs_to_summarize = self.action_logs
-            start_step = logs_to_summarize[0]["step"]
-            end_step = logs_to_summarize[-1]["step"]
-            summary = self._summarize_history_segment(logs_to_summarize, start_step, end_step)
-
-        self.last_full_summary = summary
-        self.last_summary_step = total_logs
-        logger.info(f"[Context Refinement] Completed: {summary}")
-
-    def _step_abstraction(
-        self, 
-        before_screenshot: bytes, 
-        after_screenshot: bytes, 
-        action_description: str
-    ) -> str:
-        """Abstract step by comparing before/after screenshots."""
-        if self.wo_step or not self.state_manager_func:
-            return ""
-
+    def _ensure_collection(self, collection_name: str):
+        """Ensure Qdrant collection exists for a domain."""
         try:
-            # Resize images for comparison
-            before_img = Image.open(BytesIO(before_screenshot))
-            after_img = Image.open(BytesIO(after_screenshot))
-            
-            # Convert to base64
-            before_buffer = BytesIO()
-            after_buffer = BytesIO()
-            before_img.save(before_buffer, format="PNG")
-            after_img.save(after_buffer, format="PNG")
-            before_b64 = base64.b64encode(before_buffer.getvalue()).decode("utf-8")
-            after_b64 = base64.b64encode(after_buffer.getvalue()).decode("utf-8")
+            collections = self.qdrant.list_collections()
+            if collection_name not in collections:
+                self.qdrant.create_collection(
+                    collection_name=collection_name,
+                    vector_size=1024,
+                    distance="Cosine"
+                )
+                self.logger.info(f"Created Qdrant collection: {collection_name}")
+        except Exception as e:
+            self.logger.error(f"Failed to ensure collection {collection_name}: {e}")
 
-            prompt = STEP_ABSTRACTION_PROMPT.format(action_description=action_description)
+    def save_pattern(self, domain: str, lessons: List[Dict]):
+        """Save lessons using Qdrant vector database with deduplication.
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Before screenshot:"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{before_b64}"}},
-                        {"type": "text", "text": "After screenshot:"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{after_b64}"}},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
+        Args:
+            domain: The domain to save lessons to
+            lessons: List of lesson dicts, each with 'type' and 'lesson' fields
+                    type must be: 'success' or 'failure' (determined by LLM from execution)
 
-            response = self.state_manager_func(messages)
-            result = response
-            # Extract content from <answer> tag if present
-            # First try to match <answer>...</answer>
-            answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
-            if answer_match:
-                result = answer_match.group(1).strip()
-            else:
-                # If no closing tag, try to get content after first <answer> until next tag or end
-                answer_match = re.search(r'<answer>([^<]+)', response, re.DOTALL)
-                if answer_match:
-                    result = answer_match.group(1).strip()
-            # Remove code block markers if present
-            result = re.sub(r'```\w*\s*', '', result).strip()
-            result = re.sub(r'```', '', result).strip()
-            logger.info(f"[Step Abstraction]: {response}")
-            return result
+        Note:
+            - Each lesson is vectorized and stored in Qdrant
+            - Similar lessons (cosine similarity > threshold) are detected and removed
+            - New lessons replace similar old ones
+            - Different domains use different Qdrant collections
+        """
+        try:
+            self._ensure_collection(domain)
+
+            # Get current max ID from Qdrant
+            try:
+                count = self.qdrant.count_points(domain)
+                all_points = self.qdrant.scroll_all(domain, limit=1000, with_vectors=False)
+                max_id = max([p["id"] for p in all_points], default=0) if all_points else 0
+                next_id = max_id + 1
+            except:
+                next_id = 1
+
+            added_count = 0
+            replaced_count = 0
+
+            for lesson_obj in lessons:
+                lesson_text = lesson_obj.get("lesson", "")
+                lesson_type = lesson_obj.get("type", "failure")
+
+                if not lesson_text:
+                    continue
+
+                # Generate embedding for the lesson
+                try:
+                    lesson_vector = self.embedding_client(lesson_text)
+                except Exception as e:
+                    self.logger.error(f"Failed to generate embedding: {e}")
+                    continue
+
+                # Search for similar lessons
+                try:
+                    similar_results = self.qdrant.search(
+                        collection_name=domain,
+                        query_vector=lesson_vector,
+                        limit=5,
+                        score_threshold=self.similarity_threshold
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Search failed: {e}, assuming no similar lessons")
+                    similar_results = []
+
+                # Filter out lessons with type="require" from deletion candidates
+                # IMPORTANT: Never delete or modify lessons with type="require"
+                deletable_similar = []
+                for r in similar_results:
+                    similar_type = r.get("payload", {}).get("type", "")
+                    if similar_type != "require":
+                        deletable_similar.append(r)
+                    else:
+                        self.logger.info(f"Skipping deletion of require-type lesson (id={r['id']}) - these are protected")
+
+                # Delete similar old lessons (excluding require type)
+                if deletable_similar:
+                    deletable_ids = [r["id"] for r in deletable_similar]
+                    self.logger.info(
+                        f"Found {len(deletable_similar)} similar lesson(s) with similarity > {self.similarity_threshold}, "
+                        f"replacing them with new lesson"
+                    )
+                    try:
+                        self.qdrant.delete_by_ids(domain, deletable_ids)
+                        replaced_count += len(deletable_ids)
+                    except Exception as e:
+                        self.logger.error(f"Failed to delete similar lessons: {e}")
+
+                # Add new lesson
+                try:
+                    self.qdrant.insert_points(
+                        collection_name=domain,
+                        points=[{
+                            "id": next_id,
+                            "vector": lesson_vector,
+                            "payload": {
+                                "lesson": lesson_text,
+                                "type": lesson_type,
+                                "domain": domain
+                            }
+                        }]
+                    )
+                    added_count += 1
+                    next_id += 1
+                except Exception as e:
+                    self.logger.error(f"Failed to insert lesson: {e}")
+
+            self.logger.info(
+                f"Vector DB update for domain {domain}: "
+                f"added {added_count} new lesson(s), replaced {replaced_count} similar lesson(s)"
+            )
 
         except Exception as e:
-            logger.error(f"[Step Abstraction] Failed: {e}")
-            return "Step abstraction failed."
+            self.logger.error(f"Failed to save pattern with vector DB: {e}")
+            raise
 
-    def pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[Dict]:
-        """Extract key lessons from task execution (simplified version).
+    def pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[str]:
+        """Use LLM to extract key lessons from task execution.
 
         Returns:
-            List of lesson dicts with 'type' and 'lesson' fields
+            List of lesson strings
         """
-        if self.wo_pattern or not self.state_manager_func:
+        if not self.llm:
             return []
 
         # Use step_abstract directly (already contains step, action, result)
@@ -377,7 +202,7 @@ class HiSAAgent:
                 {"role": "user", "content": prompt}
             ]
 
-            response = self.state_manager_func(messages)
+            response = self.llm(messages)
 
             # Try to parse as JSON
             if "```json" in response:
@@ -391,8 +216,7 @@ class HiSAAgent:
             else:
                 json_str = response.strip()
 
-            import json
-            lessons = json.loads(json_str)
+            lessons = json.loads(repair_json(json_str))
             if isinstance(lessons, list):
                 # Validate that each item is a dict with 'type' and 'lesson'
                 validated_lessons = []
@@ -401,281 +225,1723 @@ class HiSAAgent:
                         # Validate type is success or failure
                         if item["type"] in ["success", "failure"]:
                             validated_lessons.append(item)
+                        else:
+                            self.logger.warning(f"Invalid lesson type '{item['type']}', skipping")
+                    else:
+                        self.logger.warning(f"Invalid lesson format: {item}, skipping")
                 return validated_lessons
             else:
-                logger.warning(f"Expected list, got {type(lessons)}")
+                self.logger.warning(f"Expected list, got {type(lessons)}")
                 return []
 
         except Exception as e:
-            logger.error(f"Failed to extract lessons: {e}")
+            self.logger.error(f"Failed to extract lessons: {e}")
             return []
 
-    def prepare(self, instruction: str, obs: Dict, last_result: str = "") -> List[Dict]:
-        """Prepare messages for the model."""
-        self.task_instruction = instruction
+    def get_relevant_pattern(self, domain: str, current_task: str) -> str:
+        """Retrieve relevant patterns using vector similarity search.
 
-        # Update last result in contents
-        if "exe_result" in obs and not last_result:
-            last_result = obs["exe_result"]
-            if self.contents:
-                self.contents[-1]["exe_result"] = last_result
+        Returns:
+            Actionable advice string based on relevant patterns
+        """
+        try:
+            self._ensure_collection(domain)
 
-        # Do context refinement if needed
-        self._do_context_refinement()
+            # Check if collection has any points
+            try:
+                count = self.qdrant.count_points(domain)
+                if count == 0:
+                    self.logger.info(f"No pattern found in collection {domain}")
+                    return ""
+            except Exception as e:
+                self.logger.warning(f"Failed to check collection count: {e}")
+                return ""
 
-        # Determine current tool/app
-        cur_app = obs.get("cur_app", "").strip().replace("-", "_").lower() if obs.get("cur_app") else None
-        tool_name = cur_app if cur_app in self.tool_list else None
+            # First, retrieve ALL lessons with type="require" (mandatory requirements)
+            require_patterns = []
+            try:
+                all_require_results = self.qdrant.search_by_filter(
+                    collection_name=domain,
+                    filter_conditions={"type": "require"},
+                    limit=100  # Get all require type lessons
+                )
+                for result in all_require_results:
+                    payload = result["payload"]
+                    lesson_text = payload.get("lesson", "")
+                    entry = {"id": result["id"], "lesson": lesson_text, "score": result["score"]}
+                    require_patterns.append(entry)
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to retrieve require type lessons: {e}")
 
-        # Build system message with dynamic prompt construction
-        from .prompt.procedural_memory import Prompt as HiSAPrompt
-        setup_prompt, func_def_prompt, note_prompt = HiSAPrompt.construct_procedural_memory(
-            Agent, app_name=tool_name, client_password=self.client_password, with_image=True, with_atree=self.with_atree, relative_coordinate=True, glm41v_format=True
+            # Vectorize current task
+            try:
+                task_vector = self.embedding_client(current_task)
+            except Exception as e:
+                self.logger.error(f"Failed to generate task embedding: {e}")
+                raise
+
+            # Search for similar lessons (top 5, threshold 0.75 for high quality matching)
+            try:
+                search_results = self.qdrant.search(
+                    collection_name=domain,
+                    query_vector=task_vector,
+                    limit=5,
+                    score_threshold=0.5
+                )
+            except Exception as e:
+                self.logger.error(f"Vector search failed: {e}")
+                raise
+
+            # Group by type (excluding require since we already have them all)
+            success_patterns = []
+            failure_patterns = []
+
+            for result in search_results:
+                payload = result["payload"]
+                lesson_type = payload.get("type", "failure")
+                lesson_text = payload.get("lesson", "")
+                score = result["score"]
+
+                entry = {"id": result["id"], "lesson": lesson_text, "score": score}
+
+                # Skip require type here as we already retrieved all of them above
+                if lesson_type == "require":
+                    continue
+                elif lesson_type == "success":
+                    success_patterns.append(entry)
+                else:
+                    failure_patterns.append(entry)
+
+            # Build summary
+            pattern_summary = []
+            if require_patterns:
+                pattern_summary.append("\n--- REQUIREMENTS (MUST FOLLOW) ---")
+                for pattern in require_patterns:
+                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+
+            if success_patterns:
+                pattern_summary.append("\n--- SUCCESS Patterns ---")
+                for pattern in success_patterns:
+                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+
+            if failure_patterns:
+                pattern_summary.append("\n--- FAILURE Patterns ---")
+                for pattern in failure_patterns:
+                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+
+            if not pattern_summary:
+                return ""
+
+            prompt = PATTERN_SYNTHESIS_PROMPT.format(
+                current_task=current_task,
+                pattern_summary='\n'.join(pattern_summary)
+            )
+
+            try:
+                messages = [
+                    {"role": "system", "content": "You are an expert at analyzing past lessons and providing actionable advice for new tasks."},
+                    {"role": "user", "content": prompt}
+                ]
+
+                response = self.llm(messages)
+                self.logger.info(f"Retrieved {len(pattern_summary)} relevant lesson(s) using vector search")
+                return response.strip()
+
+            except Exception as e:
+                self.logger.error(f"Failed to summarize patterns: {e}")
+                return '\n'.join(pattern_summary)
+
+        except Exception as e:
+            self.logger.error(f"Failed to get relevant patterns with vector DB: {e}")
+            raise
+
+# ==================== AGENT FRAMEWORK ====================
+
+class HiSA:
+    """Cognitive Memory Model Agent."""
+
+    def __init__(
+        self,
+        env,
+        global_planner_model=None,  # Function to call LLM for global planner
+        visual_grounder_model=None,  # Function to call LLM for visual grounder (only used when unify_llm=False)
+        state_manager_model=None,  # Function to call LLM for state manager
+        client_password: str = "password",
+        screen_width: int = 1920,
+        screen_height: int = 1080,
+        sleep_after_execution: float = 0.5,
+        max_steps: int = 15,
+        save_dir: str = "",
+        record: bool = False,
+        max_parse_retries: int = 3,
+        wo_pattern: bool = False,  # If True, disable pattern induction (default: False means pattern induction is enabled)
+        pattern_dir: str = "D:/projects/qdrant/qdrant_storage",
+        use_qdrant_server: bool = False,  # Use server mode by default for multi-process
+        qdrant_server_url: str = "http://localhost:6333",
+        wo_roi: bool = False,  # If True, disable ROI cropping (default: False means ROI cropping is enabled)
+        roi_margin: int = 50,  # Margin around ROI when cropping
+        refine_period: int = 5,
+        bash_timeout: int = 60,  # Timeout for bash script execution in seconds
+        wo_step: bool = False,  # If True, skip step abstraction and use full conversation history
+        wo_refinement: bool = False,  # If True, disable context refinement and use sliding window
+        sliding_window_size: int = 5,  # Sliding window size (number of conversation turns to keep)
+        unify_llm: bool = True,  # If True, use unified LLM for controller and grounder
+        with_image: bool = True,
+        with_atree: bool = False,
+        tool_in_sys_msg: bool = True,
+        relative_coordinate: bool = True,
+        glm41v_format: bool = False,
+    ):
+        self.env = env
+        self.global_planner_model = global_planner_model
+        self.visual_grounder_model = visual_grounder_model
+        self.state_manager_model = state_manager_model
+        self.client_password = client_password
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.sleep_after_execution = sleep_after_execution
+        self.max_steps = max_steps
+        self.save_dir = save_dir
+        self.record = record
+        self.max_parse_retries = max_parse_retries
+        self.wo_pattern = wo_pattern  # If True, disable pattern induction (default: False means pattern induction is enabled)
+        self.wo_roi = wo_roi  # If True, disable ROI cropping (default: False means ROI cropping is enabled)
+        self.roi_margin = roi_margin
+        self.refine_period = refine_period
+        self.bash_timeout = bash_timeout  # Timeout for bash script execution
+        self.wo_step = wo_step  # Skip step abstraction if True
+        self.wo_refinement = wo_refinement  # Disable context refinement if True
+        self.sliding_window_size = sliding_window_size  # Sliding window size for conversation history
+        self.unify_llm = unify_llm  # Use unified LLM for controller and grounder
+        self.with_image = with_image
+        self.with_atree = with_atree
+        self.tool_in_sys_msg = tool_in_sys_msg
+        self.relative_coordinate = relative_coordinate
+        self.glm41v_format = glm41v_format
+
+        # Tool list for unified LLM (same as autoglm_v)
+        self.tool_list = {
+            "libreoffice_calc": "CalcTools",
+            "libreoffice_impress": "ImpressTools",
+            "libreoffice_writer": "WriterTools",
+            "code": "CodeTools",
+            "vlc": "VLCTools",
+            "google_chrome": "BrowserTools"
+        }
+
+        self.logger = logging.getLogger("desktopenv")
+
+        # Initialize token usage tracking (for compatibility with existing code)
+        self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+
+        # Initialize pattern manager
+        if not self.wo_pattern:
+            self.pattern_manager = PatternManager(
+                llm=self.global_planner_model,
+                qdrant_path=pattern_dir,
+                similarity_threshold=0.7,
+                use_qdrant_server=use_qdrant_server,
+                qdrant_server_url=qdrant_server_url
+            )
+            self.logger.info(f"Pattern manager initialized")
+
+        # Execution state
+        self.operation_count = 0
+        self.operations_dir = ""
+        self.action_logs = []
+        self.last_error_feedback = None  # Store error feedback for retry
+        self.last_full_summary = None  # Last complete history summary
+        self.last_summary_step = 0  # Step number of last summary
+        self.step_token_usage = {}  # Store token usage for current step
+        self.current_thought = ""  # Store current step's thought for step_abstract
+        self.last_tool_output = None  # Store last tool execution result for wo_step mode
+
+    def _call_llm(self, func, messages, usage_tracker):
+        """Call LLM function and update usage statistics."""
+        if hasattr(func, 'get_last_usage'):
+            # TokenTracker style function
+            response = func(messages)
+            usage = func.get_last_usage()
+            usage_tracker["cost"] += usage.get("cost", 0.0)
+            usage_tracker["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            usage_tracker["completion_tokens"] += usage.get("completion_tokens", 0)
+            usage_tracker["image_count"] += usage.get("image_count", 0)
+        else:
+            # Simple function that returns content
+            response = func(messages)
+            # For simple functions, we don't have usage info, so we skip updating
+        return response
+
+    def _get_usage_snapshot(self) -> Dict:
+        """Get current token usage snapshot from all LLMs."""
+        return {
+            "global_planner": self.global_planner_usage.copy(),
+            "visual_grounder": self.visual_grounder_usage.copy(),
+            "state_manager": self.state_manager_usage.copy()
+        }
+
+    def _calculate_usage_delta(self, before: Dict, after: Dict) -> Dict:
+        """Calculate the difference in token usage between two snapshots."""
+        delta = {}
+        for model in ["global_planner", "visual_grounder", "state_manager"]:
+            delta[model] = {
+                "cost": after[model]["cost"] - before[model]["cost"],
+                "prompt_tokens": after[model]["prompt_tokens"] - before[model]["prompt_tokens"],
+                "completion_tokens": after[model]["completion_tokens"] - before[model]["completion_tokens"],
+                "image_count": after[model]["image_count"] - before[model]["image_count"]
+            }
+        return delta
+
+    def _summarize_history_segment(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
+        """Summarize a segment of action logs with context refinement."""
+        
+        if not logs and not previous_summary:
+            return f"Steps {start_step}~{end_step}: No actions. Suggestion: Continue"
+
+        # Build detailed history of new logs
+        if self.wo_step:
+            history_lines = []
+            
+            if logs:
+                for i, log in enumerate(logs):
+                    step_num = log.get("step", 0)
+                    msg_idx = i * 2 
+                    
+                    if msg_idx + 1 < len(self.conversation_messages):
+                        user_msg = self.conversation_messages[msg_idx]
+                        assistant_msg = self.conversation_messages[msg_idx + 1]
+                        
+                        # Extract text content
+                        user_text = ""
+                        if isinstance(user_msg.get('content'), list):
+                            for content_item in user_msg['content']:
+                                if content_item.get('type') in ['text', 'input_text']:
+                                    user_text = content_item.get('text', '')
+                                    break
+                        else:
+                            user_text = user_msg.get('content', '')
+                        
+                        assistant_text = ""
+                        if isinstance(assistant_msg.get('content'), list):
+                            for content_item in assistant_msg['content']:
+                                if content_item.get('type') in ['text', 'input_text']:
+                                    assistant_text = content_item.get('text', '')
+                                    break
+                        else:
+                            assistant_text = assistant_msg.get('content', '')
+                        
+                        history_lines.append(f"Step {step_num}:\n  User: {user_text}\n  Assistant: {assistant_text}")
+        else:
+            # Original step_abstract approach
+            history_lines = []
+            for log in logs:
+                if "step_abstract" in log:
+                    history_lines.append(log["step_abstract"])
+
+        # Build complete history text
+        if previous_summary:
+            # Include previous summary + new logs
+            if history_lines:
+                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>\n\n<new_steps>\n" + "\n".join(history_lines) + "\n</new_steps>"
+            else:
+                # Only previous summary, no new steps
+                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>"
+        else:
+            # First time, only new logs
+            history_text = "\n".join(history_lines) if history_lines else ""
+
+        if not history_text.strip():
+            return f"Steps {start_step}~{end_step}: No detailed records. Suggestion: Continue"
+
+        # Use LLM to summarize with context refinement
+        prompt = CONTEXT_REFINEMENT_PROMPT.format(
+            task_instruction=self.task_instruction,
+            start_step=start_step,
+            end_step=end_step,
+            history_text=history_text
         )
 
-        system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
-        system_message += f"\n\n**IMPORTANT** You are asked to complete the following task: {instruction}"
+        try:
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+            summary_with_context_refinement = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            return summary_with_context_refinement.strip()
+        except Exception as e:
+            self.logger.error(f"Failed to summarize history segment with context refinement: {e}")
+            # Fallback: combine previous summary with brief new summary
+            if previous_summary:
+                brief_new = f"Steps {start_step}~{end_step}: {len(logs)} actions" if logs else "no new actions"
+                return f"{previous_summary} + {brief_new}. Suggestion: Continue"
+            else:
+                brief_summary = f"{len(logs)} actions executed"
+                return f"Steps {start_step}~{end_step}: {brief_summary}. Suggestion: Continue"
 
-        messages = [{"role": "system", "content": system_message}]
+    def execute_task(
+        self,
+        task_config: dict
+    ) -> float:
+        """Execute task using tool-calling loop."""
+        
+        # Record start time for execution time tracking
+        self.start_time = time.time()
 
-        # Build execution history
-        execution_history = self._build_execution_history()
+        # Reset state
+        self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.env.reset(task_config=task_config)
+        self.operation_count = 0
+        self.action_logs = []
+        self.last_full_summary = None
+        self.last_summary_step = 0
+        self.conversation_messages = []  # Store full conversation history when wo_step=True
+        self.last_tool_output = None  # Store last tool execution result for wo_step mode
 
-        # Build observation info
-        app_str = "None"
-        if obs.get("apps"):
+        if self.record:
+            self.env.controller.start_recording()
+
+        # Setup directories
+        self.operations_dir = os.path.join(self.save_dir, "operations")
+        os.makedirs(self.operations_dir, exist_ok=True)
+
+        self.logger.info("Global Planner: autoglm-os")
+        self.logger.info("Visual Grounder: autoglm-os")
+        self.logger.info("State Manager: autoglm-os")
+        self.logger.info(f"Max steps: {self.max_steps}")
+        self.logger.info(f"wo_step: {self.wo_step}")
+        
+        # Initial message
+        task_instruction = task_config["instruction"]
+
+        # Save task instruction as instance variable for later use
+        self.task_instruction = task_instruction
+
+        # Load relevant pattern
+        domain = task_config.get("domain", "general")
+        past_pattern_text = ""
+        if not self.wo_pattern:
+            past_pattern_text = self.pattern_manager.get_relevant_pattern(
+                domain, task_instruction
+            )
+            if past_pattern_text:
+                self.logger.info(f"Found relevant past pattern for domain: {domain}\n{past_pattern_text}")
+            else:
+                self.logger.info(f"No relevant past pattern found for domain: {domain}")
+
+        # Save past pattern as instance variable for later use
+        self.past_pattern_text = past_pattern_text
+
+        # Main execution loop
+        is_infeasible = False
+        infeasible_reason = ""
+        try:
+            while self.operation_count < self.max_steps:
+                self.logger.info(f"Step {self.operation_count + 1}/{self.max_steps}")
+
+                # Capture token usage before this step
+                usage_before_step = self._get_usage_snapshot()
+
+                # Get global planner decision
+                decision = self._get_global_planner_decision()
+
+                if decision is None:
+                    self.logger.error("Failed to get valid decision")
+                    # Send "FAIL" action to environment for task failure
+                    try:
+                        self.env.step("FAIL", 0)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send FAIL action: {e}")
+                    break
+
+                # Capture token usage after global planner decision
+                usage_after_global_planner = self._get_usage_snapshot()
+
+                # Check termination or infeasible
+                if self.unify_llm:
+                    # In unify_llm mode, check for special commands (autoglm_v style)
+                    if decision.get("code") == "DONE":
+                        is_infeasible = False
+                        self.logger.info("Task COMPLETED")
+                        break
+                    elif decision.get("code") == "FAIL":
+                        is_infeasible = True
+                        infeasible_reason = "Task failed (marked as FAIL by agent)"
+                        self.logger.info(f"Task FAILED: {infeasible_reason}")
+                        # Send "FAIL" action to environment so action_history ends with "FAIL"
+                        # This is required for OSWorld's infeasible task evaluation
+                        try:
+                            self.env.step("FAIL", 0)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to send FAIL action: {e}")
+                        break
+                    elif decision.get("code") == "WAIT":
+                        # Handle WAIT command - continue to next iteration
+                        self.logger.info("Agent requested WAIT - continuing to next step")
+                        continue
+                else:
+                    # Traditional hisa mode with tool field
+                    if decision["tool"] == "termination":
+                        is_infeasible = False
+                        self.logger.info("Task COMPLETED")
+                        break
+                    elif decision["tool"] == "infeasible":
+                        is_infeasible = True
+                        infeasible_reason = decision.get('input', 'Task is objectively impossible to complete')
+                        self.logger.info(f"Task INFEASIBLE: {infeasible_reason}")
+                        # Send "FAIL" action to environment so action_history ends with "FAIL"
+                        # This is required for OSWorld's infeasible task evaluation
+                        try:
+                            self.env.step("FAIL", 0)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to send FAIL action: {e}")
+                        break
+
+                # Pre-calculate global planner token usage and set step_token_usage before tool execution
+                # This ensures _gui_action/_bash_execution can use it when creating action_log
+                global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
+
+                # Initialize step_token_usage with global planner data (visual_grounder/state_manager will be updated after execution)
+                self.step_token_usage = {
+                    "global_planner": global_planner_usage["global_planner"],
+                    "visual_grounder": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
+                    "state_manager": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
+                    "total": global_planner_usage["global_planner"].copy()
+                }
+
+                # Execute tool and capture execution result text
+                execution_result_text = self._execute_tool(decision)
+                
+                if execution_result_text and (self.unify_llm or self.wo_step):
+                    self.last_tool_output = execution_result_text
+
+                # Capture token usage after tool execution
+                usage_after_tool = self._get_usage_snapshot()
+
+                # Calculate state_manager/visual_grounder token usage and update step_token_usage
+                tool_usage = self._calculate_usage_delta(usage_after_global_planner, usage_after_tool)
+                total_step_usage = self._calculate_usage_delta(usage_before_step, usage_after_tool)
+
+                # Update token usage: combine state_manager usage from history summarization and step abstraction
+                self.step_token_usage = {
+                    "global_planner": global_planner_usage["global_planner"],
+                    "visual_grounder": tool_usage["visual_grounder"],
+                    "state_manager": {
+                        "cost": global_planner_usage["state_manager"]["cost"] + tool_usage["state_manager"]["cost"],
+                        "prompt_tokens": global_planner_usage["state_manager"]["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
+                        "completion_tokens": global_planner_usage["state_manager"]["completion_tokens"] + tool_usage["state_manager"]["completion_tokens"],
+                        "image_count": global_planner_usage["state_manager"]["image_count"] + tool_usage["state_manager"]["image_count"]
+                    },
+                    "total": {
+                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["visual_grounder"]["cost"] + total_step_usage["state_manager"]["cost"],
+                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["visual_grounder"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"],
+                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["visual_grounder"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"],
+                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["visual_grounder"]["image_count"] + total_step_usage["state_manager"]["image_count"]
+                    }
+                }
+
+                # Update the action_log entry that was already added with complete token usage
+                if self.action_logs and self.action_logs[-1]["step"] == self.operation_count + 1:
+                    self.action_logs[-1]["token_usage"] = self.step_token_usage
+
+                self.operation_count += 1
+
+                # Continue with next iteration
+                # (screenshot will be fetched in next _get_global_planner_decision call)
+
+            # Check if reached max_steps without completion
+            if self.operation_count >= self.max_steps and not is_infeasible:
+                is_infeasible = True
+                infeasible_reason = f"Reached maximum steps ({self.max_steps}) without completing the task. Task may be infeasible or requires a different approach."
+                self.logger.info(f"Reached max_steps ({self.max_steps}), marking as INFEASIBLE")
+                # Send "FAIL" action to environment so action_history ends with "FAIL"
+                # This is required for OSWorld's infeasible task evaluation
+                try:
+                    self.env.step("FAIL", 0)
+                except Exception as e:
+                    self.logger.warning(f"Failed to send FAIL action: {e}")
+
+            # Evaluation
+            score = self._evaluate_and_save(task_config, is_infeasible, infeasible_reason)
+
+        except Exception as e:
+            self.logger.error(f"Execution error: {e}")
+            self.logger.error(traceback.format_exc())
+            # Send "FAIL" action to environment for unexpected task failure
+            try:
+                self.env.step("FAIL", 0)
+            except Exception as fail_error:
+                self.logger.warning(f"Failed to send FAIL action: {fail_error}")
+            
+            with open(os.path.join(self.save_dir, "result.txt"), "w") as f:
+                f.write("0.0")
+            
+            # Save err_reason.txt with error details
+            with open(os.path.join(self.save_dir, "err_reason.txt"), "w") as f:
+                f.write(f"Fatal error: {str(e)}\n\n{traceback.format_exc()}")
+            
+            score = 0.0
+        
+        if self.record:
+            self.env.controller.end_recording(os.path.join(self.save_dir, "recording.mp4"))
+        
+        return score
+
+    def _get_global_planner_decision(self) -> Optional[Dict]:
+        """Get decision from global planner with retry on parsing errors."""
+
+        for attempt in range(self.max_parse_retries):
+            try:
+                # Get current screenshot
+                screenshot = self.env.controller.get_screenshot()
+                screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
+
+                # Get current app info for tool_commands processing
+                cur_app = None
+                try:
+                    app_list, cur_window_id = self.env.get_current_apps()
+                    if cur_window_id in app_list:
+                        cur_app = app_list[cur_window_id]['app_name']
+                except Exception as e:
+                    self.logger.warning(f"Failed to get current app: {e}")
+                    cur_app = None
+
+                # Context Refinement
+                total_logs = len(self.action_logs)
+                
+                # Only trigger context refinement if not disabled (wo_refinement=False)
+                if not self.wo_refinement and total_logs > 0 and total_logs % self.refine_period == 0:
+                    # Trigger context refinement
+                    if self.last_full_summary:
+                        # Not first time: use previous summary + new logs since last summary
+                        logs_to_summarize = self.action_logs[self.last_summary_step:]
+                        start_step = self.action_logs[0]["step"]
+                        end_step = self.action_logs[-1]["step"]
+                        summary = self._summarize_history_segment(
+                            logs_to_summarize, start_step, end_step,
+                            previous_summary=self.last_full_summary
+                        )
+                    else:
+                        # First time: summarize all logs without previous summary
+                        logs_to_summarize = self.action_logs
+                        start_step = logs_to_summarize[0]["step"]
+                        end_step = logs_to_summarize[-1]["step"]
+                        summary = self._summarize_history_segment(logs_to_summarize, start_step, end_step)
+
+                    self.last_full_summary = summary
+                    self.last_summary_step = total_logs
+                    
+                    # Clear conversation messages and last tool output after context refinement
+                    if self.wo_step:
+                        self.conversation_messages = []
+                        self.last_tool_output = None  # Clear observation as it's now in summary
+
+                # ========== Build Messages ==========
+                # If there's error feedback, use direct error message without context
+                if self.last_error_feedback:
+                    # Direct call with error feedback only, no other context
+                    messages = [
+                        {"role": "user", "content": self.last_error_feedback}
+                    ]
+                elif self.unify_llm:
+                    # Use unified LLM approach (autoglm_v style)
+                    messages = self._build_unify_llm_messages(screenshot_b64)
+                else:
+                    # Use traditional hisa approach
+                    messages = self._build_traditional_messages(screenshot_b64)
+
+                if attempt > 0:
+                    self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
+
+                # Call global planner
+                response = self._call_llm(self.global_planner_model, messages, self.global_planner_usage)
+
+                if self.unify_llm:
+                    # Parse unified LLM response (autoglm_v style)
+                    obs_dict = {"cur_app": cur_app}
+                    decision = self._parse_unified_response(response, obs_dict)
+                else:
+                    # Extract JSON (original hisa style)
+                    json_str = response
+                    if "```json" in response:
+                        json_start = response.find("```json") + 7
+                        json_end = response.find("```", json_start)
+                        json_str = response[json_start:json_end].strip()
+                    elif "```" in response:
+                        json_start = response.find("```") + 3
+                        json_end = response.find("```", json_start)
+                        json_str = response[json_start:json_end].strip()
+
+                    # Parse JSON
+                    decision = json.loads(repair_json(json_str))
+
+                    # Validate decision structure
+                    if "tool" not in decision:
+                        raise ValueError("Missing 'tool' field in decision")
+                    if decision["tool"] not in ["gui_action", "bash_execution", "wait", "termination", "infeasible"]:
+                        raise ValueError(f"Invalid tool: {decision['tool']}")
+
+                if self.unify_llm:
+                    self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
+                else:
+                    self.logger.info(f"Tool: {decision.get('tool', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
+
+                # Clear error feedback on success
+                self.last_error_feedback = None
+                
+                # Store conversation after successful parsing
+                if (self.unify_llm or self.wo_step) and messages and len(messages) > 1:
+                    # For traditional hisa with wo_step, store the current user message
+                    if messages and len(messages) > 1:  # system + user messages
+                        # Store user message (last one)
+                        self.conversation_messages.append(messages[-1])
+                        # Store assistant response
+                        self.conversation_messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+
+                return decision
+                
+            except Exception as e:
+                self.logger.error(f"Decision parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {e}")
+                
+                # If not last attempt, set error feedback for retry
+                if attempt < self.max_parse_retries - 1:
+                    if self.unify_llm:
+                        error_feedback = FIX_RESPONSE_UNIFY_PROMPT.format(
+                            error_message=str(e),
+                            response=response
+                        )
+                    else:
+                        error_feedback = FIX_RESPONSE_PROMPT.format(
+                            error_message=str(e),
+                            response=response
+                        )
+
+                    # Store error feedback for next iteration
+                    self.last_error_feedback = error_feedback
+
+                    # Continue to next retry
+                    continue
+                else:
+                    # Last attempt failed, return None
+                    self.logger.error("All retry attempts exhausted, cannot get valid decision")
+                    with open(os.path.join(self.save_dir, "err_reason.txt"), "w") as f:
+                        f.write("All retry attempts exhausted, cannot get valid decision")
+                    return None
+        
+        return None
+
+    def _build_traditional_messages(self, screenshot_b64: str) -> List[Dict]:
+        """Build messages for traditional hisa approach."""
+        if self.wo_step:
+            # Use full conversation history approach
+            messages = [
+                {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
+            ]
+
+            # Build current query text
+            current_query_parts = []
+
+            # Add observation from previous action to maintain dialogue structure
+            if self.last_tool_output:
+                current_query_parts.append(f"Observation from previous action:\n{self.last_tool_output}\n")
+                self.last_tool_output = None  # Clear after use to prevent duplicate appending
+
+            # Task instruction + pattern + summary (only after context refinement)
+            if len(self.conversation_messages) == 0:
+                current_query_parts.append(f"Task: {self.task_instruction}\n")
+                if self.past_pattern_text:
+                    current_query_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
+
+                # Add refined context if available (only when context refinement is enabled)
+                if not self.wo_refinement and self.last_full_summary:
+                    current_query_parts.append(f"\n<execution_history_summary>\n{self.last_full_summary}\n</execution_history_summary>\n")
+
+            # Standard prompt (error feedback is handled directly in _get_global_planner_decision)
+            if len(self.conversation_messages) == 0:
+                current_query_parts.append("\nBased on the execution history and current screenshot, what's the next action?")
+            else:
+                current_query_parts.append("\nBased on the conversation history and current screenshot, what's the next action?")
+
+            # ========== Sliding Window Logic (for wo_step mode) ==========
+            # If context refinement is disabled, apply sliding window
+            conversation_to_append = self.conversation_messages
+            max_messages = self.sliding_window_size * 2
+            if self.wo_refinement and len(self.conversation_messages) > max_messages:
+                conversation_to_append = self.conversation_messages[-max_messages:]
+                conversation_to_append[0]["content"][0]["text"] = f'Task: {self.task_instruction}\n\n{conversation_to_append[0]["content"][0]["text"]}'
+
+            messages.extend(conversation_to_append)
+
+            # Add current user message with screenshot
+            current_user_message = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "".join(current_query_parts)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "high"}}
+                ]
+            }
+            messages.append(current_user_message)
+        else:
+            # Original approach with step_abstract
+
+            # ========== Sliding Window Logic (for step mode) ==========
+            # When wo_refinement=True, apply sliding window to action_logs
+            logs_to_use = self.action_logs
+            if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
+                logs_to_use = self.action_logs[-self.sliding_window_size:]
+
+            # Build condensed_history: summary + recent step summaries
+            condensed_history = []
+            if not self.wo_refinement and self.last_full_summary:
+                # Context refinement enabled: use summary + recent logs
+                condensed_history = [self.last_full_summary]
+                for log in self.action_logs[self.last_summary_step:]:
+                    if "step_abstract" in log:
+                        condensed_history.append(log["step_abstract"])
+            else:
+                # wo_refinement=True or no summary yet: use logs (with sliding window applied)
+                for log in logs_to_use:
+                    if "step_abstract" in log:
+                        condensed_history.append(log["step_abstract"])
+
+            user_message_parts = []
+            user_message_parts.append(f"Task: {self.task_instruction}\n")
+
+            if self.past_pattern_text:
+                user_message_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
+
+            # Add condensed history
+            if condensed_history:
+                user_message_parts.append(f"\n<execution_history>\n" + "\n".join(condensed_history) + "\n</execution_history>\n")
+
+            # Standard prompt (error feedback is handled directly in _get_global_planner_decision)
+            user_message_parts.append("""
+Based on the execution_history and current screenshot, decide the next action. Avoid repeating failed actions. You should strictly follow the JSON format below:
+```json
+{
+    "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
+    "tool": "gui_action|bash_execution|wait|termination|infeasible",
+    "input": "String - tool-specific content (see examples below)",
+    "description": "Optional - only for gui_action with placeholders, describe the element to locate"
+}
+```""")
+
+            user_message_text = "".join(user_message_parts)
+
+            # Build messages array
+            messages = [
+                {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_message_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "high"}}
+                    ]
+                }
+            ]
+
+        return messages
+
+    def _build_unify_llm_messages(self, screenshot_b64: str) -> List[Dict]:
+        """Build messages for unified LLM approach using autoglm_v prompts."""
+        # Get current app and accessibility tree for autoglm_v style observation
+        cur_app = None
+        accessibility_tree = ""
+        app_info = ""
+        app_list = {}
+        cur_window_id = ""
+
+        try:
+            # Get current apps info (similar to autoglm_v)
+            app_list, cur_window_id = self.env.get_current_apps()
+            if cur_window_id in app_list:
+                cur_app = app_list[cur_window_id]['app_name']
+                # Try to get app-specific info
+                tool_name = cur_app.strip().lower().replace('-', '_')
+                if hasattr(self.env, '_get_obs'):
+                    obs = self.env._get_obs()
+                    accessibility_tree = obs.get('accessibility_tree', '')
+                    app_info = obs.get('app_info', '')
+        except Exception as e:
+            self.logger.warning(f"Failed to get app info for unified LLM: {e}")
+
+        # ========== CHANGE: Build history as text instead of separate messages ==========
+        history_text = ""
+        if self.wo_step:
+            # ========== ADD: Sliding Window for conversation history ==========
+            conversation_to_use = self.conversation_messages
+            max_messages = self.sliding_window_size * 2
+            if self.wo_refinement and len(self.conversation_messages) > max_messages:
+                conversation_to_use = self.conversation_messages[-max_messages:]
+            
+            # Convert conversation history to text format
+            history_lines = []
+            for i, msg in enumerate(conversation_to_use):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                # Extract text from content (handling both string and list formats)
+                if isinstance(content, list):
+                    text_parts = []
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") in ["text", "input_text"]:
+                            text_parts.append(item.get("text", ""))
+                    content_text = " ".join(text_parts)
+                else:
+                    content_text = content
+                history_lines.append(f"{role}: {content_text}")
+            
+            if history_lines:
+                history_text = "\n".join(history_lines)
+        else:
+            # ========== ADD: Sliding Window for action logs ==========
+            logs_to_use = self.action_logs
+            if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
+                logs_to_use = self.action_logs[-self.sliding_window_size:]
+            
+            # Build condensed_history: summary + recent step summaries (same as _build_traditional_messages)
+            history_lines = []
+            if not self.wo_refinement and self.last_full_summary:
+                # Context refinement enabled: use summary + recent logs
+                history_lines.append(self.last_full_summary)
+                for log in self.action_logs[self.last_summary_step:]:
+                    if "step_abstract" in log:
+                        history_lines.append(log["step_abstract"])
+            else:
+                # wo_refinement=True or no summary yet: use logs (with sliding window applied)
+                for log in logs_to_use:
+                    if "step_abstract" in log:
+                        history_lines.append(log["step_abstract"])
+            
+            if history_lines:
+                history_text = "\n".join(history_lines)
+
+        # Construct prompt using autoglm_v's Prompt class (same logic as autoglm_v)
+        if cur_app:
+            tool_name = cur_app.strip().lower().replace("-", "_")
+            tool_name = tool_name if tool_name in self.tool_list.keys() else None
+        else:
+            tool_name = None
+
+        setup_prompt, func_def_prompt, note_prompt = AutoGLMPrompt.construct_procedural_memory(
+            AutoGLMAgent, app_name=tool_name, client_password=self.client_password,
+            with_image=self.with_image, with_atree=self.with_atree, relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format
+        )
+
+        if self.tool_in_sys_msg:
+            system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
+        else:
+            system_message = setup_prompt + "\n\n" + note_prompt
+
+        # ========== ADD: Inject past pattern into system message on first turn ==========
+        if self.past_pattern_text and len(self.conversation_messages) == 0:
+            system_message += f"\n\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>"
+
+        # Build current observation like autoglm_v
+        if app_list:
             app_str = "Window ID    App Name    Title\n"
-            for window_id, app in obs["apps"].items():
+            for window_id, app in app_list.items():
                 app_str += f"{window_id}    {app['app_name']}    {app['title']}\n"
+        else:
+            app_str = "None"
 
-        last_result = last_result.strip() if last_result else "None"
+        last_result = ""
+        if self.last_tool_output:
+            last_result = self.last_tool_output.strip()
+            last_result = last_result[:2000] + "..." if len(last_result) > 2000 else last_result
+            self.last_tool_output = None
 
-        # Process A11y tree if enabled
         tree = ""
-        if self.with_atree and obs.get("accessibility_tree"):
-            tree = linearize_accessibility_tree(obs["accessibility_tree"], "Ubuntu")
-            tree = trim_accessibility_tree(tree, self.a11y_tree_max_items)
+        if accessibility_tree and self.with_atree:
+            tree = linearize_accessibility_tree(accessibility_tree, "Ubuntu")
+            tree = trim_accessibility_tree(tree, 300)
 
-        app_info = obs.get("app_info", "").strip() if obs.get("app_info") else "None"
+        app_info_trimmed = app_info.strip() if app_info else "None"
+        app_info_trimmed = app_info_trimmed[:5000] + "..." if len(app_info_trimmed) > 5000 else app_info_trimmed
 
-        # Build user message
-        user_text_parts = []
-
-        # Add past patterns if available
-        if self.past_pattern_text:
-            user_text_parts.append(f"<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
-
-        # Add execution history
-        if execution_history:
-            user_text_parts.append(f"<execution_history>\n{execution_history}\n</execution_history>\n")
-
-        # Add error feedback if retry
-        if self.last_error_feedback:
-            user_text_parts.append(f"<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n")
-
+        # ========== Build user message with all context ==========
+        prompt_parts = []
+    
+        # Add task instruction at the beginning
+        prompt_parts.append(f"**IMPORTANT** You are asked to complete the following task: {self.task_instruction}\n")
+        
+        # ========== ADD: Context Refinement Summary ==========
+        # When context refinement is enabled and wo_step=True, add refined summary (same as _build_traditional_messages)
+        if self.wo_step and not self.wo_refinement and self.last_full_summary and len(self.conversation_messages) == 0:
+            prompt_parts.append(f"\n<execution_history_summary>\n{self.last_full_summary}\n</execution_history_summary>\n")
+        
+        # ========== ADD: Execution history ==========
+        # For wo_step=False, last_full_summary is already included in history_text when not wo_refinement
+        if history_text:
+            prompt_parts.append(f"\n<execution_history>\n{history_text}\n</execution_history>\n")
+        
         # Add current observation
-        user_text_parts.append(f"* Apps: {app_str.strip()}")
-        user_text_parts.append(f"* Current App: {obs.get('cur_window_id', 'None')}")
-        if tree:
-            user_text_parts.append(f"* A11y Tree: {tree.strip()}")
-        user_text_parts.append(f"* App Info: {app_info}")
-        user_text_parts.append(f"* Previous Action Result: {last_result}")
+        # ========== CHANGE: Remove Previous Action Result since it's already in execution_history ==========
+        prompt_parts.append("\n* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}".format(
+            app_str.strip(),
+            cur_window_id.strip() if cur_window_id in app_str else "None",
+            '\n\n* A11y Tree: {}'.format(tree.strip()) if self.with_atree and tree else "",
+            app_info_trimmed,
+        ))
+        
+        if not self.tool_in_sys_msg:
+            prompt_parts.append("\n\n" + func_def_prompt)
+        
+        # ========== ADD: Output format reminder at the end ==========
+        prompt_parts.append("""\n\n* Output Format:
+<think>
+**YOUR-PLAN-AND-THINKING**
+</think>
+````python
+**ONE-LINE-OF-CODE**
+```""")
 
-        user_text = "\n\n".join(user_text_parts)
+        prompt = "".join(prompt_parts)
 
-        # Build content with image
-        content = [{"type": "text", "text": user_text}]
-        if obs.get('screenshot'):
-            screenshot = resize_image(obs['screenshot'], self.image_size[0], self.image_size[1])
+        content = [{"type": "text", "text": prompt}]
+        if self.with_image and screenshot_b64:
             content = [
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{base64.b64encode(screenshot).decode('utf-8')}",
+                        "url": f"data:image/png;base64,{screenshot_b64}",
                         "detail": "high",
                     },
                 }
             ] + content
 
-        messages.append({"role": "user", "content": content})
+        # ========== CHANGE: Only two messages - system and user ==========
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": content}
+        ]
 
         return messages
 
-    def execute(self, response: str, obs: Dict) -> List:
-        """Parse and execute response, return list of actions."""
-        self.last_parse_error = None
+    def _parse_unified_response(self, response: str, obs: Dict = None) -> Dict:
+        """Parse unified LLM response (autoglm_v style)."""
+        # Extract code from response (similar to autoglm_v's parse_code_from_string)
+        import re
+
+        # Find code blocks
+        pattern = r"```(?:\w+\s+)?(.*?)```"
+        matches = re.findall(pattern, response, re.DOTALL)
+
+        if not matches:
+            raise ValueError("No code block found in response")
+
+        code = matches[0].strip()
+
+        # Check for special commands
+        if code in ["WAIT", "DONE", "FAIL"]:
+            return {"code": code, "thought": ""}
+
+        # Process tool method calls like autoglm_v
+        code = re.sub(r'^python\s*(\\+n|\n)+', '', code, flags=re.IGNORECASE)
+        code = re.sub(r'^(\\+n|\n)+', '', code)
+        code = re.sub(r'(\\+n|\n)+$', '', code)
+
+        # Extract thought if present (from <think> tags)
+        thought = ""
+        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+        if think_match:
+            thought = think_match.group(1).strip()
+
+        # Handle tool method calls exactly like autoglm_v
+        if "Agent." in code:
+            action = eval(code, {"Agent": AutoGLMAgent, "BrowserTools": BrowserTools})
+        elif "BrowserTools." in code:
+            action = eval(code, {"Agent": AutoGLMAgent, "BrowserTools": BrowserTools})
+        else:
+            # For regular code, handle like autoglm_v with tool_commands
+            cur_app = obs.get("cur_app") if obs else None
+            if cur_app:
+                tool_name = cur_app.strip().lower().replace("-", "_")
+                if tool_name in self.tool_list:
+                    actions = AutoGLMAgent.tool_commands(code, tool_name)
+                    action = actions[0]
+                else:
+                    action = code
+            else:
+                action = code
+
+        return {"code": action, "thought": thought}
+
+    def _execute_tool(self, decision: Dict) -> str:
+        """Execute tool based on decision and return execution result text."""
+        if self.unify_llm:
+            # In unified LLM mode, decision should contain the Python code to execute
+            code = decision.get("code", "")
+            if not code:
+                return "No code to execute"
+
+            # Store thought for step_abstract
+            self.current_thought = decision.get("thought", "")
+
+            # Execute the code directly (similar to autoglm_v approach)
+            return self._execute_unified_code(code)
+        else:
+            # Original hisa approach
+            tool = decision.get("tool", "")
+            tool_input = decision.get("input", "")
+            description = decision.get("description", "")
+
+            # Store thought for step_abstract
+            self.current_thought = decision.get("thought", "")
+
+            if tool == "gui_action":
+                # Input is pyautogui code string, description is optional for placeholder
+                return self._gui_action(tool_input, description)
+
+            elif tool == "bash_execution":
+                return self._bash_execution(tool_input)
+
+            elif tool == "wait":
+                return self._wait(tool_input)
+
+        return ""
+
+    def _execute_unified_code(self, code) -> str:
+        """Execute unified LLM generated code (autoglm_v style)."""
+        self.logger.info(f"[unified_execution] {code}")
+
+        # Record step start time
+        step_start_time = time.time()
+        step = self.operation_count + 1
 
         try:
-            # Extract thinking for logging
-            think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
-            if think_match:
-                self.current_thought = think_match.group(1).strip()
+            # Get before screenshot
+            before_screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}_unified.png"
 
-            # Parse code from response
-            actions = parse_code_from_string(response)
-            action = actions[0]
-            
-            action = re.sub(r'^python\s*(\\+n|\n)+', '', action, flags=re.IGNORECASE)
-            action = re.sub(r'^(\\+n|\n)+', '', action)
-            action = re.sub(r'(\\+n|\n)+$', '', action)
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(before_screenshot)
 
-            # Fix text parameter with escaped quotes (e.g. text=\'I\'m happy\')
-            match = re.search(r"text=\\'(.*)\\'(?=[,)])", action)
-            if match:
-                content = match.group(1).replace("\\'", "'")
-                action = action[:match.start()] + f"text={repr(content)}" + action[match.end():]
-            
-            # Fix other simple escaped quotes (e.g. button_type=\'left\')
-            action = re.sub(r"=\\'([^'\\]*)\\'", r"='\1'", action)
-            if 'button=' in action:
-                action = action.replace('button=', 'button_type=')
-
-            logger.info(f"Parsed pseudo action: {action}")
-
-            # Handle special bash action
-            if action.startswith("Agent.bash("):
-                # Extract bash command and return as special action
-                match = re.search(r"Agent\.bash\(command=['\"](.+?)['\"]\)", action)
-                if match:
-                    return [{"type": "bash", "command": match.group(1)}]
-                raise ValueError(f"Failed to parse bash command: {action}")
-
-            # Convert pseudo-code to pyautogui command
-            if "Agent." in action:
-                actions = [eval(action)]
-            elif "BrowserTools." in action:
-                actions = [eval(action)]
+            # Handle different types of code (tool methods already evaluated in parse phase)
+            if isinstance(code, dict):
+                # Special action dict (like OPEN_CHROME_TAB from BrowserTools methods)
+                obs, *_ = self.env.step(code, self.sleep_after_execution)
+                final_code = str(code)  # Convert to string for logging
             else:
-                cur_app = obs.get("cur_app", "").strip().replace("-", "_").lower() if obs.get("cur_app") else None
-                if cur_app and cur_app in self.tool_list:
-                    actions = self.tool_commands(action, cur_app)
-                else:
-                    # Try direct eval
-                    actions = [eval(action)]
+                # Execute regular pyautogui code
+                final_code = code
+                obs, *_ = self.env.step(final_code, self.sleep_after_execution)
 
-            logger.info(f"Grounded action: {actions[0] if actions else 'None'}")
-            return actions
+            # Wait for action to take effect
+            time.sleep(10)
+
+            # Get after screenshot
+            after_screenshot = self.env.controller.get_screenshot()
+
+            # Step abstraction for unified execution
+            if self.wo_step:
+                step_abstraction = ""
+            else:
+                step_abstraction = "Result: " + self._step_abstraction_result(
+                    before_screenshot, after_screenshot, f"Executed: {final_code}",
+                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                )
+
+            # Generate step_abstract
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            step_abstract = f"Step {step}: unified_execution | {thought_prefix}Code: {final_code} | {step_abstraction}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "unified_execution",
+                "execution_success": True,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            return f"Unified Execution: {final_code}\nStatus: Success\n{step_abstraction}"
 
         except Exception as e:
-            self.last_parse_error = str(e)
-            logger.error(f"Failed to parse action: {e}")
-            return []
+            self.logger.error(f"Unified execution error: {e}")
 
-    def format_history(self, max_turns: int = 30) -> List[Dict]:
-        """Format conversation history for context."""
-        history = []
-        for ix in range(self.turn_number):
-            if ix == 0:
-                env_input = "**Environment State (Omitted)**"
-            else:
-                env_input = f"**Environment State (Omitted)**\nPrevious Action Result: {self.contents[ix - 1].get('exe_result', 'None')}"
+            # Generate step_abstract for error
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            code_str = str(code) if isinstance(code, dict) else code
+            step_abstract = f"Step {step}: unified_execution | {thought_prefix}Code: {code_str} | Result: Error - {str(e)}"
 
-            response = self.contents[ix].get("response", "")
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
 
-            history.append({"role": "user", "content": [{"type": "text", "text": env_input}]})
-            history.append({"role": "assistant", "content": [{"type": "text", "text": response}]})
+            self.action_logs.append({
+                "step": step,
+                "type": "unified_execution",
+                "execution_success": False,
+                "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
 
-        return history[-max_turns * 2:]
+            # Return execution result text for wo_step mode
+            code_str = str(code) if isinstance(code, dict) else code
+            return f"Unified Execution: {code_str}\nStatus: Failed\nError: {str(e)}"
 
-    def predict(self, instruction: str, obs: Dict) -> Tuple[str, List]:
-        """Predict the next action based on observation."""
-        messages = self.prepare(instruction, obs)
-
-        assert self.gen_func is not None, "gen_func is not set"
-
-        response = None
-        actions = []
-
-        # Retry loop for parsing errors
-        for attempt in range(self.max_parse_retries):
-            # Add error feedback if retry
-            if attempt > 0 and self.last_error_feedback:
-                logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
-                retry_messages = messages.copy()
-                retry_messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": self.last_error_feedback}]
-                })
-            else:
-                retry_messages = messages
-
-            # Call model with network retry
-            for _ in range(3):
-                try:
-                    response = self.gen_func(retry_messages)
-                    break
-                except Exception as e:
-                    logger.error(f"Failed to call gen_func: {e}")
-            else:
-                raise RuntimeError("Failed to call gen_func after retries")
-
-            logger.info(f"Response: {response}")
-
-            # Try to parse response
-            actions = self.execute(response, obs)
-
-            if actions:
-                self.last_error_feedback = None
-                break
-            else:
-                parse_error_msg = self.last_parse_error or "Failed to parse action"
-                logger.error(f"Parse error (attempt {attempt + 1}/{self.max_parse_retries}): {parse_error_msg}")
-
-                if attempt < self.max_parse_retries - 1:
-                    self.last_error_feedback = FIX_RESPONSE_PROMPT.format(
-                        error_message=parse_error_msg,
-                        response=response
-                    )
-                else:
-                    logger.error("All retry attempts exhausted. Marking as FAIL.")
-                    self.last_error_feedback = None
-                    actions = ["FAIL"]
-
-        # Update contents
-        self.contents.append({
-            "instruction": instruction,
-            "index": len(self.contents),
-            "response": response,
-            "action": "Parse error" if not actions else (actions[0] if isinstance(actions[0], str) else str(actions[0])),
-            "exe_result": "Invalid action" if not actions else "",
-            "thought": self.current_thought,
-            **{k: v for k, v in obs.items() if k not in ['screenshot', 'accessibility_tree']},
-        })
-
-        return response, actions
-
-    def add_action_log(
-        self,
-        step: int,
-        action_type: str,
-        action: str,
-        execution_success: bool,
-        screenshot_file: str = "",
-        exe_result: str = "",
-        step_time: float = 0.0,
-        before_screenshot: bytes = None,
-        after_screenshot: bytes = None,
-    ):
-        """Add action log entry with optional step abstraction."""
-        step_abstract = ""
-        
-        if not self.wo_step and before_screenshot and after_screenshot:
-            abstraction_result = self._step_abstraction(
-                before_screenshot, after_screenshot, action
-            )
-            step_abstract = f"Step {step}: {action_type} | Action: {action} | Result: {abstraction_result}"
+    def _call_visual_grounder(self, description: str, screenshot: bytes, code: str):
+        """Call visual grounder to get coordinates or code using LLM."""
+        if self.unify_llm:
+            # In unified LLM mode, expect complete code
+            return code
         else:
-            step_abstract = f"Step {step}: {action_type} | Action: {action} | Result: {exe_result}"
+            # In traditional mode, call visual grounder LLM for coordinates
+            if not self.visual_grounder_model:
+                self.logger.warning("No visual grounder function available. Using default coordinates.")
+                return code.replace("X_COORD", "500").replace("Y_COORD", "500")
 
-        self.action_logs.append({
-            "step": step,
-            "type": action_type,
-            "execution_success": execution_success,
-            "screenshot": screenshot_file,
-            "step_abstract": step_abstract,
-            "step_time": round(step_time, 2),
-        })
+            # Check if code contains placeholders
+            if "X_COORD" in code or "Y_COORD" in code:
+                # Call visual grounder LLM to get coordinates
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Locate the element described as: {description}"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(screenshot).decode('utf-8')}", "detail": "high"}}
+                        ]
+                    }
+                ]
 
-    def get_action_logs(self) -> List[Dict]:
-        """Get all action logs."""
-        return self.action_logs
+                try:
+                    response = self.visual_grounder_model(messages)
+                    # Parse response to extract coordinates
+                    # This is a simplified implementation - in practice you'd need proper parsing
+                    import re
+                    coord_match = re.search(r'\((\d+),\s*(\d+)\)', response)
+                    if coord_match:
+                        x, y = coord_match.groups()
+                        return code.replace("X_COORD", x).replace("Y_COORD", y)
+                    else:
+                        self.logger.warning(f"Could not parse coordinates from visual grounder response: {response}")
+                        return code.replace("X_COORD", "500").replace("Y_COORD", "500")
+                except Exception as e:
+                    self.logger.error(f"Visual grounder call failed: {e}")
+                    return code.replace("X_COORD", "500").replace("Y_COORD", "500")
+
+            return code
+
+    def _gui_action(self, code: str, description: str = "") -> str:
+        """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
+        if description:
+            self.logger.info(f"[gui_action] {description}")
+        else:
+            self.logger.info(f"[gui_action] {code}")
+
+        # Record step start time
+        step_start_time = time.time()
+
+        step = self.operation_count + 1
+
+        try:
+            # Get before screenshot
+            before_screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}_gui_action.png"
+
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(before_screenshot)
+
+            # Check if code contains placeholders
+            has_placeholders = "X_COORD" in code or "Y_COORD" in code
+
+            if has_placeholders:
+                if not description:
+                    raise ValueError("Description required when using placeholders")
+
+                # Call visual grounder (simplified for autoglm-os)
+                code = self._call_visual_grounder(description, before_screenshot, code)
+
+            # Execute code
+            final_code = postprocess_action(code)
+            obs, *_ = self.env.step(final_code, self.sleep_after_execution)
+
+            # Wait 10 seconds for action to take effect
+            time.sleep(10)
+
+            # Get after screenshot and evaluate
+            after_screenshot = self.env.controller.get_screenshot()
+
+            # Create description for step abstraction
+            eval_desc = description if description else code
+            
+            # Skip step abstraction if wo_step is True
+            if self.wo_step:
+                step_abstraction = ""
+            else:
+                step_abstraction = "Result: " + self._step_abstraction_result(
+                    before_screenshot, after_screenshot, eval_desc,
+                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                )
+
+            # Generate step_abstract
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            if description:
+                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {final_code} | {step_abstraction}"
+            else:
+                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {final_code} | {step_abstraction}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "gui_action",
+                "execution_success": True,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            if description:
+                return f"GUI Action: {description}\nCode: {final_code}\nStatus: Success\n{step_abstraction}"
+            else:
+                return f"GUI Action Code: {final_code}\nStatus: Success\n{step_abstraction}"
+
+        except Exception as e:
+            self.logger.error(f"GUI action execution error: {e}")
+
+            # Generate step_abstract for error
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            if description:
+                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {code} | Result: Error - {str(e)}"
+            else:
+                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "gui_action",
+                "execution_success": False,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            if description:
+                return f"GUI Action: {description}\nCode: {code}\nStatus: Failed\nError: {str(e)}"
+            else:
+                return f"GUI Action Code: {code}\nStatus: Failed\nError: {str(e)}"
+
+    def _step_abstraction_result(self, before_screenshot: bytes, after_screenshot: bytes,
+            action_description: str, wo_roi: bool = False,
+            roi_margin: int = 50) -> str:
+        """Abstract step by comparing before/after screenshots.
+
+        Args:
+            before_screenshot: Screenshot before action
+            after_screenshot: Screenshot after action
+            action_description: Description of the action performed
+            wo_roi: If True, disable ROI cropping (default: False means ROI cropping is enabled)
+            roi_margin: Margin to add around ROI when cropping (default: 50)
+
+        Returns:
+            Step abstract text (e.g., "Succeeded. Menu opened." or "Failed. No UI change.")
+        """
+        try:
+            # Convert screenshots to PIL Images for ROI detection
+            before_img = Image.open(io.BytesIO(before_screenshot))
+            after_img = Image.open(io.BytesIO(after_screenshot))
+            
+            # Check for size mismatch and log detailed info for debugging
+            if before_img.size != after_img.size:
+                self.logger.error(f"[ANOMALY] Screenshot size mismatch detected!")
+                
+            # Optionally crop to change ROI (enabled by default, disabled when wo_roi=True)
+            if not wo_roi:
+                try:
+                    cropped_before, cropped_after = get_change_roi(
+                        before_img, after_img,
+                        margin=roi_margin,
+                    )
+
+                    # If ROI detected, use cropped images
+                    if cropped_before is not None and cropped_after is not None:
+                        before_img = cropped_before
+                        after_img = cropped_after
+                    else:
+                        # No change detected - directly return without calling LLM
+                        return "No change detected."
+                except Exception as roi_error:
+                    self.logger.warning(f"ROI detection failed, using full screenshots: {roi_error}")
+
+            # Convert (possibly cropped) images to base64
+            before_buffer = io.BytesIO()
+            after_buffer = io.BytesIO()
+            before_img.save(before_buffer, format="PNG")
+            after_img.save(after_buffer, format="PNG")
+
+            before_b64 = base64.b64encode(before_buffer.getvalue()).decode("utf-8")
+            after_b64 = base64.b64encode(after_buffer.getvalue()).decode("utf-8")
+
+            prompt = STEP_ABSTRACTION_PROMPT.format(
+                action_description=action_description
+            )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Before screenshot:"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{before_b64}", "detail": "high"}},
+                        {"type": "text", "text": "After screenshot:"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{after_b64}", "detail": "high"}},
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+
+            step_abstraction = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            return step_abstraction.strip()
+
+        except Exception as e:
+            self.logger.error(f"Failed to abstract step: {e}")
+            return "Step abstraction failed due to error."
+
+    def _bash_execution(self, code: str) -> str:
+        """Execute bash commands or Python scripts (not pyautogui)."""
+        self.logger.info(f"[bash_execution] {code}")
+
+        # Record step start time
+        step_start_time = time.time()
+
+        step = self.operation_count + 1
+
+        try:
+            # Get before screenshot
+            before_screenshot = self.env.controller.get_screenshot()
+
+            # Call env.controller.run_bash_script instead of env.step
+            output_dict = self.env.controller.run_bash_script(code, timeout=self.bash_timeout)
+            exitcode = 0 if output_dict["status"] == "success" else 1
+            logs = output_dict["output"]
+
+            # Wait 10 seconds for action to take effect
+            time.sleep(10)
+
+            # Get after screenshot
+            after_screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}_bash.png"
+
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(after_screenshot)
+
+            # Step abstraction for bash execution
+            # Skip step abstraction if wo_step is True
+            if self.wo_step:
+                step_abstraction = ""
+            else:
+                bash_description = f"Bash command: {code}\nOutput: {logs}..."  # Truncate long output
+                step_abstraction = "Result: " + self._step_abstraction_result(
+                    before_screenshot, after_screenshot, bash_description,
+                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                )
+
+            # Generate step_abstract summary
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Output: {logs} | {step_abstraction}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "bash_execution",
+                "execution_success": exitcode == 0,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            status_str = "Success" if exitcode == 0 else "Failed"
+            return f"Bash Command: {code}\nStatus: {status_str}\nOutput:\n{logs}"
+            
+        except Exception as e:
+            self.logger.error(f"Bash execution error: {e}")
+
+            screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}_bash_error.png"
+
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(screenshot)
+
+            # Generate step_abstract summary for error
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
+
+            self.action_logs.append({
+                "step": step,
+                "type": "bash_execution",
+                "execution_success": False,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            return f"Bash Command: {code}\nStatus: Failed\nError: {str(e)}"
+
+    def _wait(self, seconds_str: str) -> str:
+        """Wait for specified seconds and observe UI changes."""
+        try:
+            wait_seconds = float(seconds_str)
+            # Limit wait time to reasonable range
+            wait_seconds = max(5, min(wait_seconds, 60))
+        except:
+            self.logger.warning(f"Invalid wait time '{seconds_str}', using default 15 seconds")
+            wait_seconds = 15
+
+        self.logger.info(f"[wait] Waiting for {wait_seconds} seconds...")
+
+        # Record step start time
+        step_start_time = time.time()
+
+        step = self.operation_count + 1
+
+        try:
+            # Get before screenshot
+            before_screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}_wait_before.png"
+
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(before_screenshot)
+
+            # Wait
+            time.sleep(wait_seconds)
+
+            # Get after screenshot
+            after_screenshot = self.env.controller.get_screenshot()
+            after_screenshot_file = f"step_{step}_wait_after.png"
+
+            with open(os.path.join(self.operations_dir, after_screenshot_file), "wb") as f:
+                f.write(after_screenshot)
+
+            # Step abstraction for wait
+            # Skip step abstraction if wo_step is True
+            if self.wo_step:
+                step_abstraction = ""
+            else:
+                step_abstraction = "Result: " + self._step_abstraction_result(
+                    before_screenshot, after_screenshot,
+                    f"Waited {wait_seconds} seconds to observe UI changes",
+                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                )
+
+            # Generate step_abstract
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            step_abstract = f"Step {step}: wait | {thought_prefix}Duration: {wait_seconds}s | {step_abstraction}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "wait",
+                "execution_success": True,
+                "screenshot": screenshot_file,
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            return f"Wait: {wait_seconds}s\nStatus: Success\n{step_abstraction}"
+
+        except Exception as e:
+            self.logger.error(f"Wait execution error: {e}")
+
+            # Generate step_abstract for error
+            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            step_abstract = f"Step {step}: wait | {thought_prefix}Duration: {wait_seconds}s | Result: Error - {str(e)}"
+
+            # Calculate step execution time
+            step_time = time.time() - step_start_time
+
+            self.action_logs.append({
+                "step": step,
+                "type": "wait",
+                "execution_success": False,
+                "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
+                "step_abstract": step_abstract,
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage
+            })
+
+            # Return execution result text for wo_step mode
+            return f"Wait: {wait_seconds}s\nStatus: Failed\nError: {str(e)}"
+
+
+    def _evaluate_and_save(self, task_config: dict, is_infeasible: bool = False, termination_reason: str = "") -> float:
+        """Evaluate task and save results."""
+        self.logger.info(f"\n{'='*80}")
+        self.logger.info("Task Evaluation")
+        self.logger.info("="*80)
+
+        # Extract and save pattern BEFORE evaluating score
+        # This prevents data leakage - lessons should be based on execution process only
+        domain = task_config.get("domain", "general")
+        task_instruction = task_config["instruction"]
+
+        if not self.wo_pattern:
+            self.logger.info("Inducing pattern...")
+            key_lessons = self.pattern_manager.pattern_induction(
+                task_instruction=task_instruction,
+                action_logs=self.action_logs
+            )
+
+            if key_lessons:
+                self.pattern_manager.save_pattern(domain, key_lessons)
+                # Format lessons as numbered list for logging
+                formatted_lessons = "\n".join(f"  {i+1}. [{lesson['type']}] {lesson['lesson']}" for i, lesson in enumerate(key_lessons))
+                self.logger.info(f"Saved {len(key_lessons)} lesson(s):\n{formatted_lessons}")
+            else:
+                self.logger.info("No significant lessons to save")
+
+        # Now evaluate score
+        try:
+            # self.logger.info("Closing temporary windows...")
+            # self.env.step("pyautogui.press('esc')", 0.5)
+
+            # Wait for VM HTTP service to stabilize after task execution
+            self.logger.info("Waiting for VM to stabilize before evaluation...")
+            time.sleep(10)
+            
+            # Retry evaluation with exponential backoff to handle transient VM service issues
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    score = self.env.evaluate()
+                    break
+                except Exception as eval_error:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                        self.logger.warning(f"Evaluation attempt {attempt + 1} failed: {eval_error}. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+        except Exception as e:
+            self.logger.error(f"Evaluation failed after {max_retries} attempts: {e}")
+            score = 0.0
+
+        gui_steps = len([log for log in self.action_logs if log["type"] == "gui_action"])
+        bash_steps = len([log for log in self.action_logs if log["type"] == "bash_execution"])
+        wait_steps = len([log for log in self.action_logs if log["type"] == "wait"])
+
+        global_planner_cost = self.global_planner_usage["cost"]
+        global_planner_prompt = self.global_planner_usage["prompt_tokens"]
+        global_planner_completion = self.global_planner_usage["completion_tokens"]
+        global_planner_images = self.global_planner_usage["image_count"]
+
+        visual_grounder_cost = self.visual_grounder_usage["cost"]
+        visual_grounder_prompt = self.visual_grounder_usage["prompt_tokens"]
+        visual_grounder_completion = self.visual_grounder_usage["completion_tokens"]
+        visual_grounder_images = self.visual_grounder_usage["image_count"]
+
+        state_manager_cost = self.state_manager_usage["cost"]
+        state_manager_prompt = self.state_manager_usage["prompt_tokens"]
+        state_manager_completion = self.state_manager_usage["completion_tokens"]
+        state_manager_images = self.state_manager_usage["image_count"]
+
+        total_cost = global_planner_cost + visual_grounder_cost + state_manager_cost
+        total_images = global_planner_images + visual_grounder_images + state_manager_images
+
+        # Calculate execution time
+        execution_time = time.time() - self.start_time
+
+        # Determine success and failure reason (score is 0 or 1)
+        failure_reason = ""
+        if is_infeasible:
+            # Use termination_reason if provided (contains detailed infeasible explanation)
+            failure_reason = termination_reason if termination_reason else "Task marked as infeasible"
+        elif termination_reason:
+            failure_reason = termination_reason
+
+        execution_log = {
+            "statistics": {
+                "score": score,
+                "total_steps": self.operation_count,
+                "cua_steps": gui_steps,
+                "coding_steps": bash_steps,
+                "wait_steps": wait_steps,
+                "image_count": total_images,
+                "total_cost": total_cost,
+                "prompt_tokens": global_planner_prompt + visual_grounder_prompt + state_manager_prompt,
+                "completion_tokens": global_planner_completion + visual_grounder_completion + state_manager_completion,
+                "execution_time": execution_time,
+                    "model_usage": {
+                        "global_planner": {
+                            "model_name": "autoglm-os",
+                            "cost": global_planner_cost,
+                            "prompt_tokens": global_planner_prompt,
+                            "completion_tokens": global_planner_completion,
+                            "image_count": global_planner_images
+                        },
+                        "visual_grounder": {
+                            "model_name": "autoglm-os",
+                            "cost": visual_grounder_cost,
+                            "prompt_tokens": visual_grounder_prompt,
+                            "completion_tokens": visual_grounder_completion,
+                            "image_count": visual_grounder_images
+                        },
+                        "state_manager": {
+                            "model_name": "autoglm-os",
+                            "cost": state_manager_cost,
+                            "prompt_tokens": state_manager_prompt,
+                            "completion_tokens": state_manager_completion,
+                            "image_count": state_manager_images
+                        }
+                    }
+            },
+            "task_config": task_config,
+            "action_logs": self.action_logs,
+            "success": score == 1.0,
+            "failure_reason": failure_reason
+        }
+
+        with open(os.path.join(self.save_dir, "execution_log.json"), "w") as f:
+            json.dump(serialize_json(execution_log), f, indent=2)
+
+        with open(os.path.join(self.save_dir, "result.txt"), "w") as f:
+            f.write(str(score))
+
+        self.logger.info("="*80)
+
+        return score
+
+    def cleanup(self):
+        """Clean up resources."""
+        if self.env:
+            self.logger.info("Closing environment...")
+            self.env.close()
+            self.env = None
+
+        # Close pattern manager to release Qdrant lock
+        if hasattr(self, 'pattern_manager') and self.pattern_manager:
+            self.logger.info("Closing pattern manager...")
+            try:
+                if hasattr(self.pattern_manager, 'qdrant') and self.pattern_manager.qdrant:
+                    if hasattr(self.pattern_manager.qdrant, 'client'):
+                        self.pattern_manager.qdrant.client.close()
+            except Exception as e:
+                self.logger.warning(f"Error closing Qdrant client: {e}")
+            self.pattern_manager = None

@@ -16,6 +16,7 @@ python -m sglang.launch_server \
   --disable-cuda-graph \
   --attention-backend triton
 
+conda activate uitars
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name autoglm-os --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
 
 # 下载docker镜像
@@ -50,8 +51,9 @@ python run_hisa.py \
   --result_dir ./results/hisa_wo_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_small.json \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
   --wo_pattern \
+  --unify_llm \
   --rerun_fail \
   --cleanup_docker \
   > nohup.out 2>&1 &
