@@ -32,6 +32,8 @@ def config() -> argparse.Namespace:
     parser.add_argument("--snapshot_name", type=str, default="init_state")
     parser.add_argument("--screen_width", type=int, default=1920)
     parser.add_argument("--screen_height", type=int, default=1080)
+    parser.add_argument("--image_width", type=int, default=1280)
+    parser.add_argument("--image_height", type=int, default=720)
     parser.add_argument("--sleep_after_execution", type=float, default=0.5)
     parser.add_argument("--client_password", type=str, default="password",
                        help="VM client password")
@@ -117,7 +119,7 @@ def config() -> argparse.Namespace:
         screen_size=(args.screen_width, args.screen_height),
         headless=args.headless,
         os_type="Ubuntu",
-        require_a11y_tree=True
+        require_a11y_tree=False
     )
     return args
 
@@ -305,6 +307,8 @@ def process_single_task(
             max_steps=max_steps,
             save_dir=save_dir,
             record=args.record,
+            image_width=args.image_width,
+            image_height=args.image_height,
             wo_pattern=args.wo_pattern,
             wo_roi=args.wo_roi,
             roi_margin=args.roi_margin,
@@ -317,7 +321,6 @@ def process_single_task(
             wo_refinement=args.wo_refinement,
             sliding_window_size=args.sliding_window_size,
             max_parse_retries=max_parse_retries,
-            with_atree=True,
         )
 
         # Execute task

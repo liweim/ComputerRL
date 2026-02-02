@@ -15,6 +15,8 @@ from PIL import Image
 import io
 import time
 import glob
+from PIL import Image
+from io import BytesIO
 from .prompts import GLOBAL_PLANNER_PROMPT, CONTEXT_REFINEMENT_PROMPT, FIX_RESPONSE_PROMPT, FIX_RESPONSE_UNIFY_PROMPT, STEP_ABSTRACTION_PROMPT, PATTERN_INDUCTION_PROMPT, PATTERN_SYNTHESIS_PROMPT
 from .prompt.procedural_memory import Prompt as AutoGLMPrompt
 from ..autoglm_v.prompt.grounding_agent import GroundingAgent as AutoGLMAgent
@@ -369,6 +371,8 @@ class HiSA:
         client_password: str = "password",
         screen_width: int = 1920,
         screen_height: int = 1080,
+        image_width: int = 1280,
+        image_height: int = 720,
         sleep_after_execution: float = 0.5,
         max_steps: int = 15,
         save_dir: str = "",
@@ -389,7 +393,7 @@ class HiSA:
         with_atree: bool = False,
         tool_in_sys_msg: bool = True,
         relative_coordinate: bool = True,
-        glm41v_format: bool = False,
+        glm41v_format: bool = True,
     ):
         self.env = env
         self.global_planner_model = global_planner_model
@@ -397,6 +401,8 @@ class HiSA:
         self.client_password = client_password
         self.screen_width = screen_width
         self.screen_height = screen_height
+        self.image_width = image_width
+        self.image_height = image_height
         self.sleep_after_execution = sleep_after_execution
         self.max_steps = max_steps
         self.save_dir = save_dir
@@ -1003,11 +1009,19 @@ class HiSA:
 
         content = [{"type": "text", "text": prompt}]
         if self.with_image and screenshot_b64:
+            screenshot_bytes = base64.b64decode(screenshot_b64)
+    
+            img = Image.open(BytesIO(screenshot_bytes))
+            img = img.resize((self.image_width, self.image_height))
+            buf = BytesIO()
+            img.save(buf, format='PNG')
+            resized_screenshot = base64.b64encode(buf.getvalue()).decode('utf-8')
+
             content = [
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{screenshot_b64}",
+                        "url": f"data:image/png;base64,{resized_screenshot}",
                         "detail": "high",
                     },
                 }
@@ -1043,9 +1057,7 @@ class HiSA:
         thought = re.sub(pattern, '', response, flags=re.DOTALL).strip()
 
         # Handle tool method calls exactly like autoglm_v
-        if "Agent." in code:
-            action = eval(code, {"Agent": AutoGLMAgent, "BrowserTools": BrowserTools})
-        elif "BrowserTools." in code:
+        if "Agent." in code or "BrowserTools." in code:
             action = eval(code, {"Agent": AutoGLMAgent, "BrowserTools": BrowserTools})
         else:
             # For regular code, handle like autoglm_v with tool_commands
