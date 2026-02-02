@@ -40,7 +40,7 @@ python run_autoglm_v.py \
     --result_dir results/autoglm-os_baseline \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_small.json \
+    --test_all_meta_path ./evaluation_examples/test_one.json \
     --cleanup_docker \
     > nohup2.out 2>&1 &
 
@@ -53,7 +53,6 @@ python run_hisa.py \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_one.json \
   --wo_pattern \
-  --unify_llm \
   --rerun_fail \
   --cleanup_docker \
   > nohup.out 2>&1 &

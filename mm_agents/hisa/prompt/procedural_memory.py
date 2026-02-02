@@ -120,10 +120,7 @@ def generate_func(json_data):
 
 
 setup_prompt = """You are a GUI operation agent. You will be given a task and your action history, with current observation ({observation_list}). You should help me control the computer, output the best action step by step to accomplish the task.
-You should first generate a plan, reflect on the current observation, then generate actions to complete the task in python-style pseudo code using the predefined functions.
-
-* Output Format:
-{format_hint}"""
+You should first generate a plan, reflect on the current observation, then generate actions to complete the task in python-style pseudo code using the predefined functions."""
 
 func_def_template = """* Available Functions:
 ```python
@@ -136,7 +133,10 @@ note_prompt = """* Note:
 - Each code block is context independent, and variables from the previous round cannot be used in the next round.
 {relative_coordinate_hint}- Return with `Agent.exit(success=True)` immediately after the task is completed.
 - The computer's environment is Linux, e.g., Desktop path is '/home/user/Desktop'
-- My computer's password is '{client_password}', feel free to use it when you need sudo rights"""
+- My computer's password is '{client_password}', feel free to use it when you need sudo rights
+
+* Output Format:
+{format_hint}"""
 
 
 class Prompt:
@@ -176,13 +176,13 @@ class Prompt:
         observation_list = ", ".join(obs_items)
 
         setup_prompt_formatted = setup_prompt.format(
-            observation_list=observation_list,
-            format_hint="<think>\n{**YOUR-PLAN-AND-THINKING**}</think>\n<answer>```python\n{**ONE-LINE-OF-CODE**}\n```</answer>" if glm41v_format else "<think>\n{**YOUR-PLAN-AND-THINKING**}\n</think>\n```python\n{**ONE-LINE-OF-CODE**}\n```"
+            observation_list=observation_list
         )
 
         note_prompt_formatted = note_prompt.format(
             relative_coordinate_hint="- The coordinate [x, y] should be normalized to 0-1000, which usually should be the center of a specific target element.\n" if relative_coordinate else "",
-            client_password=client_password
+            client_password=client_password,
+            format_hint="<think>\n{**YOUR-PLAN-AND-THINKING**}</think>\n<answer>```python\n{**ONE-LINE-OF-CODE**}\n```</answer>" if glm41v_format else "<think>\n{**YOUR-PLAN-AND-THINKING**}\n</think>\n```python\n{**ONE-LINE-OF-CODE**}\n```"
         )
 
         return setup_prompt_formatted, func_def_prompt, note_prompt_formatted

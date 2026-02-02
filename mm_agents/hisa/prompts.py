@@ -165,8 +165,7 @@ Please provide a valid JSON response in the exact format:
 }}
 ```"""
 
-FIX_RESPONSE_UNIFY_PROMPT = """Error: Failed to parse your response.
-Error message: {error_message}
+FIX_RESPONSE_UNIFY_PROMPT = """Error message: {error_message}
 
 Your response was:
 {response}
@@ -175,7 +174,7 @@ Please provide a valid response in the exact format:
 <think>
 **YOUR-PLAN-AND-THINKING**
 </think>
-````python
+```python
 **ONE-LINE-OF-CODE**
 ```"""
 

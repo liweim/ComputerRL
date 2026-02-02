@@ -50,17 +50,6 @@ def config() -> argparse.Namespace:
     parser.add_argument("--global_planner_repetition_penalty", type=float, default=1.0,
                        help="Repetition penalty for Global Planner model")
 
-    parser.add_argument("--visual_grounder_model", type=str, default="autoglm-os",
-                       help="Model for Visual Grounder agent")
-    parser.add_argument("--visual_grounder_temperature", type=float, default=0.2,
-                       help="Temperature for Visual Grounder model")
-    parser.add_argument("--visual_grounder_top_p", type=float, default=0.1,
-                       help="Top-p for Visual Grounder model")
-    parser.add_argument("--visual_grounder_max_tokens", type=int, default=256,
-                       help="Max tokens for Visual Grounder model")
-    parser.add_argument("--visual_grounder_repetition_penalty", type=float, default=1.0,
-                       help="Repetition penalty for Visual Grounder model")
-
     parser.add_argument("--state_manager_model", type=str, default="autoglm-os",
                        help="Model for auxiliary tasks (step abstraction, context refinement, pattern induction, etc.)")
     parser.add_argument("--state_manager_temperature", type=float, default=0.2,
@@ -91,8 +80,6 @@ def config() -> argparse.Namespace:
                        help="Sliding window size (number of conversation turns to keep) (default: 5)")
     parser.add_argument("--max_parse_retries", type=int, default=3,
                        help="Maximum number of retries for parsing LLM responses (default: 3)")
-    parser.add_argument("--unify_llm", action="store_true",
-                       help="Unified LLM (use same model for controller and grounder, default: False means separate models are used)")
 
     # Task config
     parser.add_argument("--domain", type=str, default="all")
@@ -130,7 +117,7 @@ def config() -> argparse.Namespace:
         screen_size=(args.screen_width, args.screen_height),
         headless=args.headless,
         os_type="Ubuntu",
-        require_a11y_tree=False
+        require_a11y_tree=True
     )
     return args
 
@@ -280,7 +267,6 @@ def process_single_task(
     """Process a single task with the dual agent framework."""
     # Extract parameters
     result_dir = args.result_dir
-    unify_llm = args.unify_llm
     max_steps = args.max_steps
     sleep_after_execution = args.sleep_after_execution
     client_password = args.client_password
@@ -294,13 +280,6 @@ def process_single_task(
         args.global_planner_max_tokens,
         args.global_planner_repetition_penalty
     )
-    visual_grounder_model = LLM(
-        args.visual_grounder_model,
-        args.visual_grounder_temperature,
-        args.visual_grounder_top_p,
-        args.visual_grounder_max_tokens,
-        args.visual_grounder_repetition_penalty
-    ) if not unify_llm else global_planner_model
     state_manager_model = LLM(
         args.state_manager_model,
         args.state_manager_temperature,
@@ -320,7 +299,6 @@ def process_single_task(
         framework = HiSA(
             env=args.env,
             global_planner_model=global_planner_model,
-            visual_grounder_model=visual_grounder_model,
             state_manager_model=state_manager_model,
             client_password=client_password,
             sleep_after_execution=sleep_after_execution,
@@ -339,7 +317,7 @@ def process_single_task(
             wo_refinement=args.wo_refinement,
             sliding_window_size=args.sliding_window_size,
             max_parse_retries=max_parse_retries,
-            unify_llm=unify_llm
+            with_atree=True,
         )
 
         # Execute task

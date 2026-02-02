@@ -16,7 +16,7 @@ import io
 import time
 import glob
 from .prompts import GLOBAL_PLANNER_PROMPT, CONTEXT_REFINEMENT_PROMPT, FIX_RESPONSE_PROMPT, FIX_RESPONSE_UNIFY_PROMPT, STEP_ABSTRACTION_PROMPT, PATTERN_INDUCTION_PROMPT, PATTERN_SYNTHESIS_PROMPT
-from ..autoglm_v.prompt.procedural_memory import Prompt as AutoGLMPrompt
+from .prompt.procedural_memory import Prompt as AutoGLMPrompt
 from ..autoglm_v.prompt.grounding_agent import GroundingAgent as AutoGLMAgent
 from ..autoglm_v.prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
 from ..autoglm_v.tools.package.google_chrome import BrowserTools
@@ -56,7 +56,7 @@ class PatternManager:
         mode = "server" if use_qdrant_server else "local"
         self.logger.info(f"Vector database ({mode} mode) and embedding service initialized")
 
-    def _ensure_collection(self, collection_name: str):
+    def ensure_collection(self, collection_name: str):
         """Ensure Qdrant collection exists for a domain."""
         try:
             collections = self.qdrant.list_collections()
@@ -85,7 +85,7 @@ class PatternManager:
             - Different domains use different Qdrant collections
         """
         try:
-            self._ensure_collection(domain)
+            self.ensure_collection(domain)
 
             # Get current max ID from Qdrant
             try:
@@ -245,7 +245,7 @@ class PatternManager:
             Actionable advice string based on relevant patterns
         """
         try:
-            self._ensure_collection(domain)
+            self.ensure_collection(domain)
 
             # Check if collection has any points
             try:
@@ -365,7 +365,6 @@ class HiSA:
         self,
         env,
         global_planner_model=None,  # Function to call LLM for global planner
-        visual_grounder_model=None,  # Function to call LLM for visual grounder (only used when unify_llm=False)
         state_manager_model=None,  # Function to call LLM for state manager
         client_password: str = "password",
         screen_width: int = 1920,
@@ -386,7 +385,6 @@ class HiSA:
         wo_step: bool = False,  # If True, skip step abstraction and use full conversation history
         wo_refinement: bool = False,  # If True, disable context refinement and use sliding window
         sliding_window_size: int = 5,  # Sliding window size (number of conversation turns to keep)
-        unify_llm: bool = True,  # If True, use unified LLM for controller and grounder
         with_image: bool = True,
         with_atree: bool = False,
         tool_in_sys_msg: bool = True,
@@ -395,7 +393,6 @@ class HiSA:
     ):
         self.env = env
         self.global_planner_model = global_planner_model
-        self.visual_grounder_model = visual_grounder_model
         self.state_manager_model = state_manager_model
         self.client_password = client_password
         self.screen_width = screen_width
@@ -413,7 +410,6 @@ class HiSA:
         self.wo_step = wo_step  # Skip step abstraction if True
         self.wo_refinement = wo_refinement  # Disable context refinement if True
         self.sliding_window_size = sliding_window_size  # Sliding window size for conversation history
-        self.unify_llm = unify_llm  # Use unified LLM for controller and grounder
         self.with_image = with_image
         self.with_atree = with_atree
         self.tool_in_sys_msg = tool_in_sys_msg
@@ -434,7 +430,6 @@ class HiSA:
 
         # Initialize token usage tracking (for compatibility with existing code)
         self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
-        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
 
         # Initialize pattern manager
@@ -459,7 +454,7 @@ class HiSA:
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
 
-    def _call_llm(self, func, messages, usage_tracker):
+    def call_llm(self, func, messages, usage_tracker):
         """Call LLM function and update usage statistics."""
         if hasattr(func, 'get_last_usage'):
             # TokenTracker style function
@@ -475,18 +470,17 @@ class HiSA:
             # For simple functions, we don't have usage info, so we skip updating
         return response
 
-    def _get_usage_snapshot(self) -> Dict:
+    def get_usage_snapshot(self) -> Dict:
         """Get current token usage snapshot from all LLMs."""
         return {
             "global_planner": self.global_planner_usage.copy(),
-            "visual_grounder": self.visual_grounder_usage.copy(),
             "state_manager": self.state_manager_usage.copy()
         }
 
-    def _calculate_usage_delta(self, before: Dict, after: Dict) -> Dict:
+    def calculate_usage_delta(self, before: Dict, after: Dict) -> Dict:
         """Calculate the difference in token usage between two snapshots."""
         delta = {}
-        for model in ["global_planner", "visual_grounder", "state_manager"]:
+        for model in ["global_planner", "state_manager"]:
             delta[model] = {
                 "cost": after[model]["cost"] - before[model]["cost"],
                 "prompt_tokens": after[model]["prompt_tokens"] - before[model]["prompt_tokens"],
@@ -495,7 +489,7 @@ class HiSA:
             }
         return delta
 
-    def _summarize_history_segment(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
+    def get_context_refinement(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
         """Summarize a segment of action logs with context refinement."""
         
         if not logs and not previous_summary:
@@ -568,7 +562,7 @@ class HiSA:
             messages = [
                 {"role": "user", "content": prompt}
             ]
-            summary_with_context_refinement = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            summary_with_context_refinement = self.call_llm(self.state_manager_model, messages, self.state_manager_usage)
             return summary_with_context_refinement.strip()
         except Exception as e:
             self.logger.error(f"Failed to summarize history segment with context refinement: {e}")
@@ -591,7 +585,6 @@ class HiSA:
 
         # Reset state
         self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
-        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.env.reset(task_config=task_config)
         self.operation_count = 0
@@ -643,10 +636,10 @@ class HiSA:
                 self.logger.info(f"Step {self.operation_count + 1}/{self.max_steps}")
 
                 # Capture token usage before this step
-                usage_before_step = self._get_usage_snapshot()
+                usage_before_step = self.get_usage_snapshot()
 
                 # Get global planner decision
-                decision = self._get_global_planner_decision()
+                decision = self.get_decision()
 
                 if decision is None:
                     self.logger.error("Failed to get valid decision")
@@ -658,77 +651,55 @@ class HiSA:
                     break
 
                 # Capture token usage after global planner decision
-                usage_after_global_planner = self._get_usage_snapshot()
+                usage_after_global_planner = self.get_usage_snapshot()
 
                 # Check termination or infeasible
-                if self.unify_llm:
-                    # In unify_llm mode, check for special commands (autoglm_v style)
-                    if decision.get("code") == "DONE":
-                        is_infeasible = False
-                        self.logger.info("Task COMPLETED")
-                        break
-                    elif decision.get("code") == "FAIL":
-                        is_infeasible = True
-                        infeasible_reason = "Task failed (marked as FAIL by agent)"
-                        self.logger.info(f"Task FAILED: {infeasible_reason}")
-                        # Send "FAIL" action to environment so action_history ends with "FAIL"
-                        # This is required for OSWorld's infeasible task evaluation
-                        try:
-                            self.env.step("FAIL", 0)
-                        except Exception as e:
-                            self.logger.warning(f"Failed to send FAIL action: {e}")
-                        break
-                    elif decision.get("code") == "WAIT":
-                        # Handle WAIT command - continue to next iteration
-                        self.logger.info("Agent requested WAIT - continuing to next step")
-                        continue
-                else:
-                    # Traditional hisa mode with tool field
-                    if decision["tool"] == "termination":
-                        is_infeasible = False
-                        self.logger.info("Task COMPLETED")
-                        break
-                    elif decision["tool"] == "infeasible":
-                        is_infeasible = True
-                        infeasible_reason = decision.get('input', 'Task is objectively impossible to complete')
-                        self.logger.info(f"Task INFEASIBLE: {infeasible_reason}")
-                        # Send "FAIL" action to environment so action_history ends with "FAIL"
-                        # This is required for OSWorld's infeasible task evaluation
-                        try:
-                            self.env.step("FAIL", 0)
-                        except Exception as e:
-                            self.logger.warning(f"Failed to send FAIL action: {e}")
-                        break
+                if decision.get("code") == "DONE":
+                    is_infeasible = False
+                    self.logger.info("Task COMPLETED")
+                    break
+                elif decision.get("code") == "FAIL":
+                    is_infeasible = True
+                    infeasible_reason = "Task failed (marked as FAIL by agent)"
+                    self.logger.info(f"Task FAILED: {infeasible_reason}")
+                    # Send "FAIL" action to environment so action_history ends with "FAIL"
+                    # This is required for OSWorld's infeasible task evaluation
+                    try:
+                        self.env.step("FAIL", 0)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send FAIL action: {e}")
+                    break
+                elif decision.get("code") == "WAIT":
+                    # Handle WAIT command - continue to next iteration
+                    self.logger.info("Agent requested WAIT - continuing to next step")
+                    continue
 
                 # Pre-calculate global planner token usage and set step_token_usage before tool execution
-                # This ensures _gui_action/_bash_execution can use it when creating action_log
-                global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
+                global_planner_usage = self.calculate_usage_delta(usage_before_step, usage_after_global_planner)
 
-                # Initialize step_token_usage with global planner data (visual_grounder/state_manager will be updated after execution)
+                # Initialize step_token_usage with global planner data (state_manager will be updated after execution)
                 self.step_token_usage = {
                     "global_planner": global_planner_usage["global_planner"],
-                    "visual_grounder": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
                     "state_manager": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
                     "total": global_planner_usage["global_planner"].copy()
                 }
 
                 # Execute tool and capture execution result text
-                execution_result_text = self._execute_tool(decision)
+                execution_result_text = self.execute_tool(decision)
                 
-                if execution_result_text and (self.unify_llm or self.wo_step):
+                if execution_result_text and self.wo_step:
                     self.last_tool_output = execution_result_text
 
                 # Capture token usage after tool execution
-                usage_after_tool = self._get_usage_snapshot()
+                usage_after_tool = self.get_usage_snapshot()
 
-                # Calculate state_manager/visual_grounder token usage and update step_token_usage
-                tool_usage = self._calculate_usage_delta(usage_after_global_planner, usage_after_tool)
-                total_step_usage = self._calculate_usage_delta(usage_before_step, usage_after_tool)
+                # Calculate state_manager token usage and update step_token_usage
+                tool_usage = self.calculate_usage_delta(usage_after_global_planner, usage_after_tool)
+                total_step_usage = self.calculate_usage_delta(usage_before_step, usage_after_tool)
 
                 # Update token usage: combine state_manager usage from history summarization and step abstraction
                 self.step_token_usage = {
                     "global_planner": global_planner_usage["global_planner"],
-                    "visual_grounder": tool_usage["visual_grounder"],
                     "state_manager": {
                         "cost": global_planner_usage["state_manager"]["cost"] + tool_usage["state_manager"]["cost"],
                         "prompt_tokens": global_planner_usage["state_manager"]["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
@@ -736,10 +707,10 @@ class HiSA:
                         "image_count": global_planner_usage["state_manager"]["image_count"] + tool_usage["state_manager"]["image_count"]
                     },
                     "total": {
-                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["visual_grounder"]["cost"] + total_step_usage["state_manager"]["cost"],
-                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["visual_grounder"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"],
-                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["visual_grounder"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"],
-                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["visual_grounder"]["image_count"] + total_step_usage["state_manager"]["image_count"]
+                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["state_manager"]["cost"],
+                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"],
+                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"],
+                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["state_manager"]["image_count"]
                     }
                 }
 
@@ -750,7 +721,7 @@ class HiSA:
                 self.operation_count += 1
 
                 # Continue with next iteration
-                # (screenshot will be fetched in next _get_global_planner_decision call)
+                # (screenshot will be fetched in next get_decision call)
 
             # Check if reached max_steps without completion
             if self.operation_count >= self.max_steps and not is_infeasible:
@@ -765,7 +736,7 @@ class HiSA:
                     self.logger.warning(f"Failed to send FAIL action: {e}")
 
             # Evaluation
-            score = self._evaluate_and_save(task_config, is_infeasible, infeasible_reason)
+            score = self.evaluate_and_save(task_config, is_infeasible, infeasible_reason)
 
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
@@ -790,7 +761,7 @@ class HiSA:
         
         return score
 
-    def _get_global_planner_decision(self) -> Optional[Dict]:
+    def get_decision(self) -> Optional[Dict]:
         """Get decision from global planner with retry on parsing errors."""
 
         for attempt in range(self.max_parse_retries):
@@ -820,7 +791,7 @@ class HiSA:
                         logs_to_summarize = self.action_logs[self.last_summary_step:]
                         start_step = self.action_logs[0]["step"]
                         end_step = self.action_logs[-1]["step"]
-                        summary = self._summarize_history_segment(
+                        summary = self.get_context_refinement(
                             logs_to_summarize, start_step, end_step,
                             previous_summary=self.last_full_summary
                         )
@@ -829,7 +800,7 @@ class HiSA:
                         logs_to_summarize = self.action_logs
                         start_step = logs_to_summarize[0]["step"]
                         end_step = logs_to_summarize[-1]["step"]
-                        summary = self._summarize_history_segment(logs_to_summarize, start_step, end_step)
+                        summary = self.get_context_refinement(logs_to_summarize, start_step, end_step)
 
                     self.last_full_summary = summary
                     self.last_summary_step = total_logs
@@ -846,54 +817,25 @@ class HiSA:
                     messages = [
                         {"role": "user", "content": self.last_error_feedback}
                     ]
-                elif self.unify_llm:
-                    # Use unified LLM approach (autoglm_v style)
-                    messages = self._build_unify_llm_messages(screenshot_b64)
                 else:
-                    # Use traditional hisa approach
-                    messages = self._build_traditional_messages(screenshot_b64)
+                    messages = self.build_messages(screenshot_b64)
 
                 if attempt > 0:
                     self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
 
                 # Call global planner
-                response = self._call_llm(self.global_planner_model, messages, self.global_planner_usage)
+                response = self.call_llm(self.global_planner_model, messages, self.global_planner_usage)
 
-                if self.unify_llm:
-                    # Parse unified LLM response (autoglm_v style)
-                    obs_dict = {"cur_app": cur_app}
-                    decision = self._parse_unified_response(response, obs_dict)
-                else:
-                    # Extract JSON (original hisa style)
-                    json_str = response
-                    if "```json" in response:
-                        json_start = response.find("```json") + 7
-                        json_end = response.find("```", json_start)
-                        json_str = response[json_start:json_end].strip()
-                    elif "```" in response:
-                        json_start = response.find("```") + 3
-                        json_end = response.find("```", json_start)
-                        json_str = response[json_start:json_end].strip()
+                obs_dict = {"cur_app": cur_app}
+                decision = self.parse_response(response, obs_dict)
 
-                    # Parse JSON
-                    decision = json.loads(repair_json(json_str))
-
-                    # Validate decision structure
-                    if "tool" not in decision:
-                        raise ValueError("Missing 'tool' field in decision")
-                    if decision["tool"] not in ["gui_action", "bash_execution", "wait", "termination", "infeasible"]:
-                        raise ValueError(f"Invalid tool: {decision['tool']}")
-
-                if self.unify_llm:
-                    self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
-                else:
-                    self.logger.info(f"Tool: {decision.get('tool', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
+                self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
 
                 # Clear error feedback on success
                 self.last_error_feedback = None
                 
                 # Store conversation after successful parsing
-                if (self.unify_llm or self.wo_step) and messages and len(messages) > 1:
+                if self.wo_step and messages and len(messages) > 1:
                     # For traditional hisa with wo_step, store the current user message
                     if messages and len(messages) > 1:  # system + user messages
                         # Store user message (last one)
@@ -911,16 +853,10 @@ class HiSA:
                 
                 # If not last attempt, set error feedback for retry
                 if attempt < self.max_parse_retries - 1:
-                    if self.unify_llm:
-                        error_feedback = FIX_RESPONSE_UNIFY_PROMPT.format(
-                            error_message=str(e),
-                            response=response
-                        )
-                    else:
-                        error_feedback = FIX_RESPONSE_PROMPT.format(
-                            error_message=str(e),
-                            response=response
-                        )
+                    error_feedback = FIX_RESPONSE_UNIFY_PROMPT.format(
+                        error_message=str(e),
+                        response=response
+                    )
 
                     # Store error feedback for next iteration
                     self.last_error_feedback = error_feedback
@@ -936,119 +872,7 @@ class HiSA:
         
         return None
 
-    def _build_traditional_messages(self, screenshot_b64: str) -> List[Dict]:
-        """Build messages for traditional hisa approach."""
-        if self.wo_step:
-            # Use full conversation history approach
-            messages = [
-                {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
-            ]
-
-            # Build current query text
-            current_query_parts = []
-
-            # Add observation from previous action to maintain dialogue structure
-            if self.last_tool_output:
-                current_query_parts.append(f"Observation from previous action:\n{self.last_tool_output}\n")
-                self.last_tool_output = None  # Clear after use to prevent duplicate appending
-
-            # Task instruction + pattern + summary (only after context refinement)
-            if len(self.conversation_messages) == 0:
-                current_query_parts.append(f"Task: {self.task_instruction}\n")
-                if self.past_pattern_text:
-                    current_query_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
-
-                # Add refined context if available (only when context refinement is enabled)
-                if not self.wo_refinement and self.last_full_summary:
-                    current_query_parts.append(f"\n<execution_history_summary>\n{self.last_full_summary}\n</execution_history_summary>\n")
-
-            # Standard prompt (error feedback is handled directly in _get_global_planner_decision)
-            if len(self.conversation_messages) == 0:
-                current_query_parts.append("\nBased on the execution history and current screenshot, what's the next action?")
-            else:
-                current_query_parts.append("\nBased on the conversation history and current screenshot, what's the next action?")
-
-            # ========== Sliding Window Logic (for wo_step mode) ==========
-            # If context refinement is disabled, apply sliding window
-            conversation_to_append = self.conversation_messages
-            max_messages = self.sliding_window_size * 2
-            if self.wo_refinement and len(self.conversation_messages) > max_messages:
-                conversation_to_append = self.conversation_messages[-max_messages:]
-                conversation_to_append[0]["content"][0]["text"] = f'Task: {self.task_instruction}\n\n{conversation_to_append[0]["content"][0]["text"]}'
-
-            messages.extend(conversation_to_append)
-
-            # Add current user message with screenshot
-            current_user_message = {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "".join(current_query_parts)},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "high"}}
-                ]
-            }
-            messages.append(current_user_message)
-        else:
-            # Original approach with step_abstract
-
-            # ========== Sliding Window Logic (for step mode) ==========
-            # When wo_refinement=True, apply sliding window to action_logs
-            logs_to_use = self.action_logs
-            if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
-                logs_to_use = self.action_logs[-self.sliding_window_size:]
-
-            # Build condensed_history: summary + recent step summaries
-            condensed_history = []
-            if not self.wo_refinement and self.last_full_summary:
-                # Context refinement enabled: use summary + recent logs
-                condensed_history = [self.last_full_summary]
-                for log in self.action_logs[self.last_summary_step:]:
-                    if "step_abstract" in log:
-                        condensed_history.append(log["step_abstract"])
-            else:
-                # wo_refinement=True or no summary yet: use logs (with sliding window applied)
-                for log in logs_to_use:
-                    if "step_abstract" in log:
-                        condensed_history.append(log["step_abstract"])
-
-            user_message_parts = []
-            user_message_parts.append(f"Task: {self.task_instruction}\n")
-
-            if self.past_pattern_text:
-                user_message_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
-
-            # Add condensed history
-            if condensed_history:
-                user_message_parts.append(f"\n<execution_history>\n" + "\n".join(condensed_history) + "\n</execution_history>\n")
-
-            # Standard prompt (error feedback is handled directly in _get_global_planner_decision)
-            user_message_parts.append("""
-Based on the execution_history and current screenshot, decide the next action. Avoid repeating failed actions. You should strictly follow the JSON format below:
-```json
-{
-    "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
-    "tool": "gui_action|bash_execution|wait|termination|infeasible",
-    "input": "String - tool-specific content (see examples below)",
-    "description": "Optional - only for gui_action with placeholders, describe the element to locate"
-}
-```""")
-
-            user_message_text = "".join(user_message_parts)
-
-            # Build messages array
-            messages = [
-                {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_message_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "high"}}
-                    ]
-                }
-            ]
-
-        return messages
-
-    def _build_unify_llm_messages(self, screenshot_b64: str) -> List[Dict]:
+    def build_messages(self, screenshot_b64: str) -> List[Dict]:
         """Build messages for unified LLM approach using autoglm_v prompts."""
         # Get current app and accessibility tree for autoglm_v style observation
         cur_app = None
@@ -1071,57 +895,45 @@ Based on the execution_history and current screenshot, decide the next action. A
         except Exception as e:
             self.logger.warning(f"Failed to get app info for unified LLM: {e}")
 
-        # ========== CHANGE: Build history as text instead of separate messages ==========
-        history_text = ""
+        # ========== CHANGE: Build history messages ==========
+        history_messages = []
         if self.wo_step:
-            # ========== ADD: Sliding Window for conversation history ==========
+            # Use conversation messages directly (with sliding window)
             conversation_to_use = self.conversation_messages
             max_messages = self.sliding_window_size * 2
             if self.wo_refinement and len(self.conversation_messages) > max_messages:
                 conversation_to_use = self.conversation_messages[-max_messages:]
             
-            # Convert conversation history to text format
-            history_lines = []
-            for i, msg in enumerate(conversation_to_use):
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                # Extract text from content (handling both string and list formats)
-                if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") in ["text", "input_text"]:
-                            text_parts.append(item.get("text", ""))
-                    content_text = " ".join(text_parts)
-                else:
-                    content_text = content
-                history_lines.append(f"{role}: {content_text}")
-            
-            if history_lines:
-                history_text = "\n".join(history_lines)
+            history_messages = conversation_to_use
         else:
-            # ========== ADD: Sliding Window for action logs ==========
+            # Build from action logs (with sliding window)
             logs_to_use = self.action_logs
             if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
                 logs_to_use = self.action_logs[-self.sliding_window_size:]
             
-            # Build condensed_history: summary + recent step summaries (same as _build_traditional_messages)
-            history_lines = []
             if not self.wo_refinement and self.last_full_summary:
-                # Context refinement enabled: use summary + recent logs
-                history_lines.append(self.last_full_summary)
+                # Context refinement enabled: add summary as first message
+                history_messages.append({
+                    "role": "assistant",
+                    "content": self.last_full_summary
+                })
+                # Add recent step summaries
                 for log in self.action_logs[self.last_summary_step:]:
                     if "step_abstract" in log:
-                        history_lines.append(log["step_abstract"])
+                        history_messages.append({
+                            "role": "assistant",
+                            "content": log["step_abstract"]
+                        })
             else:
-                # wo_refinement=True or no summary yet: use logs (with sliding window applied)
+                # wo_refinement=True or no summary yet
                 for log in logs_to_use:
                     if "step_abstract" in log:
-                        history_lines.append(log["step_abstract"])
-            
-            if history_lines:
-                history_text = "\n".join(history_lines)
+                        history_messages.append({
+                            "role": "assistant",
+                            "content": log["step_abstract"]
+                        })
 
-        # Construct prompt using autoglm_v's Prompt class (same logic as autoglm_v)
+        # Construct prompt using autoglm_v's Prompt class
         if cur_app:
             tool_name = cur_app.strip().lower().replace("-", "_")
             tool_name = tool_name if tool_name in self.tool_list.keys() else None
@@ -1130,19 +942,32 @@ Based on the execution_history and current screenshot, decide the next action. A
 
         setup_prompt, func_def_prompt, note_prompt = AutoGLMPrompt.construct_procedural_memory(
             AutoGLMAgent, app_name=tool_name, client_password=self.client_password,
-            with_image=self.with_image, with_atree=self.with_atree, relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format
+            with_image=self.with_image, with_atree=self.with_atree, 
+            relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format
         )
 
         if self.tool_in_sys_msg:
             system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
         else:
             system_message = setup_prompt + "\n\n" + note_prompt
+        
+        # ========== CHANGE: Move task instruction to system message ==========
+        system_message += f"\n\n**IMPORTANT** You are asked to complete the following task: {self.task_instruction}"
 
-        # ========== ADD: Inject past pattern into system message on first turn ==========
+        # ========== Inject past pattern into system message on first turn ==========
         if self.past_pattern_text and len(self.conversation_messages) == 0:
             system_message += f"\n\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>"
 
-        # Build current observation like autoglm_v
+        # ========== CHANGE: Build messages list structure like reference ==========
+        messages = [
+            {
+                "role": "system",
+                "content": system_message,
+            }
+        ]
+        messages.extend(history_messages)
+
+        # Build current observation
         if app_list:
             app_str = "Window ID    App Name    Title\n"
             for window_id, app in app_list.items():
@@ -1155,6 +980,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             last_result = self.last_tool_output.strip()
             last_result = last_result[:2000] + "..." if len(last_result) > 2000 else last_result
             self.last_tool_output = None
+        last_result = last_result if last_result else "None"
 
         tree = ""
         if accessibility_tree and self.with_atree:
@@ -1164,44 +990,16 @@ Based on the execution_history and current screenshot, decide the next action. A
         app_info_trimmed = app_info.strip() if app_info else "None"
         app_info_trimmed = app_info_trimmed[:5000] + "..." if len(app_info_trimmed) > 5000 else app_info_trimmed
 
-        # ========== Build user message with all context ==========
-        prompt_parts = []
-    
-        # Add task instruction at the beginning
-        prompt_parts.append(f"**IMPORTANT** You are asked to complete the following task: {self.task_instruction}\n")
-        
-        # ========== ADD: Context Refinement Summary ==========
-        # When context refinement is enabled and wo_step=True, add refined summary (same as _build_traditional_messages)
-        if self.wo_step and not self.wo_refinement and self.last_full_summary and len(self.conversation_messages) == 0:
-            prompt_parts.append(f"\n<execution_history_summary>\n{self.last_full_summary}\n</execution_history_summary>\n")
-        
-        # ========== ADD: Execution history ==========
-        # For wo_step=False, last_full_summary is already included in history_text when not wo_refinement
-        if history_text:
-            prompt_parts.append(f"\n<execution_history>\n{history_text}\n</execution_history>\n")
-        
-        # Add current observation
-        # ========== CHANGE: Remove Previous Action Result since it's already in execution_history ==========
-        prompt_parts.append("\n* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}".format(
+        # ========== CHANGE: Build prompt like reference (no task instruction, no summary here) ==========
+        prompt = "* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}\n\n* Previous Action Result: {}".format(
             app_str.strip(),
             cur_window_id.strip() if cur_window_id in app_str else "None",
             '\n\n* A11y Tree: {}'.format(tree.strip()) if self.with_atree and tree else "",
             app_info_trimmed,
-        ))
-        
-        if not self.tool_in_sys_msg:
-            prompt_parts.append("\n\n" + func_def_prompt)
-        
-        # ========== ADD: Output format reminder at the end ==========
-        prompt_parts.append("""\n\n* Output Format:
-<think>
-**YOUR-PLAN-AND-THINKING**
-</think>
-````python
-**ONE-LINE-OF-CODE**
-```""")
-
-        prompt = "".join(prompt_parts)
+            last_result,
+        ) + (
+            "\n\n" + func_def_prompt if not self.tool_in_sys_msg else ""
+        ) + "\n\nBased on the current screenshot and conversation history, decide the next action."
 
         content = [{"type": "text", "text": prompt}]
         if self.with_image and screenshot_b64:
@@ -1215,15 +1013,11 @@ Based on the execution_history and current screenshot, decide the next action. A
                 }
             ] + content
 
-        # ========== CHANGE: Only two messages - system and user ==========
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": content}
-        ]
+        messages.append({"role": "user", "content": content})
 
         return messages
 
-    def _parse_unified_response(self, response: str, obs: Dict = None) -> Dict:
+    def parse_response(self, response: str, obs: Dict = None) -> Dict:
         """Parse unified LLM response (autoglm_v style)."""
         # Extract code from response (similar to autoglm_v's parse_code_from_string)
         import re
@@ -1246,11 +1040,7 @@ Based on the execution_history and current screenshot, decide the next action. A
         code = re.sub(r'^(\\+n|\n)+', '', code)
         code = re.sub(r'(\\+n|\n)+$', '', code)
 
-        # Extract thought if present (from <think> tags)
-        thought = ""
-        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
-        if think_match:
-            thought = think_match.group(1).strip()
+        thought = re.sub(pattern, '', response, flags=re.DOTALL).strip()
 
         # Handle tool method calls exactly like autoglm_v
         if "Agent." in code:
@@ -1272,41 +1062,20 @@ Based on the execution_history and current screenshot, decide the next action. A
 
         return {"code": action, "thought": thought}
 
-    def _execute_tool(self, decision: Dict) -> str:
+    def execute_tool(self, decision: Dict) -> str:
         """Execute tool based on decision and return execution result text."""
-        if self.unify_llm:
-            # In unified LLM mode, decision should contain the Python code to execute
-            code = decision.get("code", "")
-            if not code:
-                return "No code to execute"
+        # In unified LLM mode, decision should contain the Python code to execute
+        code = decision.get("code", "")
+        if not code:
+            return "No code to execute"
 
-            # Store thought for step_abstract
-            self.current_thought = decision.get("thought", "")
+        # Store thought for step_abstract
+        self.current_thought = decision.get("thought", "")
 
-            # Execute the code directly (similar to autoglm_v approach)
-            return self._execute_unified_code(code)
-        else:
-            # Original hisa approach
-            tool = decision.get("tool", "")
-            tool_input = decision.get("input", "")
-            description = decision.get("description", "")
+        # Execute the code directly (similar to autoglm_v approach)
+        return self.execute_code(code)
 
-            # Store thought for step_abstract
-            self.current_thought = decision.get("thought", "")
-
-            if tool == "gui_action":
-                # Input is pyautogui code string, description is optional for placeholder
-                return self._gui_action(tool_input, description)
-
-            elif tool == "bash_execution":
-                return self._bash_execution(tool_input)
-
-            elif tool == "wait":
-                return self._wait(tool_input)
-
-        return ""
-
-    def _execute_unified_code(self, code) -> str:
+    def execute_code(self, code) -> str:
         """Execute unified LLM generated code (autoglm_v style)."""
         self.logger.info(f"[unified_execution] {code}")
 
@@ -1317,7 +1086,7 @@ Based on the execution_history and current screenshot, decide the next action. A
         try:
             # Get before screenshot
             before_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_unified.png"
+            screenshot_file = f"step_{step}.png"
 
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(before_screenshot)
@@ -1342,7 +1111,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             if self.wo_step:
                 step_abstraction = ""
             else:
-                step_abstraction = "Result: " + self._step_abstraction_result(
+                step_abstraction = "Result: " + self.get_step_abstraction(
                     before_screenshot, after_screenshot, f"Executed: {final_code}",
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
@@ -1392,156 +1161,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             code_str = str(code) if isinstance(code, dict) else code
             return f"Unified Execution: {code_str}\nStatus: Failed\nError: {str(e)}"
 
-    def _call_visual_grounder(self, description: str, screenshot: bytes, code: str):
-        """Call visual grounder to get coordinates or code using LLM."""
-        if self.unify_llm:
-            # In unified LLM mode, expect complete code
-            return code
-        else:
-            # In traditional mode, call visual grounder LLM for coordinates
-            if not self.visual_grounder_model:
-                self.logger.warning("No visual grounder function available. Using default coordinates.")
-                return code.replace("X_COORD", "500").replace("Y_COORD", "500")
-
-            # Check if code contains placeholders
-            if "X_COORD" in code or "Y_COORD" in code:
-                # Call visual grounder LLM to get coordinates
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"Locate the element described as: {description}"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(screenshot).decode('utf-8')}", "detail": "high"}}
-                        ]
-                    }
-                ]
-
-                try:
-                    response = self.visual_grounder_model(messages)
-                    # Parse response to extract coordinates
-                    # This is a simplified implementation - in practice you'd need proper parsing
-                    import re
-                    coord_match = re.search(r'\((\d+),\s*(\d+)\)', response)
-                    if coord_match:
-                        x, y = coord_match.groups()
-                        return code.replace("X_COORD", x).replace("Y_COORD", y)
-                    else:
-                        self.logger.warning(f"Could not parse coordinates from visual grounder response: {response}")
-                        return code.replace("X_COORD", "500").replace("Y_COORD", "500")
-                except Exception as e:
-                    self.logger.error(f"Visual grounder call failed: {e}")
-                    return code.replace("X_COORD", "500").replace("Y_COORD", "500")
-
-            return code
-
-    def _gui_action(self, code: str, description: str = "") -> str:
-        """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
-        if description:
-            self.logger.info(f"[gui_action] {description}")
-        else:
-            self.logger.info(f"[gui_action] {code}")
-
-        # Record step start time
-        step_start_time = time.time()
-
-        step = self.operation_count + 1
-
-        try:
-            # Get before screenshot
-            before_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_gui_action.png"
-
-            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
-                f.write(before_screenshot)
-
-            # Check if code contains placeholders
-            has_placeholders = "X_COORD" in code or "Y_COORD" in code
-
-            if has_placeholders:
-                if not description:
-                    raise ValueError("Description required when using placeholders")
-
-                # Call visual grounder (simplified for autoglm-os)
-                code = self._call_visual_grounder(description, before_screenshot, code)
-
-            # Execute code
-            final_code = postprocess_action(code)
-            obs, *_ = self.env.step(final_code, self.sleep_after_execution)
-
-            # Wait 10 seconds for action to take effect
-            time.sleep(10)
-
-            # Get after screenshot and evaluate
-            after_screenshot = self.env.controller.get_screenshot()
-
-            # Create description for step abstraction
-            eval_desc = description if description else code
-            
-            # Skip step abstraction if wo_step is True
-            if self.wo_step:
-                step_abstraction = ""
-            else:
-                step_abstraction = "Result: " + self._step_abstraction_result(
-                    before_screenshot, after_screenshot, eval_desc,
-                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
-                )
-
-            # Generate step_abstract
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            if description:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {final_code} | {step_abstraction}"
-            else:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {final_code} | {step_abstraction}"
-
-            # Calculate step execution time
-            step_time = time.time() - step_start_time
-
-            self.action_logs.append({
-                "step": step,
-                "type": "gui_action",
-                "execution_success": True,
-                "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
-                "step_time": round(step_time, 2),
-                "token_usage": self.step_token_usage
-            })
-
-            # Return execution result text for wo_step mode
-            if description:
-                return f"GUI Action: {description}\nCode: {final_code}\nStatus: Success\n{step_abstraction}"
-            else:
-                return f"GUI Action Code: {final_code}\nStatus: Success\n{step_abstraction}"
-
-        except Exception as e:
-            self.logger.error(f"GUI action execution error: {e}")
-
-            # Generate step_abstract for error
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            if description:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {code} | Result: Error - {str(e)}"
-            else:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
-
-            # Calculate step execution time
-            step_time = time.time() - step_start_time
-
-            self.action_logs.append({
-                "step": step,
-                "type": "gui_action",
-                "execution_success": False,
-                "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
-                "step_time": round(step_time, 2),
-                "token_usage": self.step_token_usage
-            })
-
-            # Return execution result text for wo_step mode
-            if description:
-                return f"GUI Action: {description}\nCode: {code}\nStatus: Failed\nError: {str(e)}"
-            else:
-                return f"GUI Action Code: {code}\nStatus: Failed\nError: {str(e)}"
-
-    def _step_abstraction_result(self, before_screenshot: bytes, after_screenshot: bytes,
+    def get_step_abstraction(self, before_screenshot: bytes, after_screenshot: bytes,
             action_description: str, wo_roi: bool = False,
             roi_margin: int = 50) -> str:
         """Abstract step by comparing before/after screenshots.
@@ -1609,14 +1229,14 @@ Based on the execution_history and current screenshot, decide the next action. A
                 }
             ]
 
-            step_abstraction = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            step_abstraction = self.call_llm(self.state_manager_model, messages, self.state_manager_usage)
             return step_abstraction.strip()
 
         except Exception as e:
             self.logger.error(f"Failed to abstract step: {e}")
             return "Step abstraction failed due to error."
 
-    def _bash_execution(self, code: str) -> str:
+    def get_bash_execution(self, code: str) -> str:
         """Execute bash commands or Python scripts (not pyautogui)."""
         self.logger.info(f"[bash_execution] {code}")
 
@@ -1650,7 +1270,7 @@ Based on the execution_history and current screenshot, decide the next action. A
                 step_abstraction = ""
             else:
                 bash_description = f"Bash command: {code}\nOutput: {logs}..."  # Truncate long output
-                step_abstraction = "Result: " + self._step_abstraction_result(
+                step_abstraction = "Result: " + self.get_step_abstraction(
                     before_screenshot, after_screenshot, bash_description,
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
@@ -1701,7 +1321,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             # Return execution result text for wo_step mode
             return f"Bash Command: {code}\nStatus: Failed\nError: {str(e)}"
 
-    def _wait(self, seconds_str: str) -> str:
+    def wait_function(self, seconds_str: str) -> str:
         """Wait for specified seconds and observe UI changes."""
         try:
             wait_seconds = float(seconds_str)
@@ -1721,7 +1341,7 @@ Based on the execution_history and current screenshot, decide the next action. A
         try:
             # Get before screenshot
             before_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_wait_before.png"
+            screenshot_file = f"step_{step}wait_function_before.png"
 
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(before_screenshot)
@@ -1731,7 +1351,7 @@ Based on the execution_history and current screenshot, decide the next action. A
 
             # Get after screenshot
             after_screenshot = self.env.controller.get_screenshot()
-            after_screenshot_file = f"step_{step}_wait_after.png"
+            after_screenshot_file = f"step_{step}wait_function_after.png"
 
             with open(os.path.join(self.operations_dir, after_screenshot_file), "wb") as f:
                 f.write(after_screenshot)
@@ -1741,7 +1361,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             if self.wo_step:
                 step_abstraction = ""
             else:
-                step_abstraction = "Result: " + self._step_abstraction_result(
+                step_abstraction = "Result: " + self.get_step_abstraction(
                     before_screenshot, after_screenshot,
                     f"Waited {wait_seconds} seconds to observe UI changes",
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
@@ -1791,7 +1411,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             return f"Wait: {wait_seconds}s\nStatus: Failed\nError: {str(e)}"
 
 
-    def _evaluate_and_save(self, task_config: dict, is_infeasible: bool = False, termination_reason: str = "") -> float:
+    def evaluate_and_save(self, task_config: dict, is_infeasible: bool = False, termination_reason: str = "") -> float:
         """Evaluate task and save results."""
         self.logger.info(f"\n{'='*80}")
         self.logger.info("Task Evaluation")
@@ -1852,18 +1472,13 @@ Based on the execution_history and current screenshot, decide the next action. A
         global_planner_completion = self.global_planner_usage["completion_tokens"]
         global_planner_images = self.global_planner_usage["image_count"]
 
-        visual_grounder_cost = self.visual_grounder_usage["cost"]
-        visual_grounder_prompt = self.visual_grounder_usage["prompt_tokens"]
-        visual_grounder_completion = self.visual_grounder_usage["completion_tokens"]
-        visual_grounder_images = self.visual_grounder_usage["image_count"]
-
         state_manager_cost = self.state_manager_usage["cost"]
         state_manager_prompt = self.state_manager_usage["prompt_tokens"]
         state_manager_completion = self.state_manager_usage["completion_tokens"]
         state_manager_images = self.state_manager_usage["image_count"]
 
-        total_cost = global_planner_cost + visual_grounder_cost + state_manager_cost
-        total_images = global_planner_images + visual_grounder_images + state_manager_images
+        total_cost = global_planner_cost + state_manager_cost
+        total_images = global_planner_images + state_manager_images
 
         # Calculate execution time
         execution_time = time.time() - self.start_time
@@ -1885,8 +1500,8 @@ Based on the execution_history and current screenshot, decide the next action. A
                 "wait_steps": wait_steps,
                 "image_count": total_images,
                 "total_cost": total_cost,
-                "prompt_tokens": global_planner_prompt + visual_grounder_prompt + state_manager_prompt,
-                "completion_tokens": global_planner_completion + visual_grounder_completion + state_manager_completion,
+                "prompt_tokens": global_planner_prompt + state_manager_prompt,
+                "completion_tokens": global_planner_completion + state_manager_completion,
                 "execution_time": execution_time,
                     "model_usage": {
                         "global_planner": {
@@ -1895,13 +1510,6 @@ Based on the execution_history and current screenshot, decide the next action. A
                             "prompt_tokens": global_planner_prompt,
                             "completion_tokens": global_planner_completion,
                             "image_count": global_planner_images
-                        },
-                        "visual_grounder": {
-                            "model_name": "autoglm-os",
-                            "cost": visual_grounder_cost,
-                            "prompt_tokens": visual_grounder_prompt,
-                            "completion_tokens": visual_grounder_completion,
-                            "image_count": visual_grounder_images
                         },
                         "state_manager": {
                             "model_name": "autoglm-os",
