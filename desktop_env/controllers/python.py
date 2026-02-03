@@ -147,7 +147,7 @@ class PythonController:
                 response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
                                          data=payload, timeout=90)
                 if response.status_code == 200:
-                    logger.info("Command executed successfully: %s", response.text)
+                    logger.debug("Command executed successfully: %s", response.text)
                     return response.json()
                 else:
                     logger.error("Failed to execute command. Status code: %d", response.status_code)

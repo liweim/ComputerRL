@@ -14,6 +14,7 @@ from utils import summary, save_args_to_settings, setup_logger
 from tqdm import tqdm
 import run_autoglm_v
 from run_autoglm_v import DesktopEnv
+from mm_agents.hisa.llm import AbstractLLM
 
 global_logger = None  # Will be initialized in run function
 
@@ -65,6 +66,9 @@ def config() -> argparse.Namespace:
     parser.add_argument("--state_manager_repetition_penalty", type=float, default=1.0,
                        help="Repetition penalty for State Manager model")
 
+    parser.add_argument("--visual_grounder_model", type=str, default="gta1-7b",
+                       help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
+
     parser.add_argument("--max_steps", type=int, default=15,
                        help="Maximum steps for Global Planner")
     parser.add_argument("--wo_pattern", action="store_true", help="Disable pattern induction (pattern induction is enabled by default)")
@@ -99,8 +103,6 @@ def config() -> argparse.Namespace:
     parser.add_argument("--qdrant_server_url", type=str, default="http://localhost:6333", help="Qdrant server URL")
 
     # docker related
-    parser.add_argument("--cleanup_docker", action="store_true", default=False, help="Cleanup docker containers before starting")
-
     # Output config
     parser.add_argument("--result_dir", type=str, default="./results/dual_agent",
                        help="Directory to save results")
@@ -291,6 +293,19 @@ def cleanup_osworld_containers(logger, remove_running=False):
     try:
         client = docker.from_env()
         containers = client.containers.list(all=True, filters={"ancestor": "happysixd/osworld-docker"})
+        if not containers:
+            # Fallback: match by image tag or name to handle custom images.
+            all_containers = client.containers.list(all=True)
+            containers = []
+            for container in all_containers:
+                try:
+                    image_tags = container.image.tags or []
+                    image_str = " ".join(image_tags).lower()
+                except Exception:
+                    image_str = ""
+                name_str = (container.name or "").lower()
+                if "osworld" in image_str or "osworld" in name_str:
+                    containers.append(container)
         if containers:
             removed_count = 0
             skipped_count = 0
@@ -347,6 +362,10 @@ def process_single_task(
         args.state_manager_max_tokens,
         args.state_manager_repetition_penalty
     )
+    if args.visual_grounder_model == args.global_planner_model:
+        visual_grounder_model = None
+    else:
+        visual_grounder_model = AbstractLLM(args.visual_grounder_model)
 
     logger.info(f"[Processing task] {domain}/{task_id}")
     
@@ -359,6 +378,7 @@ def process_single_task(
         framework = HiSA(
             env=args.env,
             global_planner_model=global_planner_model,
+            visual_grounder_model=visual_grounder_model,
             state_manager_model=state_manager_model,
             client_password=client_password,
             screen_width=args.screen_width,
@@ -442,10 +462,6 @@ def run(args, logger=None, tasks=None):
         logger: Logger instance (optional, will create if not provided)
         tasks: List of (domain, task_id) tuples (optional, will build from file if not provided)
     """
-
-    # Clean up existing osworld containers before starting (docker only, if requested)
-    if args.provider_name == "docker" and args.cleanup_docker:
-        cleanup_osworld_containers(global_logger)
 
     # Build tasks if not provided
     if tasks is None:

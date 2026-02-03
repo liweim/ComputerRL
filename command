@@ -53,13 +53,14 @@ nohup \
 python run_hisa.py \
   --provider_name docker \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_wo_pattern \
+  --result_dir ./results/hisa_gta1_7b_wo_step_refinement_pattern \
+  --visual_grounder_model gta1-7b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_one.json \
+  --test_all_meta_path ./evaluation_examples/test_small.json \
+  --wo_step \
+  --wo_refinement \
   --wo_pattern \
-  --rerun_fail \
-  --cleanup_docker \
   > nohup.out 2>&1 &
 
 # 杀进程

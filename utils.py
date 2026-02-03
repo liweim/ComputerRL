@@ -194,6 +194,9 @@ def setup_logger(result_name, log_level):
     datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
 
     logger = logging.getLogger()
+    # Remove any existing handlers (e.g., from logging.basicConfig) to avoid mixed formats.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
 
     log_level = getattr(logging, log_level.upper())
     logger.setLevel(log_level)

@@ -4,11 +4,12 @@ import json
 import os
 import logging
 import traceback
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from utils import serialize_json, get_change_roi
 from json_repair import repair_json
 from utils import postprocess_action
 import re
+import ast
 from .qdrant import QdrantManager, add_lessons_to_existing
 from .embedding import EmbeddingClient
 from PIL import Image
@@ -58,7 +59,7 @@ class PatternManager:
         mode = "server" if use_qdrant_server else "local"
         self.logger.info(f"Vector database ({mode} mode) and embedding service initialized")
 
-    def ensure_collection(self, collection_name: str):
+    def _ensure_collection(self, collection_name: str):
         """Ensure Qdrant collection exists for a domain."""
         try:
             collections = self.qdrant.list_collections()
@@ -72,7 +73,7 @@ class PatternManager:
         except Exception as e:
             self.logger.error(f"Failed to ensure collection {collection_name}: {e}")
 
-    def save_pattern(self, domain: str, lessons: List[Dict]):
+    def _save_pattern(self, domain: str, lessons: List[Dict]):
         """Save lessons using Qdrant vector database with deduplication.
 
         Args:
@@ -87,7 +88,7 @@ class PatternManager:
             - Different domains use different Qdrant collections
         """
         try:
-            self.ensure_collection(domain)
+            self._ensure_collection(domain)
 
             # Get current max ID from Qdrant
             try:
@@ -178,7 +179,7 @@ class PatternManager:
             self.logger.error(f"Failed to save pattern with vector DB: {e}")
             raise
 
-    def pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[str]:
+    def _pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[str]:
         """Use LLM to extract key lessons from task execution.
 
         Returns:
@@ -240,14 +241,14 @@ class PatternManager:
             self.logger.error(f"Failed to extract lessons: {e}")
             return []
 
-    def get_relevant_pattern(self, domain: str, current_task: str) -> str:
+    def _get_relevant_pattern(self, domain: str, current_task: str) -> str:
         """Retrieve relevant patterns using vector similarity search.
 
         Returns:
             Actionable advice string based on relevant patterns
         """
         try:
-            self.ensure_collection(domain)
+            self._ensure_collection(domain)
 
             # Check if collection has any points
             try:
@@ -367,6 +368,7 @@ class HiSA:
         self,
         env,
         global_planner_model=None,  # Function to call LLM for global planner
+        visual_grounder_model=None,  # LLM for visual grounding (e.g., gta1-7b)
         state_manager_model=None,  # Function to call LLM for state manager
         client_password: str = "password",
         screen_width: int = 1280,
@@ -392,11 +394,11 @@ class HiSA:
         with_image: bool = True,
         with_atree: bool = False,
         tool_in_sys_msg: bool = True,
-        relative_coordinate: bool = True,
         glm41v_format: bool = True,
     ):
         self.env = env
         self.global_planner_model = global_planner_model
+        self.visual_grounder_model = visual_grounder_model
         self.state_manager_model = state_manager_model
         self.client_password = client_password
         self.screen_width = screen_width
@@ -419,6 +421,11 @@ class HiSA:
         self.with_image = with_image
         self.with_atree = with_atree
         self.tool_in_sys_msg = tool_in_sys_msg
+        relative_coordinate = True
+        if self.visual_grounder_model is not None:
+            model_name = getattr(self.visual_grounder_model, "model_name", "")
+            if isinstance(model_name, str) and model_name.startswith("gta1"):
+                relative_coordinate = False
         self.relative_coordinate = relative_coordinate
         self.glm41v_format = glm41v_format
         self.grounding_agent = GroundingAgent(
@@ -441,6 +448,7 @@ class HiSA:
 
         # Initialize token usage tracking (for compatibility with existing code)
         self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
 
         # Initialize pattern manager
@@ -465,7 +473,7 @@ class HiSA:
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
 
-    def call_llm(self, func, messages, usage_tracker):
+    def _call_llm(self, func, messages, usage_tracker):
         """Call LLM function and update usage statistics."""
         if hasattr(func, 'get_last_usage'):
             # TokenTracker style function
@@ -481,17 +489,20 @@ class HiSA:
             # For simple functions, we don't have usage info, so we skip updating
         return response
 
-    def get_usage_snapshot(self) -> Dict:
+    def _get_usage_snapshot(self) -> Dict:
         """Get current token usage snapshot from all LLMs."""
-        return {
+        snapshot = {
             "global_planner": self.global_planner_usage.copy(),
             "state_manager": self.state_manager_usage.copy()
         }
+        if self.visual_grounder_model is not None:
+            snapshot["visual_grounder"] = self.visual_grounder_usage.copy()
+        return snapshot
 
-    def calculate_usage_delta(self, before: Dict, after: Dict) -> Dict:
+    def _calculate_usage_delta(self, before: Dict, after: Dict) -> Dict:
         """Calculate the difference in token usage between two snapshots."""
         delta = {}
-        for model in ["global_planner", "state_manager"]:
+        for model in before.keys():
             delta[model] = {
                 "cost": after[model]["cost"] - before[model]["cost"],
                 "prompt_tokens": after[model]["prompt_tokens"] - before[model]["prompt_tokens"],
@@ -500,7 +511,139 @@ class HiSA:
             }
         return delta
 
-    def get_context_refinement(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
+    def _get_llm_usage_dict(self, llm) -> Dict:
+        """Fetch usage stats from AbstractLLM-style clients."""
+        if llm is None or not hasattr(llm, "get_usage"):
+            return {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        cost, prompt_tokens, completion_tokens, image_count = llm.get_usage()
+        return {
+            "cost": cost,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "image_count": image_count,
+        }
+
+    def _extract_grounding_description(self, thought: str) -> str:
+        """Extract grounding target description from thought text."""
+        if not thought:
+            return ""
+        for pattern in [r"Grounding target:\s*(.*)", r"Target:\s*(.*)"]:
+            match = re.search(pattern, thought, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return thought.strip()
+
+    def _ground_coordinates(self, description: str, screenshot: bytes) -> Tuple[int, int]:
+        """Return grounded (x, y) using the visual grounder."""
+        if self.visual_grounder_model is None:
+            raise ValueError("Visual grounder model is not configured")
+
+        usage_before = self._get_llm_usage_dict(self.visual_grounder_model)
+        img = Image.open(io.BytesIO(screenshot))
+        model_name = getattr(self.visual_grounder_model, "model_name", "")
+        scale = 1.5 if isinstance(model_name, str) and model_name.startswith("gta1") else 1.0
+
+        py_cmd, reasoning = self.visual_grounder_model.call_cua(
+            description,
+            img,
+            environment="linux",
+            screen_width=self.screen_width,
+            screen_height=self.screen_height,
+            scale=scale,
+        )
+
+        usage_after = self._get_llm_usage_dict(self.visual_grounder_model)
+        usage_delta = {
+            "cost": usage_after["cost"] - usage_before["cost"],
+            "prompt_tokens": usage_after["prompt_tokens"] - usage_before["prompt_tokens"],
+            "completion_tokens": usage_after["completion_tokens"] - usage_before["completion_tokens"],
+            "image_count": usage_after["image_count"] - usage_before["image_count"],
+        }
+        self.visual_grounder_usage["cost"] += usage_delta["cost"]
+        self.visual_grounder_usage["prompt_tokens"] += usage_delta["prompt_tokens"]
+        self.visual_grounder_usage["completion_tokens"] += usage_delta["completion_tokens"]
+        self.visual_grounder_usage["image_count"] += usage_delta["image_count"]
+
+        if not py_cmd:
+            raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
+
+        if isinstance(py_cmd, tuple) and len(py_cmd) == 2:
+            return py_cmd
+
+        raise ValueError(f"Visual Grounder did not return coordinates: {py_cmd}")
+
+    def _parse_agent_call(self, code: str):
+        """Parse Agent.<method>(...) call and return (method, args, kwargs)."""
+        tree = ast.parse(code)
+        if len(tree.body) != 1:
+            raise ValueError("Expected a single Agent call")
+        node = tree.body[0]
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            raise ValueError("Expected a call expression")
+        call = node.value
+        if not isinstance(call.func, ast.Attribute):
+            raise ValueError("Expected attribute call")
+        if not isinstance(call.func.value, ast.Name) or call.func.value.id != "Agent":
+            raise ValueError("Expected Agent.<method> call")
+        method = call.func.attr
+        args = [ast.literal_eval(arg) for arg in call.args]
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        return method, args, kwargs
+
+    def _resolve_agent_call(self, code: str, description: str, screenshot: bytes):
+        """Resolve Agent.click/type calls using visual grounding and return action code."""
+        method, args, kwargs = self._parse_agent_call(code)
+        desc = description or self.current_thought or "target element"
+
+        if method == "click":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            num_clicks = kwargs.get("num_clicks", args[1] if len(args) > 1 else 1)
+            button_type = kwargs.get("button_type", args[2] if len(args) > 2 else "left")
+            return self.grounding_agent.click(coordinate, num_clicks=num_clicks, button_type=button_type)
+        if method == "type":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            text = kwargs.get("text", args[1] if len(args) > 1 else "")
+            overwrite = kwargs.get("overwrite", False)
+            enter = kwargs.get("enter", False)
+            return self.grounding_agent.type(coordinate=coordinate, text=text, overwrite=overwrite, enter=enter)
+
+        if method == "scroll":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            direction = kwargs.get("direction", args[1] if len(args) > 1 else "down")
+            return self.grounding_agent.scroll(coordinate, direction)
+
+        if method == "drag_and_drop":
+            desc_text = desc.strip()
+            start_desc = ""
+            end_desc = ""
+            if "->" in desc_text:
+                parts = desc_text.split("->", 1)
+                start_desc, end_desc = parts[0].strip(), parts[1].strip()
+            elif " to " in desc_text.lower():
+                parts = re.split(r"\s+to\s+", desc_text, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    start_desc, end_desc = parts[0].strip(), parts[1].strip()
+            elif ";" in desc_text:
+                parts = desc_text.split(";", 1)
+                start_desc, end_desc = parts[0].strip(), parts[1].strip()
+
+            if not start_desc:
+                start_desc = f"{desc_text} (drag start)"
+            if not end_desc:
+                end_desc = f"{desc_text} (drop target)"
+
+            drag_from = self._ground_coordinates(start_desc, screenshot)
+            drop_on = self._ground_coordinates(end_desc, screenshot)
+            return self.grounding_agent.drag_and_drop(drag_from, drop_on)
+
+        if method == "exit":
+            success = kwargs.get("success", args[0] if len(args) > 0 else True)
+            return self.grounding_agent.exit(success=success)
+
+        raise ValueError(f"Grounding not supported for Agent.{method}")
+
+
+    def _get_context_refinement(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
         """Summarize a segment of action logs with context refinement."""
         
         if not logs and not previous_summary:
@@ -573,7 +716,7 @@ class HiSA:
             messages = [
                 {"role": "user", "content": prompt}
             ]
-            summary_with_context_refinement = self.call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            summary_with_context_refinement = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
             return summary_with_context_refinement.strip()
         except Exception as e:
             self.logger.error(f"Failed to summarize history segment with context refinement: {e}")
@@ -596,6 +739,7 @@ class HiSA:
 
         # Reset state
         self.global_planner_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+        self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.env.reset(task_config=task_config)
         self.operation_count = 0
@@ -612,9 +756,15 @@ class HiSA:
         self.operations_dir = os.path.join(self.save_dir, "operations")
         os.makedirs(self.operations_dir, exist_ok=True)
 
-        self.logger.info("Global Planner: autoglm-os")
-        self.logger.info("Visual Grounder: autoglm-os")
-        self.logger.info("State Manager: autoglm-os")
+        global_planner_name = getattr(self.global_planner_model, "model_name", "unknown")
+        if self.visual_grounder_model is None:
+            visual_grounder_name = "autoglm-os (unified)"
+        else:
+            visual_grounder_name = getattr(self.visual_grounder_model, "model_name", "unknown")
+        state_manager_name = getattr(self.state_manager_model, "model_name", "unknown")
+        self.logger.info(f"Global Planner: {global_planner_name}")
+        self.logger.info(f"Visual Grounder: {visual_grounder_name}")
+        self.logger.info(f"State Manager: {state_manager_name}")
         self.logger.info(f"Max steps: {self.max_steps}")
         self.logger.info(f"wo_step: {self.wo_step}")
         
@@ -628,7 +778,7 @@ class HiSA:
         domain = task_config.get("domain", "general")
         past_pattern_text = ""
         if not self.wo_pattern:
-            past_pattern_text = self.pattern_manager.get_relevant_pattern(
+            past_pattern_text = self.pattern_manager._get_relevant_pattern(
                 domain, task_instruction
             )
             if past_pattern_text:
@@ -647,10 +797,10 @@ class HiSA:
                 self.logger.info(f"Step {self.operation_count + 1}/{self.max_steps}")
 
                 # Capture token usage before this step
-                usage_before_step = self.get_usage_snapshot()
+                usage_before_step = self._get_usage_snapshot()
 
                 # Get global planner decision
-                decision = self.get_decision()
+                decision = self._get_decision()
 
                 if decision is None:
                     self.logger.error("Failed to get valid decision")
@@ -662,7 +812,7 @@ class HiSA:
                     break
 
                 # Capture token usage after global planner decision
-                usage_after_global_planner = self.get_usage_snapshot()
+                usage_after_global_planner = self._get_usage_snapshot()
 
                 # Check termination or infeasible
                 if decision.get("code") == "DONE":
@@ -686,31 +836,46 @@ class HiSA:
                     continue
 
                 # Pre-calculate global planner token usage and set step_token_usage before tool execution
-                global_planner_usage = self.calculate_usage_delta(usage_before_step, usage_after_global_planner)
+                global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
 
                 # Initialize step_token_usage with global planner data (state_manager will be updated after execution)
+                visual_grounder_zero = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
                 self.step_token_usage = {
                     "global_planner": global_planner_usage["global_planner"],
+                    "visual_grounder": global_planner_usage.get("visual_grounder", visual_grounder_zero),
                     "state_manager": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
-                    "total": global_planner_usage["global_planner"].copy()
+                    "total": {
+                        "cost": global_planner_usage["global_planner"]["cost"],
+                        "prompt_tokens": global_planner_usage["global_planner"]["prompt_tokens"],
+                        "completion_tokens": global_planner_usage["global_planner"]["completion_tokens"],
+                        "image_count": global_planner_usage["global_planner"]["image_count"]
+                    }
                 }
 
                 # Execute tool and capture execution result text
-                execution_result_text = self.execute_tool(decision)
+                execution_result_text = self._execute_tool(decision)
                 
                 if execution_result_text and self.wo_step:
                     self.last_tool_output = execution_result_text
 
                 # Capture token usage after tool execution
-                usage_after_tool = self.get_usage_snapshot()
+                usage_after_tool = self._get_usage_snapshot()
 
                 # Calculate state_manager token usage and update step_token_usage
-                tool_usage = self.calculate_usage_delta(usage_after_global_planner, usage_after_tool)
-                total_step_usage = self.calculate_usage_delta(usage_before_step, usage_after_tool)
+                tool_usage = self._calculate_usage_delta(usage_after_global_planner, usage_after_tool)
+                total_step_usage = self._calculate_usage_delta(usage_before_step, usage_after_tool)
 
                 # Update token usage: combine state_manager usage from history summarization and step abstraction
+                visual_grounder_usage = global_planner_usage.get("visual_grounder", visual_grounder_zero)
+                visual_grounder_tool = tool_usage.get("visual_grounder", visual_grounder_zero)
                 self.step_token_usage = {
                     "global_planner": global_planner_usage["global_planner"],
+                    "visual_grounder": {
+                        "cost": visual_grounder_usage["cost"] + visual_grounder_tool["cost"],
+                        "prompt_tokens": visual_grounder_usage["prompt_tokens"] + visual_grounder_tool["prompt_tokens"],
+                        "completion_tokens": visual_grounder_usage["completion_tokens"] + visual_grounder_tool["completion_tokens"],
+                        "image_count": visual_grounder_usage["image_count"] + visual_grounder_tool["image_count"]
+                    },
                     "state_manager": {
                         "cost": global_planner_usage["state_manager"]["cost"] + tool_usage["state_manager"]["cost"],
                         "prompt_tokens": global_planner_usage["state_manager"]["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
@@ -718,10 +883,10 @@ class HiSA:
                         "image_count": global_planner_usage["state_manager"]["image_count"] + tool_usage["state_manager"]["image_count"]
                     },
                     "total": {
-                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["state_manager"]["cost"],
-                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"],
-                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"],
-                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["state_manager"]["image_count"]
+                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["state_manager"]["cost"] + total_step_usage.get("visual_grounder", visual_grounder_zero)["cost"],
+                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"] + total_step_usage.get("visual_grounder", visual_grounder_zero)["prompt_tokens"],
+                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"] + total_step_usage.get("visual_grounder", visual_grounder_zero)["completion_tokens"],
+                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["state_manager"]["image_count"] + total_step_usage.get("visual_grounder", visual_grounder_zero)["image_count"]
                     }
                 }
 
@@ -747,7 +912,7 @@ class HiSA:
                     self.logger.warning(f"Failed to send FAIL action: {e}")
 
             # Evaluation
-            score = self.evaluate_and_save(task_config, is_infeasible, infeasible_reason)
+            score = self._evaluate_and_save(task_config, is_infeasible, infeasible_reason)
 
         except Exception as e:
             self.logger.error(f"Execution error: {e}")
@@ -772,7 +937,7 @@ class HiSA:
         
         return score
 
-    def get_decision(self) -> Optional[Dict]:
+    def _get_decision(self) -> Optional[Dict]:
         """Get decision from global planner with retry on parsing errors."""
 
         for attempt in range(self.max_parse_retries):
@@ -802,7 +967,7 @@ class HiSA:
                         logs_to_summarize = self.action_logs[self.last_summary_step:]
                         start_step = self.action_logs[0]["step"]
                         end_step = self.action_logs[-1]["step"]
-                        summary = self.get_context_refinement(
+                        summary = self._get_context_refinement(
                             logs_to_summarize, start_step, end_step,
                             previous_summary=self.last_full_summary
                         )
@@ -811,7 +976,7 @@ class HiSA:
                         logs_to_summarize = self.action_logs
                         start_step = logs_to_summarize[0]["step"]
                         end_step = logs_to_summarize[-1]["step"]
-                        summary = self.get_context_refinement(logs_to_summarize, start_step, end_step)
+                        summary = self._get_context_refinement(logs_to_summarize, start_step, end_step)
 
                     self.last_full_summary = summary
                     self.last_summary_step = total_logs
@@ -829,18 +994,18 @@ class HiSA:
                         {"role": "user", "content": self.last_error_feedback}
                     ]
                 else:
-                    messages = self.build_messages(screenshot_b64)
+                    messages = self._build_messages(screenshot_b64)
 
                 if attempt > 0:
                     self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
 
                 # Call global planner
-                response = self.call_llm(self.global_planner_model, messages, self.global_planner_usage)
+                response = self._call_llm(self.global_planner_model, messages, self.global_planner_usage)
 
                 obs_dict = {"cur_app": cur_app}
-                decision = self.parse_response(response, obs_dict)
+                decision = self._parse_response(response, obs_dict)
 
-                self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')[:100]}")
+                self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')}")
 
                 # Clear error feedback on success
                 self.last_error_feedback = None
@@ -883,7 +1048,7 @@ class HiSA:
         
         return None
 
-    def build_messages(self, screenshot_b64: str) -> List[Dict]:
+    def _build_messages(self, screenshot_b64: str) -> List[Dict]:
         """Build messages for unified LLM approach using autoglm_v prompts."""
         # Get current app and accessibility tree for autoglm_v style observation
         cur_app = None
@@ -1038,7 +1203,7 @@ class HiSA:
         return messages
 
 
-    def parse_response(self, response: str, obs: Dict = None) -> Dict:
+    def _parse_response(self, response: str, obs: Dict = None) -> Dict:
         """Parse unified LLM response (autoglm_v style)."""
         # Extract code from response (similar to autoglm_v's parse_code_from_string)
         import re
@@ -1064,7 +1229,12 @@ class HiSA:
         thought = re.sub(pattern, '', response, flags=re.DOTALL).strip()
 
         # Handle tool method calls exactly like autoglm_v
-        if "Agent." in code or "BrowserTools." in code:
+        if "Agent." in code:
+            if code.startswith("Agent.exit") or code.startswith("Agent.wait"):
+                action = eval(code, {"Agent": self.grounding_agent, "BrowserTools": BrowserTools})
+                return {"code": action, "thought": thought}
+            action = code
+        elif "BrowserTools." in code:
             action = eval(code, {"Agent": self.grounding_agent, "BrowserTools": BrowserTools})
         else:
             # For regular code, handle like autoglm_v with tool_commands
@@ -1081,7 +1251,7 @@ class HiSA:
 
         return {"code": action, "thought": thought}
 
-    def execute_tool(self, decision: Dict) -> str:
+    def _execute_tool(self, decision: Dict) -> str:
         """Execute tool based on decision and return execution result text."""
         # In unified LLM mode, decision should contain the Python code to execute
         code = decision.get("code", "")
@@ -1092,12 +1262,10 @@ class HiSA:
         self.current_thought = decision.get("thought", "")
 
         # Execute the code directly (similar to autoglm_v approach)
-        return self.execute_code(code)
+        return self._execute_code(code)
 
-    def execute_code(self, code) -> str:
+    def _execute_code(self, code) -> str:
         """Execute unified LLM generated code (autoglm_v style)."""
-        self.logger.info(f"[unified_execution] {code}")
-
         # Record step start time
         step_start_time = time.time()
         step = self.operation_count + 1
@@ -1110,15 +1278,29 @@ class HiSA:
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(before_screenshot)
 
+            final_code = code
+            if isinstance(final_code, str) and "Agent." in final_code and self.visual_grounder_model is not None:
+                description = self._extract_grounding_description(self.current_thought)
+                try:
+                    final_code = self._resolve_agent_call(final_code, description, before_screenshot)
+                except Exception as e:
+                    self.logger.warning(f"Agent grounding failed, falling back to direct eval: {e}")
+
             # Handle different types of code (tool methods already evaluated in parse phase)
-            if isinstance(code, dict):
+            if isinstance(final_code, dict):
                 # Special action dict (like OPEN_CHROME_TAB from BrowserTools methods)
-                obs, *_ = self.env.step(code, self.sleep_after_execution)
-                final_code = str(code)  # Convert to string for logging
-            else:
-                # Execute regular pyautogui code
-                final_code = code
                 obs, *_ = self.env.step(final_code, self.sleep_after_execution)
+                final_code = str(final_code)  # Convert to string for logging
+            else:
+                # If still a tool method string, evaluate it now
+                if isinstance(final_code, str) and ("Agent." in final_code or "BrowserTools." in final_code):
+                    final_code = eval(final_code, {"Agent": self.grounding_agent, "BrowserTools": BrowserTools})
+                if isinstance(final_code, dict):
+                    obs, *_ = self.env.step(final_code, self.sleep_after_execution)
+                    final_code = str(final_code)
+                else:
+                    # Execute regular pyautogui code
+                    obs, *_ = self.env.step(final_code, self.sleep_after_execution)
 
             # Wait for action to take effect
             time.sleep(10)
@@ -1130,7 +1312,7 @@ class HiSA:
             if self.wo_step:
                 step_abstraction = ""
             else:
-                step_abstraction = "Result: " + self.get_step_abstraction(
+                step_abstraction = "Result: " + self._get_step_abstraction(
                     before_screenshot, after_screenshot, f"Executed: {final_code}",
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
@@ -1180,7 +1362,7 @@ class HiSA:
             code_str = str(code) if isinstance(code, dict) else code
             return f"Unified Execution: {code_str}\nStatus: Failed\nError: {str(e)}"
 
-    def get_step_abstraction(self, before_screenshot: bytes, after_screenshot: bytes,
+    def _get_step_abstraction(self, before_screenshot: bytes, after_screenshot: bytes,
             action_description: str, wo_roi: bool = False,
             roi_margin: int = 50) -> str:
         """Abstract step by comparing before/after screenshots.
@@ -1248,14 +1430,14 @@ class HiSA:
                 }
             ]
 
-            step_abstraction = self.call_llm(self.state_manager_model, messages, self.state_manager_usage)
+            step_abstraction = self._call_llm(self.state_manager_model, messages, self.state_manager_usage)
             return step_abstraction.strip()
 
         except Exception as e:
             self.logger.error(f"Failed to abstract step: {e}")
             return "Step abstraction failed due to error."
 
-    def get_bash_execution(self, code: str) -> str:
+    def _get_bash_execution(self, code: str) -> str:
         """Execute bash commands or Python scripts (not pyautogui)."""
         self.logger.info(f"[bash_execution] {code}")
 
@@ -1289,7 +1471,7 @@ class HiSA:
                 step_abstraction = ""
             else:
                 bash_description = f"Bash command: {code}\nOutput: {logs}..."  # Truncate long output
-                step_abstraction = "Result: " + self.get_step_abstraction(
+                step_abstraction = "Result: " + self._get_step_abstraction(
                     before_screenshot, after_screenshot, bash_description,
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
@@ -1340,7 +1522,7 @@ class HiSA:
             # Return execution result text for wo_step mode
             return f"Bash Command: {code}\nStatus: Failed\nError: {str(e)}"
 
-    def wait_function(self, seconds_str: str) -> str:
+    def _wait_function(self, seconds_str: str) -> str:
         """Wait for specified seconds and observe UI changes."""
         try:
             wait_seconds = float(seconds_str)
@@ -1380,7 +1562,7 @@ class HiSA:
             if self.wo_step:
                 step_abstraction = ""
             else:
-                step_abstraction = "Result: " + self.get_step_abstraction(
+                step_abstraction = "Result: " + self._get_step_abstraction(
                     before_screenshot, after_screenshot,
                     f"Waited {wait_seconds} seconds to observe UI changes",
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
@@ -1430,7 +1612,7 @@ class HiSA:
             return f"Wait: {wait_seconds}s\nStatus: Failed\nError: {str(e)}"
 
 
-    def evaluate_and_save(self, task_config: dict, is_infeasible: bool = False, termination_reason: str = "") -> float:
+    def _evaluate_and_save(self, task_config: dict, is_infeasible: bool = False, termination_reason: str = "") -> float:
         """Evaluate task and save results."""
         self.logger.info(f"\n{'='*80}")
         self.logger.info("Task Evaluation")
@@ -1443,13 +1625,13 @@ class HiSA:
 
         if not self.wo_pattern:
             self.logger.info("Inducing pattern...")
-            key_lessons = self.pattern_manager.pattern_induction(
+            key_lessons = self.pattern_manager._pattern_induction(
                 task_instruction=task_instruction,
                 action_logs=self.action_logs
             )
 
             if key_lessons:
-                self.pattern_manager.save_pattern(domain, key_lessons)
+                self.pattern_manager._save_pattern(domain, key_lessons)
                 # Format lessons as numbered list for logging
                 formatted_lessons = "\n".join(f"  {i+1}. [{lesson['type']}] {lesson['lesson']}" for i, lesson in enumerate(key_lessons))
                 self.logger.info(f"Saved {len(key_lessons)} lesson(s):\n{formatted_lessons}")
@@ -1491,13 +1673,18 @@ class HiSA:
         global_planner_completion = self.global_planner_usage["completion_tokens"]
         global_planner_images = self.global_planner_usage["image_count"]
 
+        visual_grounder_cost = self.visual_grounder_usage["cost"]
+        visual_grounder_prompt = self.visual_grounder_usage["prompt_tokens"]
+        visual_grounder_completion = self.visual_grounder_usage["completion_tokens"]
+        visual_grounder_images = self.visual_grounder_usage["image_count"]
+
         state_manager_cost = self.state_manager_usage["cost"]
         state_manager_prompt = self.state_manager_usage["prompt_tokens"]
         state_manager_completion = self.state_manager_usage["completion_tokens"]
         state_manager_images = self.state_manager_usage["image_count"]
 
-        total_cost = global_planner_cost + state_manager_cost
-        total_images = global_planner_images + state_manager_images
+        total_cost = global_planner_cost + visual_grounder_cost + state_manager_cost
+        total_images = global_planner_images + visual_grounder_images + state_manager_images
 
         # Calculate execution time
         execution_time = time.time() - self.start_time
@@ -1519,25 +1706,32 @@ class HiSA:
                 "wait_steps": wait_steps,
                 "image_count": total_images,
                 "total_cost": total_cost,
-                "prompt_tokens": global_planner_prompt + state_manager_prompt,
-                "completion_tokens": global_planner_completion + state_manager_completion,
+                "prompt_tokens": global_planner_prompt + visual_grounder_prompt + state_manager_prompt,
+                "completion_tokens": global_planner_completion + visual_grounder_completion + state_manager_completion,
                 "execution_time": execution_time,
-                    "model_usage": {
-                        "global_planner": {
-                            "model_name": "autoglm-os",
-                            "cost": global_planner_cost,
-                            "prompt_tokens": global_planner_prompt,
-                            "completion_tokens": global_planner_completion,
-                            "image_count": global_planner_images
-                        },
-                        "state_manager": {
-                            "model_name": "autoglm-os",
-                            "cost": state_manager_cost,
-                            "prompt_tokens": state_manager_prompt,
-                            "completion_tokens": state_manager_completion,
-                            "image_count": state_manager_images
-                        }
+                "model_usage": {
+                    "global_planner": {
+                        "model_name": getattr(self.global_planner_model, "model_name", "unknown"),
+                        "cost": global_planner_cost,
+                        "prompt_tokens": global_planner_prompt,
+                        "completion_tokens": global_planner_completion,
+                        "image_count": global_planner_images
+                    },
+                    "visual_grounder": {
+                        "model_name": getattr(self.visual_grounder_model, "model_name", "none"),
+                        "cost": visual_grounder_cost,
+                        "prompt_tokens": visual_grounder_prompt,
+                        "completion_tokens": visual_grounder_completion,
+                        "image_count": visual_grounder_images
+                    },
+                    "state_manager": {
+                        "model_name": getattr(self.state_manager_model, "model_name", "unknown"),
+                        "cost": state_manager_cost,
+                        "prompt_tokens": state_manager_prompt,
+                        "completion_tokens": state_manager_completion,
+                        "image_count": state_manager_images
                     }
+                }
             },
             "task_config": task_config,
             "action_logs": self.action_logs,

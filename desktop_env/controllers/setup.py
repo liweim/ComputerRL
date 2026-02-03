@@ -269,7 +269,7 @@ class SetupController:
         try:
             response = requests.post(self.http_server + "/setup" + "/change_wallpaper", headers=headers, data=payload)
             if response.status_code == 200:
-                logger.info("Command executed successfully: %s", response.text)
+                logger.debug("Command executed successfully: %s", response.text)
             else:
                 logger.error("Failed to change wallpaper. Status code: %s", response.text)
         except requests.exceptions.RequestException as e:
@@ -293,7 +293,7 @@ class SetupController:
             # We set a timeout that is slightly longer than the server's timeout (1800s).
             response = requests.post(self.http_server + "/setup" + "/open_file", headers=headers, data=payload, timeout=1810)
             response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
-            logger.info("Command executed successfully: %s", response.text)
+            logger.debug("Command executed successfully: %s", response.text)
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}")
             raise Exception(f"Failed to open file '{path}'. An error occurred while trying to send the request or the server responded with an error: {e}") from e
@@ -316,7 +316,7 @@ class SetupController:
             logger.info("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/launch")
             response = requests.post(self.http_server + "/setup" + "/launch", headers=headers, data=payload)
             if response.status_code == 200:
-                logger.info("Command executed successfully: %s", response.text)
+                logger.debug("Command executed successfully: %s", response.text)
             else:
                 logger.error("Failed to launch application. Status code: %s", response.text)
         except requests.exceptions.RequestException as e:
@@ -376,7 +376,7 @@ class SetupController:
                     if stderr:
                         with open(os.path.join(self.cache_dir, stderr), "w") as f:
                             f.write(results["error"])
-                    logger.info("Command executed successfully: %s -> %s"
+                    logger.debug("Command executed successfully: %s -> %s"
                                 , " ".join(command) if isinstance(command, list) else command
                                 , response.text
                                 )
@@ -484,7 +484,7 @@ class SetupController:
         try:
             response = requests.post(self.http_server + "/setup" + "/activate_window", headers=headers, data=payload)
             if response.status_code == 200:
-                logger.info("Command executed successfully: %s", response.text)
+                logger.debug("Command executed successfully: %s", response.text)
             else:
                 logger.error(f"Failed to activate window {window_name}. Status code: %s", response.text)
         except requests.exceptions.RequestException as e:
@@ -503,7 +503,7 @@ class SetupController:
         try:
             response = requests.post(self.http_server + "/setup" + "/close_window", headers=headers, data=payload)
             if response.status_code == 200:
-                logger.info("Command executed successfully: %s", response.text)
+                logger.debug("Command executed successfully: %s", response.text)
             else:
                 logger.error(f"Failed to close window {window_name}. Status code: %s", response.text)
         except requests.exceptions.RequestException as e:
@@ -909,7 +909,7 @@ class SetupController:
             logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
             response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form)
             if response.status_code == 200:
-                logger.info("Command executed successfully: %s", response.text)
+                logger.debug("Command executed successfully: %s", response.text)
             else:
                 logger.error("Failed to upload file. Status code: %s", response.text)
         except requests.exceptions.RequestException as e:

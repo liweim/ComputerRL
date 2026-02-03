@@ -9,7 +9,10 @@ import base64
 import io
 from dataclasses import dataclass
 from typing import Any, Tuple, Optional, List, Dict
-from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
+try:
+    from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
+except:
+    pass
 from openai import OpenAI
 import logging
 import sys

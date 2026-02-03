@@ -233,6 +233,16 @@ class GroundingAgent:
         """
         return "WAIT"
 
+    @agent_action
+    def exit(self, success: bool):
+        """
+        End the current task.
+
+        Args:
+            success (bool): True if successfully finish a task, otherwise set it False
+        """
+        return "DONE" if success else "FAIL"
+
 logger = logging.getLogger("desktopenv.agent")
 
 
@@ -272,4 +282,3 @@ launch_app_commands = {
     # Email
     "thunderbird": "thunderbird",
 }
-
