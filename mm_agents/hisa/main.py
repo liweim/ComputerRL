@@ -17,11 +17,11 @@ import time
 import glob
 from PIL import Image
 from io import BytesIO
-from .prompts import GLOBAL_PLANNER_PROMPT, CONTEXT_REFINEMENT_PROMPT, FIX_RESPONSE_PROMPT, FIX_RESPONSE_UNIFY_PROMPT, STEP_ABSTRACTION_PROMPT, PATTERN_INDUCTION_PROMPT, PATTERN_SYNTHESIS_PROMPT
+from .prompt.hisa_prompt import GLOBAL_PLANNER_PROMPT, CONTEXT_REFINEMENT_PROMPT, FIX_RESPONSE_PROMPT, FIX_RESPONSE_UNIFY_PROMPT, STEP_ABSTRACTION_PROMPT, PATTERN_INDUCTION_PROMPT, PATTERN_SYNTHESIS_PROMPT
 from .prompt.procedural_memory import Prompt as AutoGLMPrompt
-from ..autoglm_v.prompt.grounding_agent import GroundingAgent as AutoGLMAgent
-from ..autoglm_v.prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
-from ..autoglm_v.tools.package.google_chrome import BrowserTools
+from .prompt.grounding_agent import GroundingAgent
+from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
+from .tools.package.google_chrome import BrowserTools
 
 # ==================== PATTERN MANAGER ====================
 
@@ -369,8 +369,8 @@ class HiSA:
         global_planner_model=None,  # Function to call LLM for global planner
         state_manager_model=None,  # Function to call LLM for state manager
         client_password: str = "password",
-        screen_width: int = 1920,
-        screen_height: int = 1080,
+        screen_width: int = 1280,
+        screen_height: int = 720,
         image_width: int = 1280,
         image_height: int = 720,
         sleep_after_execution: float = 0.5,
@@ -421,6 +421,11 @@ class HiSA:
         self.tool_in_sys_msg = tool_in_sys_msg
         self.relative_coordinate = relative_coordinate
         self.glm41v_format = glm41v_format
+        self.grounding_agent = GroundingAgent(
+            screen_width=self.screen_width,
+            screen_height=self.screen_height,
+            relative_coordinate=self.relative_coordinate,
+        )
 
         # Tool list for unified LLM (same as autoglm_v)
         self.tool_list = {
@@ -947,9 +952,10 @@ class HiSA:
             tool_name = None
 
         setup_prompt, func_def_prompt, note_prompt = AutoGLMPrompt.construct_procedural_memory(
-            AutoGLMAgent, app_name=tool_name, client_password=self.client_password,
-            with_image=self.with_image, with_atree=self.with_atree, 
-            relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format
+            GroundingAgent, app_name=tool_name, client_password=self.client_password,
+            with_image=self.with_image, with_atree=self.with_atree,
+            relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format,
+            screen_width=self.screen_width, screen_height=self.screen_height,
         )
 
         if self.tool_in_sys_msg:
@@ -1031,6 +1037,7 @@ class HiSA:
 
         return messages
 
+
     def parse_response(self, response: str, obs: Dict = None) -> Dict:
         """Parse unified LLM response (autoglm_v style)."""
         # Extract code from response (similar to autoglm_v's parse_code_from_string)
@@ -1058,14 +1065,14 @@ class HiSA:
 
         # Handle tool method calls exactly like autoglm_v
         if "Agent." in code or "BrowserTools." in code:
-            action = eval(code, {"Agent": AutoGLMAgent, "BrowserTools": BrowserTools})
+            action = eval(code, {"Agent": self.grounding_agent, "BrowserTools": BrowserTools})
         else:
             # For regular code, handle like autoglm_v with tool_commands
             cur_app = obs.get("cur_app") if obs else None
             if cur_app:
                 tool_name = cur_app.strip().lower().replace("-", "_")
                 if tool_name in self.tool_list:
-                    actions = AutoGLMAgent.tool_commands(code, tool_name)
+                    actions = self.grounding_agent.tool_commands(code, tool_name)
                     action = actions[0]
                 else:
                     action = code

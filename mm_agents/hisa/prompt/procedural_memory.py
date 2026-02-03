@@ -7,7 +7,7 @@ current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 
 
 def generate_func(json_data):
-    # 收集所有类名和它们的函数
+    # Collect all class names and their functions
     class_funcs = {}
     no_class_funcs = []
     cls_name = ""
@@ -27,7 +27,7 @@ def generate_func(json_data):
 
     code = ""
 
-    # 生成有类的函数
+    # Generate functions grouped by class
     for class_name, funcs in class_funcs.items():
         code += f"class {class_name}:\n"
         cls_name = class_name
@@ -38,30 +38,30 @@ def generate_func(json_data):
             params = func["parameters"]["properties"]
             required = func["parameters"].get("required", [])
 
-            # 构建参数列表
+            # Build the parameter list
             param_list = ["cls"]
-            # 首先添加必需参数
+            # Add required parameters first
             for param_name in required:
                 param_list.append(f"{param_name}")
-            # 然后添加可选参数
+            # Then add optional parameters
             for param_name in params:
                 if param_name not in required:
-                    param_list.append(f"{param_name}")  # 可选参数默认值设为None
+                    param_list.append(f"{param_name}")  # Optional parameters default to None
 
-            # 构建函数定义
+            # Build the function definition
             func_def = f"    def {func_name}({', '.join(param_list)}):\n"
 
-            # 构建文档字符串
+            # Build the docstring
             docstring = f'        """\n        {description}\n\n        Args:\n'
-            if len(param_list) == 1:  # 只有cls参数
+            if len(param_list) == 1:  # Only cls parameter
                 docstring += "            None\n"
             else:
-                # 首先记录必需参数
+                # Document required parameters first
                 for param_name in required:
                     param_type = params[param_name]["type"]
                     param_desc = params[param_name].get("description", "")
                     docstring += f"            {param_name} ({param_type}): {param_desc}\n"
-                # 然后记录可选参数
+                # Then document optional parameters
                 for param_name in params:
                     if param_name not in required:
                         param_type = params[param_name]["type"]
@@ -74,7 +74,7 @@ def generate_func(json_data):
 
         code += "\n"
 
-    # 生成没有类的函数
+    # Generate functions without a class
     for item in no_class_funcs:
         func = item["function"]
         func_name = func["name"]
@@ -82,30 +82,30 @@ def generate_func(json_data):
         params = func["parameters"]["properties"]
         required = func["parameters"].get("required", [])
 
-        # 构建参数列表
+        # Build the parameter list
         param_list = []
-        # 首先添加必需参数
+        # Add required parameters first
         for param_name in required:
             param_list.append(f"{param_name}")
-        # 然后添加可选参数
+        # Then add optional parameters
         for param_name in params:
             if param_name not in required:
                 param_list.append(f"{param_name}")
 
-        # 构建函数定义
+        # Build the function definition
         func_def = f"def {func_name}({', '.join(param_list)}):\n"
 
-        # 构建文档字符串
+        # Build the docstring
         docstring = f'    """\n    {description}\n\n    Args:\n'
         if not param_list:
             docstring += "        None\n"
         else:
-            # 首先记录必需参数
+            # Document required parameters first
             for param_name in required:
                 param_type = params[param_name]["type"]
                 param_desc = params[param_name].get("description", "")
                 docstring += f"        {param_name} ({param_type}): {param_desc}\n"
-            # 然后记录可选参数
+            # Then document optional parameters
             for param_name in params:
                 if param_name not in required:
                     param_type = params[param_name]["type"]
@@ -141,7 +141,7 @@ note_prompt = """* Note:
 
 class Prompt:
     @staticmethod
-    def construct_procedural_memory(agent_class, app_name=None, client_password="password", with_image=True, with_atree=False, relative_coordinate=True, glm41v_format=True):
+    def construct_procedural_memory(agent_class, app_name=None, client_password="password", with_image=True, with_atree=False, relative_coordinate=True, glm41v_format=True, screen_width=1280, screen_height=720):
         agent_class_content = "Class Agent:"
         for attr_name in dir(agent_class):
             attr = getattr(agent_class, attr_name)
@@ -182,7 +182,9 @@ class Prompt:
         note_prompt_formatted = note_prompt.format(
             relative_coordinate_hint="- The coordinate [x, y] should be normalized to 0-1000, which usually should be the center of a specific target element.\n" if relative_coordinate else "",
             client_password=client_password,
-            format_hint="<think>\n{**YOUR-PLAN-AND-THINKING**}</think>\n<answer>```python\n{**ONE-LINE-OF-CODE**}\n```</answer>" if glm41v_format else "<think>\n{**YOUR-PLAN-AND-THINKING**}\n</think>\n```python\n{**ONE-LINE-OF-CODE**}\n```"
+            format_hint="<think>\n{**YOUR-PLAN-AND-THINKING**}</think>\n<answer>```python\n{**ONE-LINE-OF-CODE**}\n```</answer>" if glm41v_format else "<think>\n{**YOUR-PLAN-AND-THINKING**}\n</think>\n```python\n{**ONE-LINE-OF-CODE**}\n```",
+            screen_width=screen_width,
+            screen_height=screen_height,
         )
 
         return setup_prompt_formatted, func_def_prompt, note_prompt_formatted

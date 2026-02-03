@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 from mm_agents.hisa.main import HiSA
 import traceback
 import docker
+import textwrap
 from utils import summary, save_args_to_settings, setup_logger
 from tqdm import tqdm
 import run_autoglm_v
@@ -30,8 +31,9 @@ def config() -> argparse.Namespace:
         help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
     )
     parser.add_argument("--snapshot_name", type=str, default="init_state")
-    parser.add_argument("--screen_width", type=int, default=1920)
-    parser.add_argument("--screen_height", type=int, default=1080)
+    # NOTE: Docker provider ignores screen_size; effective resolution remains the container's default.
+    parser.add_argument("--screen_width", type=int, default=1280) #1920
+    parser.add_argument("--screen_height", type=int, default=720) #1080
     parser.add_argument("--image_width", type=int, default=1280)
     parser.add_argument("--image_height", type=int, default=720)
     parser.add_argument("--sleep_after_execution", type=float, default=0.5)
@@ -121,7 +123,63 @@ def config() -> argparse.Namespace:
         os_type="Ubuntu",
         require_a11y_tree=False
     )
+    _ensure_vm_resolution(args.env, args.screen_width, args.screen_height, global_logger)
     return args
+
+
+def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
+    script = textwrap.dedent(f"""
+        import os
+        import shlex
+        import subprocess
+
+        os.environ["DISPLAY"] = ":0"
+        output = subprocess.check_output(
+            "xrandr --query | awk '/ connected/{{print $1; exit}}'",
+            shell=True,
+            text=True
+        ).strip()
+        if not output:
+            raise RuntimeError("No connected display output found")
+
+        mode = "{width}x{height}"
+        modes = subprocess.check_output("xrandr | awk '{{print $1}}'", shell=True, text=True).split()
+        if mode in modes:
+            subprocess.check_call(["xrandr", "--output", output, "--mode", mode])
+        else:
+            if subprocess.call("command -v cvt >/dev/null 2>&1", shell=True) != 0:
+                raise RuntimeError("cvt not found; install x11-xserver-utils in the VM")
+            cvt_out = subprocess.check_output(
+                "cvt {width} {height}",
+                shell=True,
+                text=True
+            ).splitlines()
+            if len(cvt_out) < 2:
+                raise RuntimeError("cvt output is invalid")
+            # Example: Modeline "1280x720_60.00" 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync
+            parts = cvt_out[1].split()
+            if len(parts) < 3 or parts[0] != "Modeline":
+                raise RuntimeError("Unexpected cvt output: " + cvt_out[1])
+            name = parts[1].strip('"')
+            params = parts[2:]
+            subprocess.call(["xrandr", "--newmode", name, *params])
+            subprocess.call(["xrandr", "--addmode", output, name])
+            subprocess.check_call(["xrandr", "--output", output, "--mode", name])
+    """).strip()
+
+    try:
+        result = env.controller.run_python_script(script)
+    except Exception as exc:
+        raise SystemExit(f"Failed to set VM resolution: {exc}")
+
+    if result and result.get("status") == "error":
+        raise SystemExit(f"Failed to set VM resolution: {result.get('error')}")
+
+    size = env.controller.get_vm_screen_size() or {}
+    if size.get("width") != width or size.get("height") != height:
+        raise SystemExit(
+            f"VM resolution mismatch: got {size.get('width')}x{size.get('height')}, expected {width}x{height}"
+        )
 
 
 def create_llm_function(model_name: str, temperature: float = 0.1, top_p: float = 0.9, max_tokens: int = 2048, repetition_penalty: float = 1.0):
@@ -303,6 +361,8 @@ def process_single_task(
             global_planner_model=global_planner_model,
             state_manager_model=state_manager_model,
             client_password=client_password,
+            screen_width=args.screen_width,
+            screen_height=args.screen_height,
             sleep_after_execution=sleep_after_execution,
             max_steps=max_steps,
             save_dir=save_dir,

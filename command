@@ -19,6 +19,11 @@ python -m sglang.launch_server \
 conda activate uitars
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name autoglm-os --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
 
+# 启动UI-TARS
+conda activate uitars
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 > uitars.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1234 > gta1.log 2>&1 &
+
 # 下载docker镜像
 git lfs install
 git clone https://huggingface.co/datasets/xlangai/ubuntu_osworld

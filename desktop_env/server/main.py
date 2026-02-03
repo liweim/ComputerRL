@@ -72,6 +72,10 @@ logger = app.logger
 recording_process = None  # fixme: this is a temporary solution for recording, need to be changed to support multiple-process
 recording_path = "/tmp/recording.mp4"
 
+def _append_event(*_args, **_kwargs):
+    # No-op placeholder to avoid NameError when trajectory logging is enabled.
+    return None
+
 
 @app.route('/setup/execute', methods=['POST'])
 @app.route('/execute', methods=['POST'])
