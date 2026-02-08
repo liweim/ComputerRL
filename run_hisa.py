@@ -332,6 +332,40 @@ def cleanup_osworld_containers(logger, remove_running=False):
     except Exception as e:
         logger.warning(f"Warning: Failed to cleanup containers: {e}")
 
+def filter_tasks(args, test_all_meta: dict, logger) -> List[tuple]:
+    """
+    Filter tasks based on rerun/rerun_fail flags.
+    
+    Returns:
+        List of (domain, example_id) tuples to execute
+    """
+    tasks_to_run = []
+    
+    for domain in test_all_meta:
+        for example_id in test_all_meta[domain]:
+            target_dir = os.path.join(args.result_dir, domain, example_id)
+            execution_log_path = os.path.join(target_dir, 'execution_log.json')
+            result_path = os.path.join(target_dir, 'result.txt')
+            err_reason_path = os.path.join(target_dir, 'err_reason.txt')
+            if not os.path.exists(execution_log_path):
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+            
+            should_skip = False
+            if not args.rerun and os.path.exists(result_path) and not os.path.exists(err_reason_path):
+                try:
+                    result = float(open(result_path, 'r').read().strip())
+                    # Skip successful tasks, or failed tasks if not rerun_fail
+                    if result > 0.0 or not args.rerun_fail:
+                        should_skip = True
+                except (ValueError, IOError) as e:
+                    logger.warning(f"Failed to read result for {domain}/{example_id}: {e}")
+            
+            if not should_skip:
+                tasks_to_run.append((domain, example_id))
+    
+    return tasks_to_run
+
 def process_single_task(
     domain: str,
     task_id: str,
@@ -471,10 +505,7 @@ def run(args, logger=None, tasks=None):
         if args.domain != "all":
             test_all_meta = {args.domain: test_all_meta[args.domain]}
         
-        tasks = []
-        for domain in test_all_meta:
-            for task_id in test_all_meta[domain]:
-                tasks.append((domain, task_id))
+        tasks = filter_tasks(args, test_all_meta, global_logger)
     
     if not args.get_score:
         # Use global logger for task processing

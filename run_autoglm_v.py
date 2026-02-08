@@ -5,62 +5,19 @@ Utils and basic architecture credit to https://github.com/web-arena-x/webarena/b
 import argparse
 import datetime
 import json
-import logging
 import os
-import sys
 import math
 import ast
 import time
-import backoff
-import httpx
 import requests
-from requests.exceptions import SSLError
 from tqdm import tqdm
 import shutil
-
 import lib_run_single
-import docker
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
 from typing import Optional, Dict, Any
 from utils import summary, setup_logger
 
-
-def cleanup_osworld_containers(remove_running=False):
-    """Clean up osworld docker containers before starting.
-    
-    Args:
-        remove_running: If True, also stop and remove running containers.
-                       If False (default), only remove exited containers.
-    """
-    try:
-        client = docker.from_env()
-        containers = client.containers.list(all=True, filters={"ancestor": "happysixd/osworld-docker"})
-        if containers:
-            removed_count = 0
-            skipped_count = 0
-            for container in containers:
-                try:
-                    if container.status == "running":
-                        if remove_running:
-                            container.stop(timeout=5)
-                            container.remove(force=True)
-                            print(f"  Stopped and removed running container: {container.name}")
-                            removed_count += 1
-                        else:
-                            skipped_count += 1
-                    else:
-                        # Remove exited/stopped containers
-                        container.remove(force=True)
-                        print(f"  Removed exited container: {container.name}")
-                        removed_count += 1
-                except Exception as e:
-                    print(f"  Failed to remove container {container.name}: {e}")
-            print(f"Cleanup completed. Removed: {removed_count}, Skipped (running): {skipped_count}")
-        else:
-            print("No existing osworld containers found.")
-    except Exception as e:
-        print(f"Warning: Failed to cleanup containers: {e}")
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
 logger = None  # Will be initialized in main
@@ -122,9 +79,6 @@ def config() -> argparse.Namespace:
     # rerun related
     parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
     parser.add_argument("--rerun_fail", action="store_true", help="Rerun only failed tasks (score == 0)")
-    
-    # docker related
-    parser.add_argument("--cleanup_docker", action="store_true", default=False, help="Cleanup docker containers before starting")
     
     args = parser.parse_args()
 
@@ -567,103 +521,47 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         logger.info("No tasks completed")
 
 
-def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False):
-    """Get unfinished tasks."""
+def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, logger=None):
+    """Get unfinished tasks (aligned with run_hisa.filter_tasks logic)."""
 
     if not os.path.exists(target_dir):
         return total_file_json
 
-    # If rerun is True, return all tasks (ignore existing results)
-    if rerun:
-        # Clear all existing results
-        for domain in os.listdir(target_dir):
-            domain_path = os.path.join(target_dir, domain)
-            if os.path.isdir(domain_path):
-                for example_id in os.listdir(domain_path):
-                    if example_id == "onboard":
-                        continue
-                    example_path = os.path.join(domain_path, example_id)
-                    if os.path.isdir(example_path):
-                        # Remove all files in the example directory
-                        shutil.rmtree(example_path)
-                        os.makedirs(example_path, exist_ok=True)
-        return total_file_json
+    tasks_to_run = {}
+    for domain in total_file_json:
+        tasks_to_run[domain] = []
+        for example_id in total_file_json[domain]:
+            example_dir = os.path.join(target_dir, domain, example_id)
+            execution_log_path = os.path.join(example_dir, "execution_log.json")
+            result_path = os.path.join(example_dir, "result.txt")
+            err_reason_path = os.path.join(example_dir, "err_reason.txt")
 
-    # If rerun_fail is True, only rerun failed tasks specified in total_file_json
-    if rerun_fail:
-        tasks_to_rerun = {}
-        for domain in total_file_json:
-            tasks_to_rerun[domain] = []
-            if domain not in os.listdir(target_dir):
-                # Domain doesn't exist, run all tasks in it
-                tasks_to_rerun[domain] = total_file_json[domain]
-                continue
-            domain_path = os.path.join(target_dir, domain)
-            if not os.path.isdir(domain_path):
-                # Domain directory doesn't exist, run all tasks in it
-                tasks_to_rerun[domain] = total_file_json[domain]
-                continue
-            for example_id in total_file_json[domain]:
-                example_path = os.path.join(domain_path, example_id)
-                if not os.path.isdir(example_path):
-                    # Task directory doesn't exist, need to run
-                    tasks_to_rerun[domain].append(example_id)
-                elif "result.txt" not in os.listdir(example_path) or 'execution_log.json' not in os.listdir(example_path):
-                    # Incomplete task, need to rerun
-                    tasks_to_rerun[domain].append(example_id)
-                else:
-                    try:
-                        result_file = os.path.join(example_path, "result.txt")
-                        with open(result_file, "r") as f:
-                            score = float(f.read().strip())
-                        if score == 0.0:
-                            # Failed task, need to rerun
-                            tasks_to_rerun[domain].append(example_id)
-                        # If score > 0, skip (don't add to tasks_to_rerun)
-                    except Exception as e:
-                        raise RuntimeError(f"Error reading {result_file}: {e}")
+            if not os.path.exists(execution_log_path) and os.path.exists(result_path):
+                os.remove(result_path)
 
-        # Remove empty domains
-        tasks_to_rerun = {k: v for k, v in tasks_to_rerun.items() if v}
-
-        return tasks_to_rerun
-
-    # Normal case: check all existing directories and find unfinished tasks
-    finished = {}
-    for domain in os.listdir(target_dir):
-        finished[domain] = []
-        domain_path = os.path.join(target_dir, domain)
-        if os.path.isdir(domain_path):
-            for example_id in os.listdir(domain_path):
-                if example_id == "onboard":
-                    continue
-                example_path = os.path.join(domain_path, example_id)
-                if os.path.isdir(example_path):
-                    if "result.txt" not in os.listdir(example_path) or 'execution_log.json' not in os.listdir(example_path):
-                        # Task incomplete (no result.txt), clear and re-run
-                        print(f"[Cleanup] Removing incomplete task directory: {example_path}")
-                        shutil.rmtree(example_path)
-                        os.makedirs(example_path, exist_ok=True)
+            should_skip = False
+            if not rerun and os.path.exists(result_path) and not os.path.exists(err_reason_path):
+                try:
+                    with open(result_path, "r") as f:
+                        result = float(f.read().strip())
+                    if result > 0.0 or not rerun_fail:
+                        should_skip = True
+                except (ValueError, IOError) as e:
+                    if logger is not None:
+                        logger.warning(f"Failed to read result for {domain}/{example_id}: {e}")
                     else:
-                        finished[domain].append(example_id)
+                        print(f"[Warning] Failed to read result for {domain}/{example_id}: {e}")
 
-    if not finished:
-        return total_file_json
+            if not should_skip:
+                tasks_to_run[domain].append(example_id)
 
-    for domain, examples in finished.items():
-        if domain in total_file_json:
-            total_file_json[domain] = [x for x in total_file_json[domain] if x not in examples]
-
-    return total_file_json
+    tasks_to_run = {k: v for k, v in tasks_to_run.items() if v}
+    return tasks_to_run
 
 if __name__ == "__main__":
     ####### The complete version of the list of examples #######
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = config()
-    
-    # Clean up existing osworld containers before starting (docker only, if requested)
-    if args.provider_name == "docker" and args.cleanup_docker:
-        cleanup_osworld_containers()
     
     # Initialize logger after args are parsed
     result_name = os.path.basename(args.result_dir)
@@ -696,7 +594,9 @@ if __name__ == "__main__":
         test_all_meta,
         rerun=args.rerun,
         rerun_fail=args.rerun_fail,
+        logger=logger,
     )
+    summary(args.result_dir, test_all_meta)
     left_info = ""
     for domain in test_file_list:
         left_info += f"{domain}: {len(test_file_list[domain])}\n"

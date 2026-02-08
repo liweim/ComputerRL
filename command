@@ -17,6 +17,7 @@ python -m sglang.launch_server \
   --attention-backend triton
 
 conda activate uitars
+export CUDA_VISIBLE_DEVICES=0
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name autoglm-os --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
 
 # 启动UI-TARS
@@ -45,9 +46,19 @@ python run_autoglm_v.py \
     --result_dir results/autoglm-os_baseline \
     --headless \
     --max_steps 100 \
+    --test_all_meta_path ./evaluation_examples/test_all.json \
+    > nohup3.out 2>&1 &
+
+nohup \
+python run_autoglm_v_branch.py \
+    --provider_name docker \
+    --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+    --result_dir results/autoglm-os_branch \
+    --headless \
+    --max_steps 100 \
     --test_all_meta_path ./evaluation_examples/test_one.json \
-    --cleanup_docker \
-    > nohup2.out 2>&1 &
+    --rerun_fail \
+    > nohup3.out 2>&1 &
 
 nohup \
 python run_hisa.py \

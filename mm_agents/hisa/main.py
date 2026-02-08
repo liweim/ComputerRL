@@ -742,6 +742,11 @@ class HiSA:
         self.visual_grounder_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.state_manager_usage = {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
         self.env.reset(task_config=task_config)
+        try:
+            from run_hisa import _ensure_vm_resolution
+            _ensure_vm_resolution(self.env, self.screen_width, self.screen_height, self.logger)
+        except Exception as e:
+            self.logger.warning(f"Failed to reset VM resolution: {e}")
         self.operation_count = 0
         self.action_logs = []
         self.last_full_summary = None
@@ -937,7 +942,7 @@ class HiSA:
         
         return score
 
-    def _get_decision(self) -> Optional[Dict]:
+    def error_feedback(self) -> Optional[Dict]:
         """Get decision from global planner with retry on parsing errors."""
 
         for attempt in range(self.max_parse_retries):
