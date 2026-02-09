@@ -50,13 +50,13 @@ python run_autoglm_v.py \
     > nohup3.out 2>&1 &
 
 nohup \
-python run_autoglm_v_branch.py \
+python run_autoglm_v_recovery.py \
     --provider_name docker \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-    --result_dir results/autoglm-os_branch \
+    --result_dir results/autoglm-os_recovery \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_one.json \
+    --test_all_meta_path ./evaluation_examples/debug.json \
     --rerun_fail \
     > nohup3.out 2>&1 &
 
