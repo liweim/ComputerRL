@@ -1,9 +1,10 @@
+import ast
 import logging
 import re
 from base64 import b64encode
 from PIL import Image
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import time
 
 from .prompt.accessibility_tree_handle import linearize_accessibility_tree, trim_accessibility_tree
@@ -77,8 +78,8 @@ class AutoGLMAgent:
         max_trajectory_length=3,
         a11y_tree_max_items=300,
         with_image: bool = True,
-        screen_size = (1920, 1080),
-        image_size=(1920, 1080),
+        screen_size = (1280, 720),
+        image_size=(1280, 720),
         with_atree: bool = False,
         glm41v_format: bool = True,
         relative_coordinate: bool = True,
@@ -88,6 +89,7 @@ class AutoGLMAgent:
         max_parse_retries: int = 3,
         enable_recovery: bool = True,
         max_failure_memory: int = 8,
+        visual_grounder_model=None,
     ):
         self.action_space = action_space
         self.observation_type = observation_type
@@ -100,7 +102,12 @@ class AutoGLMAgent:
         self.image_size = image_size
         self.with_atree = with_atree
         self.glm41v_format = glm41v_format
+        self.visual_grounder_model = visual_grounder_model
         self.relative_coordinate = relative_coordinate
+        if self.visual_grounder_model is not None:
+            model_name = getattr(self.visual_grounder_model, "model_name", "")
+            if isinstance(model_name, str) and model_name.startswith("gta1"):
+                self.relative_coordinate = False
         self.client_password = client_password
         self.gen_func = gen_func
         self.tool_in_sys_msg = tool_in_sys_msg
@@ -123,7 +130,7 @@ class AutoGLMAgent:
             "google_chrome": "BrowserTools",
         }
         
-        Agent.relative_coordinate = relative_coordinate
+        Agent.relative_coordinate = self.relative_coordinate
         
         self.contents = []
 
@@ -247,6 +254,90 @@ class AutoGLMAgent:
             parts.append(seq_memory)
         return "\n\n".join(parts)
 
+    def _parse_agent_call(self, code: str):
+        tree = ast.parse(code)
+        if len(tree.body) != 1:
+            raise ValueError("Expected a single Agent call")
+        node = tree.body[0]
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            raise ValueError("Expected a call expression")
+        call = node.value
+        if not isinstance(call.func, ast.Attribute):
+            raise ValueError("Expected attribute call")
+        if not isinstance(call.func.value, ast.Name) or call.func.value.id != "Agent":
+            raise ValueError("Expected Agent.<method> call")
+        method = call.func.attr
+        args = [ast.literal_eval(arg) for arg in call.args]
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+        return method, args, kwargs
+
+    def _ground_coordinates(self, description: str, screenshot: bytes) -> Tuple[int, int]:
+        if self.visual_grounder_model is None:
+            raise ValueError("Visual grounder model is not configured")
+        img = Image.open(BytesIO(screenshot))
+        model_name = getattr(self.visual_grounder_model, "model_name", "")
+        scale = 1.5 if isinstance(model_name, str) and model_name.startswith("gta1") else 1.0
+        py_cmd, reasoning = self.visual_grounder_model.call_cua(
+            description,
+            img,
+            environment="linux",
+            screen_width=self.screen_size[0],
+            screen_height=self.screen_size[1],
+            scale=scale,
+        )
+        if not py_cmd:
+            raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
+        if isinstance(py_cmd, tuple) and len(py_cmd) == 2:
+            return py_cmd
+        raise ValueError(f"Visual Grounder did not return coordinates: {py_cmd}")
+
+    def _resolve_agent_call(self, code: str, desc: str, screenshot: bytes):
+        method, args, kwargs = self._parse_agent_call(code)
+
+        if method == "click":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            num_clicks = kwargs.get("num_clicks", args[1] if len(args) > 1 else 1)
+            button_type = kwargs.get("button_type", args[2] if len(args) > 2 else "left")
+            return Agent.click(coordinate, num_clicks=num_clicks, button_type=button_type)
+        if method == "type":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            text = kwargs.get("text", args[1] if len(args) > 1 else "")
+            overwrite = kwargs.get("overwrite", False)
+            enter = kwargs.get("enter", False)
+            return Agent.type(coordinate=coordinate, text=text, overwrite=overwrite, enter=enter)
+        if method == "scroll":
+            coordinate = self._ground_coordinates(desc, screenshot)
+            direction = kwargs.get("direction", args[1] if len(args) > 1 else "down")
+            return Agent.scroll(coordinate, direction)
+        if method == "drag_and_drop":
+            desc_text = desc.strip()
+            start_desc = ""
+            end_desc = ""
+            if "->" in desc_text:
+                parts = desc_text.split("->", 1)
+                start_desc, end_desc = parts[0].strip(), parts[1].strip()
+            elif " to " in desc_text.lower():
+                parts = re.split(r"\s+to\s+", desc_text, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    start_desc, end_desc = parts[0].strip(), parts[1].strip()
+            elif ";" in desc_text:
+                parts = desc_text.split(";", 1)
+                start_desc, end_desc = parts[0].strip(), parts[1].strip()
+
+            if not start_desc:
+                start_desc = f"{desc_text} (drag start)"
+            if not end_desc:
+                end_desc = f"{desc_text} (drop target)"
+
+            drag_from = self._ground_coordinates(start_desc, screenshot)
+            drop_on = self._ground_coordinates(end_desc, screenshot)
+            return Agent.drag_and_drop(drag_from, drop_on)
+        if method == "exit":
+            success = kwargs.get("success", args[0] if len(args) > 0 else True)
+            return Agent.exit(success=success)
+
+        raise ValueError(f"Grounding not supported for Agent.{method}")
+
     def prepare(self, instruction: str, obs: Dict, history: List, last_result: str = "") -> List:
         """
         Predict the next action(s) based on the current observation.
@@ -334,7 +425,8 @@ class AutoGLMAgent:
             actions = parse_code_from_string(response)
             action = actions[0]
             
-            action = re.sub(r'^python\s*(\\+n|\n)+', '', action, flags=re.IGNORECASE)
+            pattern = r'^python\s*(\\+n|\n)+'
+            action = re.sub(pattern, '', action, flags=re.IGNORECASE)
             action = re.sub(r'^(\\+n|\n)+', '', action)
             action = re.sub(r'(\\+n|\n)+$', '', action)
 
@@ -349,14 +441,24 @@ class AutoGLMAgent:
             if 'button=' in action:
                 action = action.replace('button=', 'button_type=')
             
+            thought = re.sub(pattern, '', response, flags=re.DOTALL).strip()
+            
             logger.info(f"The pesudo action is {action}")
 
             if action in ["WAIT", "DONE", "FAIL", "RESET", "RECOVERY_DONE", "ROLLBACK"]:
                 actions = [action]
             elif "Agent." in action:
-                actions = [
-                    eval(action),
-                ]
+                if self.visual_grounder_model is not None and obs.get("screenshot"):
+                    try:
+                        grounded_action = self._resolve_agent_call(action, thought, obs["screenshot"])
+                        actions = [grounded_action]
+                    except Exception as e:
+                        logger.error(f"Visual grounding failed, falling back to raw Agent action: {e}")
+                        actions = [eval(action)]
+                else:
+                    actions = [
+                        eval(action),
+                    ]
             elif "BrowserTools." in action:  # TODO: special check for BrowserTools
                 actions = [
                     eval(action),

@@ -523,16 +523,6 @@ class HiSA:
             "image_count": image_count,
         }
 
-    def _extract_grounding_description(self, thought: str) -> str:
-        """Extract grounding target description from thought text."""
-        if not thought:
-            return ""
-        for pattern in [r"Grounding target:\s*(.*)", r"Target:\s*(.*)"]:
-            match = re.search(pattern, thought, flags=re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        return thought.strip()
-
     def _ground_coordinates(self, description: str, screenshot: bytes) -> Tuple[int, int]:
         """Return grounded (x, y) using the visual grounder."""
         if self.visual_grounder_model is None:
@@ -590,10 +580,9 @@ class HiSA:
         kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
         return method, args, kwargs
 
-    def _resolve_agent_call(self, code: str, description: str, screenshot: bytes):
+    def _resolve_agent_call(self, code: str, desc: str, screenshot: bytes):
         """Resolve Agent.click/type calls using visual grounding and return action code."""
         method, args, kwargs = self._parse_agent_call(code)
-        desc = description or self.current_thought or "target element"
 
         if method == "click":
             coordinate = self._ground_coordinates(desc, screenshot)
@@ -941,6 +930,117 @@ class HiSA:
             self.env.controller.end_recording(os.path.join(self.save_dir, "recording.mp4"))
         
         return score
+    
+    def _get_decision(self) -> Optional[Dict]:
+        """Get decision from global planner with retry on parsing errors."""
+
+        for attempt in range(self.max_parse_retries):
+            try:
+                # Get current screenshot
+                screenshot = self.env.controller.get_screenshot()
+                screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
+
+                # Get current app info for tool_commands processing
+                cur_app = None
+                try:
+                    app_list, cur_window_id = self.env.get_current_apps()
+                    if cur_window_id in app_list:
+                        cur_app = app_list[cur_window_id]['app_name']
+                except Exception as e:
+                    self.logger.warning(f"Failed to get current app: {e}")
+                    cur_app = None
+
+                # Context Refinement
+                total_logs = len(self.action_logs)
+                
+                # Only trigger context refinement if not disabled (wo_refinement=False)
+                if not self.wo_refinement and total_logs > 0 and total_logs % self.refine_period == 0:
+                    # Trigger context refinement
+                    if self.last_full_summary:
+                        # Not first time: use previous summary + new logs since last summary
+                        logs_to_summarize = self.action_logs[self.last_summary_step:]
+                        start_step = self.action_logs[0]["step"]
+                        end_step = self.action_logs[-1]["step"]
+                        summary = self._get_context_refinement(
+                            logs_to_summarize, start_step, end_step,
+                            previous_summary=self.last_full_summary
+                        )
+                    else:
+                        # First time: summarize all logs without previous summary
+                        logs_to_summarize = self.action_logs
+                        start_step = logs_to_summarize[0]["step"]
+                        end_step = logs_to_summarize[-1]["step"]
+                        summary = self._get_context_refinement(logs_to_summarize, start_step, end_step)
+
+                    self.last_full_summary = summary
+                    self.last_summary_step = total_logs
+                    
+                    # Clear conversation messages and last tool output after context refinement
+                    if self.wo_step:
+                        self.conversation_messages = []
+                        self.last_tool_output = None  # Clear observation as it's now in summary
+
+                # ========== Build Messages ==========
+                # If there's error feedback, use direct error message without context
+                if self.last_error_feedback:
+                    # Direct call with error feedback only, no other context
+                    messages = [
+                        {"role": "user", "content": self.last_error_feedback}
+                    ]
+                else:
+                    messages = self._build_messages(screenshot_b64)
+
+                if attempt > 0:
+                    self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
+
+                # Call global planner
+                response = self._call_llm(self.global_planner_model, messages, self.global_planner_usage)
+
+                obs_dict = {"cur_app": cur_app}
+                decision = self._parse_response(response, obs_dict)
+
+                self.logger.info(f"Code: {decision.get('code', 'N/A')} | Thought: {decision.get('thought', '')}")
+
+                # Clear error feedback on success
+                self.last_error_feedback = None
+                
+                # Store conversation after successful parsing
+                if self.wo_step and messages and len(messages) > 1:
+                    # For traditional hisa with wo_step, store the current user message
+                    if messages and len(messages) > 1:  # system + user messages
+                        # Store user message (last one)
+                        self.conversation_messages.append(messages[-1])
+                        # Store assistant response
+                        self.conversation_messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+
+                return decision
+                
+            except Exception as e:
+                self.logger.error(f"Decision parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {e}")
+                
+                # If not last attempt, set error feedback for retry
+                if attempt < self.max_parse_retries - 1:
+                    error_feedback = FIX_RESPONSE_UNIFY_PROMPT.format(
+                        error_message=str(e),
+                        response=response
+                    )
+
+                    # Store error feedback for next iteration
+                    self.last_error_feedback = error_feedback
+
+                    # Continue to next retry
+                    continue
+                else:
+                    # Last attempt failed, return None
+                    self.logger.error("All retry attempts exhausted, cannot get valid decision")
+                    with open(os.path.join(self.save_dir, "err_reason.txt"), "w") as f:
+                        f.write("All retry attempts exhausted, cannot get valid decision")
+                    return None
+        
+        return None
 
     def error_feedback(self) -> Optional[Dict]:
         """Get decision from global planner with retry on parsing errors."""
@@ -1285,9 +1385,8 @@ class HiSA:
 
             final_code = code
             if isinstance(final_code, str) and "Agent." in final_code and self.visual_grounder_model is not None:
-                description = self._extract_grounding_description(self.current_thought)
                 try:
-                    final_code = self._resolve_agent_call(final_code, description, before_screenshot)
+                    final_code = self._resolve_agent_call(final_code, self.current_thought, before_screenshot)
                 except Exception as e:
                     self.logger.warning(f"Agent grounding failed, falling back to direct eval: {e}")
 

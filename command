@@ -53,10 +53,11 @@ nohup \
 python run_autoglm_v_recovery.py \
     --provider_name docker \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-    --result_dir results/autoglm-os_recovery \
+    --result_dir results/autoglm-os_gta1_7b_recovery \
+    --visual_grounder_model gta1-7b \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/debug.json \
+    --test_all_meta_path ./evaluation_examples/test_one.json \
     --rerun_fail \
     > nohup3.out 2>&1 &
 
@@ -68,7 +69,7 @@ python run_hisa.py \
   --visual_grounder_model gta1-7b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_small.json \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
   --wo_step \
   --wo_refinement \
   --wo_pattern \

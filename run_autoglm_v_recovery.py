@@ -12,8 +12,10 @@ import time
 import requests
 from tqdm import tqdm
 import shutil
+import textwrap
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v_recovery import AutoGLMAgent
+from mm_agents.hisa.llm import AbstractLLM
 from typing import Optional, Dict, Any
 from utils import summary, setup_logger
 import datetime
@@ -28,6 +30,58 @@ logger = logging.getLogger("desktopenv.experiment")
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
 logger = None  # Will be initialized in main
+
+def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
+    script = textwrap.dedent(f"""
+        import os
+        import subprocess
+
+        os.environ["DISPLAY"] = ":0"
+        output = subprocess.check_output(
+            "xrandr --query | awk '/ connected/{{print $1; exit}}'",
+            shell=True,
+            text=True
+        ).strip()
+        if not output:
+            raise RuntimeError("No connected display output found")
+
+        mode = "{width}x{height}"
+        modes = subprocess.check_output("xrandr | awk '{{print $1}}'", shell=True, text=True).split()
+        if mode in modes:
+            subprocess.check_call(["xrandr", "--output", output, "--mode", mode])
+        else:
+            if subprocess.call("command -v cvt >/dev/null 2>&1", shell=True) != 0:
+                raise RuntimeError("cvt not found; install x11-xserver-utils in the VM")
+            cvt_out = subprocess.check_output(
+                "cvt {width} {height}",
+                shell=True,
+                text=True
+            ).splitlines()
+            if len(cvt_out) < 2:
+                raise RuntimeError("cvt output is invalid")
+            parts = cvt_out[1].split()
+            if len(parts) < 3 or parts[0] != "Modeline":
+                raise RuntimeError("Unexpected cvt output: " + cvt_out[1])
+            name = parts[1].strip('"')
+            params = parts[2:]
+            subprocess.call(["xrandr", "--newmode", name, *params])
+            subprocess.call(["xrandr", "--addmode", output, name])
+            subprocess.check_call(["xrandr", "--output", output, "--mode", name])
+    """).strip()
+
+    try:
+        result = env.controller.run_python_script(script)
+    except Exception as exc:
+        raise SystemExit(f"Failed to set VM resolution: {exc}")
+
+    if result and result.get("status") == "error":
+        raise SystemExit(f"Failed to set VM resolution: {result.get('error')}")
+
+    size = env.controller.get_vm_screen_size() or {}
+    if size.get("width") != width or size.get("height") != height:
+        raise SystemExit(
+            f"VM resolution mismatch: got {size.get('width')}x{size.get('height')}, expected {width}x{height}"
+        )
 
 def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
@@ -48,8 +102,8 @@ def config() -> argparse.Namespace:
         default="a11y_tree",
         help="Observation type",
     )# NOTE: Only supports "a11y_tree" and actually uses screenshot (with_image=True, with_atree=False)
-    parser.add_argument("--screen_width", type=int, default=1920)
-    parser.add_argument("--screen_height", type=int, default=1080)
+    parser.add_argument("--screen_width", type=int, default=1280) #1920
+    parser.add_argument("--screen_height", type=int, default=720) #1080
     parser.add_argument("--sleep_after_execution", type=float, default=1.0)
     parser.add_argument("--max_steps", type=int, default=50)
 
@@ -64,6 +118,8 @@ def config() -> argparse.Namespace:
     parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
     parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
     parser.add_argument("--stop_token", type=str, default=None)
+    parser.add_argument("--visual_grounder_model", type=str, default="autoglm-os",
+                        help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
     parser.add_argument("--image_width", type=int, default=1280)
     parser.add_argument("--image_height", type=int, default=720)
     parser.add_argument("--recovery", action="store_true", default=True, help="Enable recovery/rollback mode")
@@ -346,6 +402,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "max_steps": args.max_steps,
         "max_trajectory_length": args.max_trajectory_length,
         "model": args.model,
+        "visual_grounder_model": args.visual_grounder_model,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
@@ -449,6 +506,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             self.last_usage = {}
     
     token_tracker = TokenTracker()
+
+    if args.visual_grounder_model == args.model:
+        visual_grounder_model = None
+    else:
+        visual_grounder_model = AbstractLLM(args.visual_grounder_model)
     
     env = DesktopEnv(
         provider_name=args.provider_name,
@@ -461,6 +523,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         os_type="Ubuntu",
         require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
     )
+    _ensure_vm_resolution(env, args.screen_width, args.screen_height, logger)
     agent = AutoGLMAgent(
         action_space=args.action_space,
         observation_type=args.observation_type,
@@ -471,6 +534,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         gen_func=token_tracker,
         enable_recovery=args.recovery,
         max_failure_memory=args.recovery_max_failure_memory,
+        visual_grounder_model=visual_grounder_model,
     )
     
     # Attach token_tracker to agent for access in run_single_example_autoglm
@@ -574,7 +638,7 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, l
 
 
 def run_single_example(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
-    runtime_logger = setup_logger(example, example_result_dir)
+    runtime_logger = setup_logger(os.path.basename(args.result_dir), getattr(args, "log_level", "INFO"))
     try:
         agent.reset(runtime_logger)
     except Exception as e:
@@ -616,15 +680,8 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
         f.write(f"{result}\n")
     env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
 
-
-def setup_logger(example, example_result_dir):
-    runtime_logger = logging.getLogger(f"desktopenv.example.{example['id']}")
-    runtime_logger.setLevel(logging.DEBUG)
-    runtime_logger.addHandler(logging.FileHandler(os.path.join(example_result_dir, "runtime.log")))
-    return runtime_logger
-
-def run_single_example_human(env, example, max_steps, instruction, args, example_result_dir, scores):
-    runtime_logger = setup_logger(example, example_result_dir)
+def run_single_example_human(env, example, example_result_dir, scores):
+    runtime_logger = setup_logger(os.path.basename(example_result_dir), "INFO")
     env.reset(task_config=example)
     time.sleep(60) # Wait for the environment to be ready
     obs = env._get_obs() # Get the initial observation
@@ -642,7 +699,7 @@ def run_single_example_human(env, example, max_steps, instruction, args, example
         f.write(f"{result}\n")
 
 def run_single_example_autoglm(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
-    runtime_logger = setup_logger(example, example_result_dir)
+    runtime_logger = setup_logger(os.path.basename(args.result_dir), getattr(args, "log_level", "INFO"))
     try:
         agent.reset(runtime_logger)
     except Exception as e:
