@@ -747,7 +747,18 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             exe_result = exe_result.decode("utf-8", errors="replace")
         return str(exe_result)
 
-    def _is_execution_error(exe_result, info):
+    def _is_tool_action(action):
+        if not isinstance(action, str):
+            return False
+        if "Tools." in action:
+            return True
+        if action.strip().startswith("from ") and "Tools." in action:
+            return True
+        return False
+
+    def _is_execution_error(exe_result, info, action):
+        if _is_tool_action(action):
+            return False
         if info and info.get("fail", False):
             return True
         if not exe_result:
@@ -828,7 +839,7 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             return
         logger.info("REPLAY: start %d steps (branch %d)", replay_index, branch_id)
         for idx, action in enumerate(action_history_full[:replay_index], start=1):
-            if isinstance(action, str) and action in ["WAIT", "DONE", "FAIL", "RECOVERY_DONE", "RESET", "ROLLBACK"]:
+            if isinstance(action, str) and action in ["WAIT", "DONE", "FAIL", "RESET", "ROLLBACK"]:
                 continue
             logger.info("REPLAY: step %d/%d action=%s", idx, replay_index, str(action))
             obs, _, _, _ = env.step(action, args.sleep_after_execution)
@@ -920,16 +931,24 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             step_start_time = time.time()
 
             if getattr(args, "recovery", False) and isinstance(action, str):
+                if recovery_active and action == "ROLLBACK":
+                    if reset_count < max_resets:
+                        action = "RESET"
+                    else:
+                        action = "FAIL"
                 if action == "ROLLBACK":
                     replay_index = max(0, replay_index - 1)
                     recovery_steps += 1
                     logger.info("ROLLBACK: replay_index -> %d (branch %d)", replay_index, branch_id)
-                    if recovery_context is None:
-                        recovery_context = {"reason": "rollback"}
-                    if failure_end_index is not None:
-                        failed_seq = action_history_full[replay_index:failure_end_index + 1]
-                        recovery_context["failed_sequence"] = [str(a) for a in failed_seq]
+                    recovery_active = True
+                    recovery_context = {
+                        "reason": "parse_error",
+                        "action": str(original_action),
+                        "exe_result": "No action code in response",
+                    }
                     obs = env._get_obs()
+                    if isinstance(obs, dict):
+                        obs["exe_result"] = "Response contains no action code. Triggering ROLLBACK without retry."
                     screenshot_file = f"step_{step_idx + 1}_rollback.png"
                     with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
                         _f.write(obs["screenshot"])
@@ -941,39 +960,6 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                         "action": "ROLLBACK",
                         "response": str(response) if response else "",
                         "exe_result": f"Replay index -> {replay_index}",
-                        "step_time": round(time.time() - step_start_time, 2),
-                        "token_usage": step_usage,
-                        "recovery_mode": True,
-                        "branch_id": branch_id,
-                        "branch_parent_id": branch_parents.get(branch_id),
-                    })
-                    continue
-                if action == "RECOVERY_DONE":
-                    recovery_active = False
-                    recovery_context = None
-                    recovery_steps = 0
-                    logger.info("RECOVERY_DONE: resume planning (branch %d)", branch_id)
-                    failure_end_index = None
-                    if action_history_full and replay_index < len(action_history_full):
-                        _record_failure_sequence(
-                            action_history_full[replay_index:],
-                            "branch_abandoned",
-                            replay_index,
-                            len(action_history_full) - 1,
-                        )
-                        action_history_full = action_history_full[:replay_index]
-                    obs = env._get_obs()
-                    screenshot_file = f"step_{step_idx + 1}_recovery_done.png"
-                    with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
-                        _f.write(obs["screenshot"])
-                    action_logs.append({
-                        "step": step_idx + 1,
-                        "type": "recovery_done",
-                        "execution_success": True,
-                        "screenshot": screenshot_file,
-                        "action": "RECOVERY_DONE",
-                        "response": str(response) if response else "",
-                        "exe_result": "Recovery completed",
                         "step_time": round(time.time() - step_start_time, 2),
                         "token_usage": step_usage,
                         "recovery_mode": True,
@@ -1117,7 +1103,7 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                 action_history_full.append(action if isinstance(action, (str, dict)) else str(action))
                 replay_index = len(action_history_full)
 
-            if getattr(args, "recovery", False) and _is_execution_error(exe_result, info):
+            if getattr(args, "recovery", False) and _is_execution_error(exe_result, info, action):
                 recovery_active = True
                 recovery_steps = 0
                 if action_history_full:
@@ -1130,11 +1116,9 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                     "action": str(action),
                     "exe_result": exe_result,
                     "app": obs.get("cur_app"),
-                    "note": "auto_fix_failed" if auto_fix_attempted and not auto_fix_applied else "",
                 }
                 if failure_end_index is not None:
                     failed_seq = action_history_full[replay_index:failure_end_index + 1]
-                    recovery_context["failed_sequence"] = [str(a) for a in failed_seq]
                     _record_failure_sequence(
                         failed_seq,
                         "failure",

@@ -213,6 +213,14 @@ class GroundingAgent:
 
     @classmethod
     @agent_action
+    def reset(cls):
+        """
+        Trigger environment reset when rollback is impossible.
+        """
+        return "RESET"
+
+    @classmethod
+    @agent_action
     def hotkey(cls, keys: List):
         """
         Press a hotkey combination

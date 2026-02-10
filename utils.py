@@ -524,4 +524,5 @@ def summary(result_dir, test_all_meta):
 if __name__ == "__main__":
     #autoglm-os_baseline, hisa_wo_pattern
     # summary('/data1/lwm/projects/ComputerRL/results/hisa_gta1_7b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_recovery', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')

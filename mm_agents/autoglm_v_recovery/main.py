@@ -16,7 +16,6 @@ logger = logging.getLogger("desktopenv.agent")
 
 pure_text_settings = ["a11y_tree"]
 
-# Prompt template for fixing parsing errors
 FIX_RESPONSE_PROMPT = """Your previous response could not be parsed correctly. Please fix the format issue and try again.
 
 Error message: {error_message}
@@ -25,6 +24,18 @@ Your previous response:
 {response}
 
 Please provide a corrected response with proper format."""
+
+RECOVERY_MODE_PROMPT = (
+    "RECOVERY MODE: The previous action is not feasible. Undo the action.\n"
+    "If you cannot undo at all, output Agent.reset() to reset the environment.\n"
+    "\n"
+    "Common undo actions:\n"
+    "- Agent.hotkey(['ctrl', 'z'])  # undo typing\n"
+    "- Agent.hotkey(['esc'])        # close a dialog\n"
+    "- Agent.hotkey(['alt', 'left'])# page back\n"
+    "- Agent.click(...)             # click back button or close icon\n"
+    "- Agent.scroll(...)            # restore view\n"
+)
 
 def resize_image(image, w, h):
     img = Image.open(BytesIO(image))
@@ -36,8 +47,14 @@ def resize_image(image, w, h):
     return img_bytes
 
 def parse_code_from_string(input_string):
+    if not isinstance(input_string, str):
+        input_string = str(input_string)
+    if "\\n" in input_string:
+        input_string = input_string.replace("\\n", "\n")
+    if "\\`" in input_string:
+        input_string = input_string.replace("\\`", "`")
     # input_string = "\n".join([line.strip() for line in input_string.split(';') if line.strip()])
-    if input_string.strip() in ["WAIT", "DONE", "FAIL", "RESET", "RECOVERY_DONE", "ROLLBACK"]:
+    if input_string.strip() in ["WAIT", "DONE", "FAIL"]:
         return [input_string.strip()]
 
     # This regular expression will match both ```code``` and ```python code```
@@ -56,7 +73,7 @@ def parse_code_from_string(input_string):
 
     for match in matches:
         match = match.strip()
-        commands = ["WAIT", "DONE", "FAIL", "RESET", "RECOVERY_DONE", "ROLLBACK"]  # fixme: updates this part when we have more commands
+        commands = ["WAIT", "DONE", "FAIL"]  # fixme: updates this part when we have more commands
 
         if match in commands:
             codes.append(match.strip())
@@ -68,6 +85,63 @@ def parse_code_from_string(input_string):
             codes.append(match)
 
     return codes
+
+def has_code_block(input_string: str) -> bool:
+    if not input_string:
+        return False
+    stripped = input_string.strip()
+    if stripped in ["WAIT", "DONE", "FAIL"]:
+        return True
+    return len(parse_code_from_string(input_string)) > 0
+
+def extract_action_and_thought(response: str):
+    actions = parse_code_from_string(response)
+    if not actions:
+        response = response or ""
+        action = None
+        if "Action:" in response or "Action：" in response:
+            marker = "Action：" if "Action：" in response else "Action:"
+            action = response.split(marker)[-1].strip()
+            if "\n" in action:
+                action = action.splitlines()[0].strip()
+        if not action:
+            call_pattern = re.compile(r"\b[A-Za-z_]\w*\.\w+\s*\(")
+            for line in response.splitlines():
+                if call_pattern.search(line):
+                    action = line.strip()
+                    break
+        if not action:
+            stripped = response.strip()
+            if stripped in ["WAIT", "DONE", "FAIL"]:
+                action = stripped
+        if not action:
+            return None, None
+        actions = [action]
+    action = actions[0]
+
+    pattern = r'^python\s*(\\+n|\n)+'
+    action = re.sub(pattern, '', action, flags=re.IGNORECASE)
+    action = re.sub(r'^(\\+n|\n)+', '', action)
+    action = re.sub(r'(\\+n|\n)+$', '', action)
+
+    if '<think>' in response:
+        thought = response.split('<think>')[1].split('</think>')[0]
+    elif '</think>' in response:
+        thought = response.split('</think>')[0]
+    else:
+        thought = response.replace(action, '')
+    thought = thought.replace("[{'type': 'text', 'text': ", '').replace('```python', '').replace('```', '').strip()
+
+    match = re.search(r"text=\\'(.*)\\'(?=[,)])", action)
+    if match:
+        content = match.group(1).replace("\\'", "'")
+        action = action[:match.start()] + f"text={repr(content)}" + action[match.end():]
+
+    action = re.sub(r"=\\'([^'\\]*)\\'", r"='\1'", action)
+    if 'button=' in action:
+        action = action.replace('button=', 'button_type=')
+
+    return action, thought
 
 
 class AutoGLMAgent:
@@ -117,6 +191,7 @@ class AutoGLMAgent:
         self.enable_recovery = enable_recovery
         self.recovery_mode = False
         self.recovery_context = None
+        self.parse_fail_streak = 0
         self.failure_memory = []
         self.max_failure_memory = max_failure_memory
         self.failure_sequences = []
@@ -221,39 +296,6 @@ class AutoGLMAgent:
             lines.append(f"{idx}. {chain}{meta_str}")
         return "\n".join(lines)
 
-    def _format_recovery_instructions(self) -> str:
-        if not self.enable_recovery:
-            return ""
-        parts = []
-        if self.recovery_mode:
-            parts.append(
-                "RECOVERY MODE: Roll back recent changes to return to a stable, re-plannable state. "
-                "Use undo/close dialog/page back/scroll restore/clear input, etc. "
-                "Keep actions minimal and safe. "
-                "After performing ONE rollback step, output `ROLLBACK` to decrement the replay index. "
-                "When stable, output `RECOVERY_DONE`. "
-                "If rollback is impossible and you are blocked, output `RESET`."
-            )
-            if self.recovery_context:
-                parts.append(
-                    "Last failure context: "
-                    f"action={self.recovery_context.get('action')}; "
-                    f"result={self.recovery_context.get('exe_result')}; "
-                    f"app={self.recovery_context.get('app')}"
-                )
-                if self.recovery_context.get("note"):
-                    parts.append(f"Note: {self.recovery_context.get('note')}")
-                failed_seq = self.recovery_context.get("failed_sequence")
-                if failed_seq:
-                    parts.append("Failed sequence to avoid: " + " -> ".join([str(s) for s in failed_seq]))
-        memory = self._format_failure_memory()
-        if memory:
-            parts.append(memory)
-        seq_memory = self._format_failure_sequences()
-        if seq_memory:
-            parts.append(seq_memory)
-        return "\n\n".join(parts)
-
     def _parse_agent_call(self, code: str):
         tree = ast.parse(code)
         if len(tree.body) != 1:
@@ -332,9 +374,6 @@ class AutoGLMAgent:
             drag_from = self._ground_coordinates(start_desc, screenshot)
             drop_on = self._ground_coordinates(end_desc, screenshot)
             return Agent.drag_and_drop(drag_from, drop_on)
-        if method == "exit":
-            success = kwargs.get("success", args[0] if len(args) > 0 else True)
-            return Agent.exit(success=success)
 
         raise ValueError(f"Grounding not supported for Agent.{method}")
 
@@ -363,10 +402,6 @@ class AutoGLMAgent:
             system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
         else:
             system_message = setup_prompt + "\n\n" + note_prompt
-        system_message += "\n\n**IMPORTANT** You are asked to complete the following task: {}".format(instruction)
-        recovery_msg = self._format_recovery_instructions()
-        if recovery_msg:
-            system_message += "\n\n" + recovery_msg
 
         messages = [
             {
@@ -384,15 +419,17 @@ class AutoGLMAgent:
             app_str = "None"
 
         last_result = last_result.strip() if last_result else "None"
-        last_result = last_result[:2000] + "..." if len(last_result) > 2000 else last_result
 
         tree = linearize_accessibility_tree(obs["accessibility_tree"], "Ubuntu")
         tree = trim_accessibility_tree(tree, 300)
 
         app_info = obs["app_info"].strip() if obs["app_info"] else "None"
-        app_info = app_info[:5000] + "..." if len(app_info) > 5000 else app_info
 
-        prompt = "* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}\n\n* Previous Action Result: {}".format(
+        if history == []:
+            prompt = f'**IMPORTANT** You are asked to complete the following task: {instruction}\n\n'
+        else:
+            prompt = ''
+        prompt += "* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}\n\n* Previous Action Result: {}".format(
             app_str.strip(),
             obs["cur_window_id"].strip() if obs["cur_window_id"] in app_str else "None",
             '\n\n* A11y Tree: {}'.format(tree.strip()) if self.with_atree else "",
@@ -402,6 +439,8 @@ class AutoGLMAgent:
             "\n\n" + func_def_prompt if not self.tool_in_sys_msg else ""
         )
 
+        if self.recovery_mode:
+            prompt += "\n\n" + RECOVERY_MODE_PROMPT
         content = [{"type": "text", "text": prompt}]
         if self.with_image and obs.get('screenshot'):
             screenshot = resize_image(obs['screenshot'], self.image_size[0], self.image_size[1])
@@ -422,36 +461,25 @@ class AutoGLMAgent:
     def execute(self, response, obs):
         self.last_parse_error = None  # Reset error before each attempt
         try:
-            actions = parse_code_from_string(response)
-            action = actions[0]
+            action, thought = extract_action_and_thought(response)
+            if action is None:
+                raise ValueError("No action code found in response")
             
-            pattern = r'^python\s*(\\+n|\n)+'
-            action = re.sub(pattern, '', action, flags=re.IGNORECASE)
-            action = re.sub(r'^(\\+n|\n)+', '', action)
-            action = re.sub(r'(\\+n|\n)+$', '', action)
+            logger.info(f"The pesudo action is: {action}")
+            logger.info(f"The thought is: {thought}")
 
-            # Fix text parameter with escaped quotes (e.g. text=\'I\'m happy\')
-            match = re.search(r"text=\\'(.*)\\'(?=[,)])", action)
-            if match:
-                content = match.group(1).replace("\\'", "'")
-                action = action[:match.start()] + f"text={repr(content)}" + action[match.end():]
-            
-            # Fix other simple escaped quotes (e.g. button_type=\'left\')
-            action = re.sub(r"=\\'([^'\\]*)\\'", r"='\1'", action)
-            if 'button=' in action:
-                action = action.replace('button=', 'button_type=')
-            
-            thought = re.sub(pattern, '', response, flags=re.DOTALL).strip()
-            
-            logger.info(f"The pesudo action is {action}")
-
-            if action in ["WAIT", "DONE", "FAIL", "RESET", "RECOVERY_DONE", "ROLLBACK"]:
+            if action in ["WAIT", "DONE", "FAIL"]:
                 actions = [action]
             elif "Agent." in action:
                 if self.visual_grounder_model is not None and obs.get("screenshot"):
                     try:
-                        grounded_action = self._resolve_agent_call(action, thought, obs["screenshot"])
-                        actions = [grounded_action]
+                        method, _, _ = self._parse_agent_call(action)
+                        grounding_methods = {"click", "type", "scroll", "drag_and_drop"}
+                        if method in grounding_methods:
+                            grounded_action = self._resolve_agent_call(action, thought, obs["screenshot"])
+                            actions = [grounded_action]
+                        else:
+                            actions = [eval(action)]
                     except Exception as e:
                         logger.error(f"Visual grounding failed, falling back to raw Agent action: {e}")
                         actions = [eval(action)]
@@ -473,29 +501,26 @@ class AutoGLMAgent:
 
         return actions
 
-    def format_history(self, max_turns=30):
+    def format_history(self, instruction, max_turns=30):
         history = []
         for ix in range(self.turn_number):
             if ix == 0:
-                env_input = "**Environment State (Omitted)**"
+                env_input = "**IMPORTANT** You are asked to complete the following task: {}".format(instruction)
             else:
                 env_input = (
-                    f"**Environment State (Omitted)**\nPrevious Action Result: {self.contents[ix - 1]['exe_result']}"
+                    f"Previous Action Result: {self.contents[ix - 1]['exe_result']}"
                 )
 
-            env_input = env_input[:2000] + "..." if len(env_input) > 2000 else env_input
-            response = (
-                self.contents[ix]["response"][:1500] + "..."
-                if len(self.contents[ix]["response"]) > 1500
-                else self.contents[ix]["response"]
-            )
+            response = self.contents[ix]["response"]
+            if not isinstance(response, str):
+                response = str(response)
             history.append({"role": "user", "content": [{"type": "text", "text": env_input}]})
             history.append({"role": "assistant", "content": [{"type": "text", "text": response}]})
 
         return history[-max_turns * 2:]
 
     def predict(self, instruction: str, obs: Dict) -> List:
-        history = self.format_history()
+        history = self.format_history(instruction)
         messages = self.prepare(instruction, obs, history)
 
         assert self.gen_func is not None, "gen_func is not set"
@@ -527,20 +552,28 @@ class AutoGLMAgent:
             else:
                 raise RuntimeError("Failed to call gen_func after retries")
 
+            if not isinstance(response, str):
+                response = str(response)
             logger.info("RESPONSE: %s", response)
 
-            # Try to execute/parse the response
-            actions = self.execute(response, obs)
+            action_probe, _ = extract_action_and_thought(response or "")
+            if action_probe is None:
+                self.last_parse_error = "No action code in response"
+                actions = []
+            else:
+                # Try to execute/parse the response
+                actions = self.execute(response, obs)
             
             if actions:
                 # Successfully parsed, clear error feedback
                 self.last_error_feedback = None
+                self.last_parse_error = None
+                self.parse_fail_streak = 0
                 break
             else:
                 # Parsing failed, use stored error or generic message
                 parse_error_msg = self.last_parse_error or "Failed to parse action from response"
                 logger.error(f"Action parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {parse_error_msg}")
-                
                 # If not last attempt, set error feedback for retry
                 if attempt < self.max_parse_retries - 1:
                     self.last_error_feedback = FIX_RESPONSE_PROMPT.format(
@@ -549,9 +582,15 @@ class AutoGLMAgent:
                     )
                 else:
                     # Last attempt failed, mark task as FAIL
-                    logger.error("All retry attempts exhausted, cannot parse valid action. Marking task as FAIL.")
+                    logger.error("All retry attempts exhausted, cannot parse valid action. Triggering fallback action.")
                     self.last_error_feedback = None
-                    actions = ["FAIL"]
+                    self.parse_fail_streak += 1
+                    if self.recovery_mode:
+                        actions = ["RESET"]
+                    elif self.parse_fail_streak >= self.max_parse_retries:
+                        actions = ["FAIL"]
+                    else:
+                        actions = ["ROLLBACK"]
 
         # update the contents
         self.contents.append(
@@ -571,3 +610,6 @@ class AutoGLMAgent:
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
         self.contents = []
+        self.last_error_feedback = None
+        self.last_parse_error = None
+        self.parse_fail_streak = 0

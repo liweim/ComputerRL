@@ -57,8 +57,8 @@ python run_autoglm_v_recovery.py \
     --visual_grounder_model gta1-7b \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_one.json \
-    --rerun_fail \
+    --test_all_meta_path ./evaluation_examples/test_small.json \
+    --rerun \
     > nohup3.out 2>&1 &
 
 nohup \
@@ -77,4 +77,18 @@ python run_hisa.py \
 
 # 杀进程
 ps -ef | grep run_autoglm_v.py
-pkill -f run_autoglm_v.py
+pkill -f run_autoglm_v_recovery.py
+
+
+# debug
+"\n\n".join(
+      f"[{i}][{'AI' if i % 2 == 0 else 'User'}] " + (
+          "\n".join(
+              item.get("text", "") if isinstance(item, dict) else str(item)
+              for item in (m.get("content") if isinstance(m.get("content"), list) else [m.get("content",
+  "")])
+              if item is not None
+          )
+      )
+      for i, m in enumerate(messages)
+  )
