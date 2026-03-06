@@ -119,12 +119,12 @@ class EmbeddingClient:
     """
     Client for calling BGE embedding service via REST API
     """
-    def __init__(self, service_url: str = "http://localhost:8000"):
+    def __init__(self, service_url: str = "http://localhost:8001"):
         """
         Initialize embedding client
 
         Args:
-            service_url: URL of the embedding service (default: http://localhost:8000)
+            service_url: URL of the embedding service (default: http://localhost:8001)
         """
         self.service_url = service_url.rstrip('/')
         self._check_health()
@@ -179,7 +179,7 @@ class EmbeddingClient:
             raise Exception(f"Failed to get embeddings from service: {e}")
 
 def test():
-    model = EmbeddingClient('http://localhost:8000')
+    model = EmbeddingClient('http://localhost:8001')
     sentences_1 = ["What is BGE M3?", "Defination of BM25"]
     sentences_2 = [
         "BGE M3 is an embedding model supporting dense retrieval, lexical matching and multi-vector interaction.",
@@ -195,10 +195,11 @@ def test():
     
 if __name__ == "__main__":
     # nohup python embedding.py > embedding.log 2>&1 &
-    uvicorn.run(
-        "embedding:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        log_level="info"
-    )
+    test()
+    # uvicorn.run(
+    #     "embedding:app",
+    #     host="0.0.0.0",
+    #     port=8001,
+    #     reload=False,
+    #     log_level="info"
+    # )

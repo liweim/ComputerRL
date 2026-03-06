@@ -213,11 +213,11 @@ class GroundingAgent:
 
     @classmethod
     @agent_action
-    def reset(cls):
+    def restart(cls):
         """
-        Trigger environment reset when rollback is impossible.
+        Trigger environment restart when rollback is impossible.
         """
-        return "RESET"
+        return "RESTART"
 
     @classmethod
     @agent_action

@@ -25,17 +25,6 @@ Your previous response:
 
 Please provide a corrected response with proper format."""
 
-RECOVERY_MODE_PROMPT = (
-    "RECOVERY MODE: The previous action is not feasible. Undo the action.\n"
-    "If you cannot undo at all, output Agent.reset() to reset the environment.\n"
-    "\n"
-    "Common undo actions:\n"
-    "- Agent.hotkey(['ctrl', 'z'])  # undo typing\n"
-    "- Agent.hotkey(['esc'])        # close a dialog\n"
-    "- Agent.hotkey(['alt', 'left'])# page back\n"
-    "- Agent.click(...)             # click back button or close icon\n"
-    "- Agent.scroll(...)            # restore view\n"
-)
 
 def resize_image(image, w, h):
     img = Image.open(BytesIO(image))
@@ -49,8 +38,6 @@ def resize_image(image, w, h):
 def parse_code_from_string(input_string):
     if not isinstance(input_string, str):
         input_string = str(input_string)
-    if "\\n" in input_string:
-        input_string = input_string.replace("\\n", "\n")
     if "\\`" in input_string:
         input_string = input_string.replace("\\`", "`")
     # input_string = "\n".join([line.strip() for line in input_string.split(';') if line.strip()])
@@ -161,7 +148,6 @@ class AutoGLMAgent:
         gen_func=None,
         tool_in_sys_msg: bool = True,
         max_parse_retries: int = 3,
-        enable_recovery: bool = True,
         max_failure_memory: int = 8,
         visual_grounder_model=None,
     ):
@@ -188,13 +174,12 @@ class AutoGLMAgent:
         self.max_parse_retries = max_parse_retries
         self.last_error_feedback = None
         self.last_parse_error = None
-        self.enable_recovery = enable_recovery
-        self.recovery_mode = False
-        self.recovery_context = None
         self.parse_fail_streak = 0
         self.failure_memory = []
         self.max_failure_memory = max_failure_memory
         self.failure_sequences = []
+        self.failure_hints = []
+        self.last_pseudo_action = None
 
         self.tool_list = {
             "libreoffice_calc": "CalcTools",
@@ -213,16 +198,8 @@ class AutoGLMAgent:
     def turn_number(self):
         return len(self.contents)
 
-    def set_recovery_mode(self, enabled: bool, context: Optional[Dict] = None):
-        if not self.enable_recovery:
-            self.recovery_mode = False
-            self.recovery_context = None
-            return
-        self.recovery_mode = bool(enabled)
-        self.recovery_context = context if enabled else None
-
     def record_failure(self, failure: Dict):
-        if not self.enable_recovery or not failure:
+        if not failure:
             return
         item = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -237,7 +214,7 @@ class AutoGLMAgent:
             self.failure_memory = self.failure_memory[-self.max_failure_memory :]
 
     def record_failure_sequence(self, sequence):
-        if not self.enable_recovery or not sequence:
+        if not sequence:
             return
         if isinstance(sequence, dict):
             seq = [str(item) for item in sequence.get("sequence", [])]
@@ -253,6 +230,13 @@ class AutoGLMAgent:
         self.failure_sequences.append(item)
         if len(self.failure_sequences) > self.max_failure_memory:
             self.failure_sequences = self.failure_sequences[-self.max_failure_memory :]
+
+    def add_failure_hint(self, hint: str):
+        if not hint:
+            return
+        self.failure_hints.append(str(hint))
+        if len(self.failure_hints) > self.max_failure_memory:
+            self.failure_hints = self.failure_hints[-self.max_failure_memory :]
 
     def _format_failure_memory(self) -> str:
         if not self.failure_memory:
@@ -296,7 +280,64 @@ class AutoGLMAgent:
             lines.append(f"{idx}. {chain}{meta_str}")
         return "\n".join(lines)
 
+    def _extract_agent_call(self, code: str) -> str:
+        start = code.find("Agent.")
+        if start == -1:
+            return code
+        open_idx = code.find("(", start)
+        if open_idx == -1:
+            return code[start:]
+        depth = 0
+        for idx in range(open_idx, len(code)):
+            ch = code[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return code[start:idx + 1]
+        return code[start:]
+
+    def _sanitize_action_code(self, code: str) -> str:
+        if not code:
+            return code
+        fixed = code
+        for _ in range(2):
+            fixed = fixed.replace("\\\\'", "\\'")
+            fixed = fixed.replace("\\\\\"", "\\\"")
+            fixed = fixed.replace("\\\\n", "\\n")
+            fixed = fixed.replace("\\\\t", "\\t")
+            fixed = fixed.replace("\\\\r", "\\r")
+        fixed = fixed.replace("\\'", "'")
+        fixed = fixed.replace("\\\"", "\"")
+        return fixed
+
     def _parse_agent_call(self, code: str):
+        code = self._sanitize_action_code(self._extract_agent_call(code))
+        if "Agent.click(" in code:
+            return "click", [], {}
+        if "Agent.type(" in code:
+            kwargs = {}
+            text_match = re.search(r"text\s*=\s*(['\"])(.*?)\1", code)
+            if text_match:
+                kwargs["text"] = text_match.group(2)
+            enter_match = re.search(r"enter\s*=\s*(True|False)", code)
+            if enter_match:
+                kwargs["enter"] = enter_match.group(1) == "True"
+            overwrite_match = re.search(r"overwrite\s*=\s*(True|False)", code)
+            if overwrite_match:
+                kwargs["overwrite"] = overwrite_match.group(1) == "True"
+            coord_match = re.search(r"\[\s*\d+\s*,\s*\d+\s*\]", code)
+            if coord_match:
+                try:
+                    kwargs["coordinate"] = ast.literal_eval(coord_match.group(0))
+                except Exception:
+                    pass
+            return "type", [], kwargs
+        if "Agent.scroll(" in code:
+            return "scroll", [], {}
+        if "Agent.drag_and_drop(" in code:
+            return "drag_and_drop", [], {}
         tree = ast.parse(code)
         if len(tree.body) != 1:
             raise ValueError("Expected a single Agent call")
@@ -333,22 +374,63 @@ class AutoGLMAgent:
             return py_cmd
         raise ValueError(f"Visual Grounder did not return coordinates: {py_cmd}")
 
+    def _ground_action(self, description: str, screenshot: bytes):
+        if self.visual_grounder_model is None:
+            raise ValueError("Visual grounder model is not configured")
+        img = Image.open(BytesIO(screenshot))
+        model_name = getattr(self.visual_grounder_model, "model_name", "")
+        scale = 1.5 if isinstance(model_name, str) and model_name.startswith("gta1") else 1.0
+        py_cmd, reasoning = self.visual_grounder_model.call_cua(
+            description,
+            img,
+            environment="linux",
+            screen_width=self.screen_size[0],
+            screen_height=self.screen_size[1],
+            scale=scale,
+        )
+        if not py_cmd:
+            raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
+        if isinstance(py_cmd, tuple) and len(py_cmd) == 2:
+            return Agent.click(py_cmd)
+        if isinstance(py_cmd, str):
+            if "Agent." in py_cmd:
+                return eval(py_cmd)
+            return py_cmd
+        raise ValueError(f"Visual Grounder did not return action: {py_cmd}")
+
     def _resolve_agent_call(self, code: str, desc: str, screenshot: bytes):
         method, args, kwargs = self._parse_agent_call(code)
 
         if method == "click":
-            coordinate = self._ground_coordinates(desc, screenshot)
+            if "coordinate" in kwargs:
+                coordinate = kwargs["coordinate"]
+            elif args:
+                coordinate = args[0]
+            else:
+                coordinate = self._ground_coordinates(desc, screenshot)
             num_clicks = kwargs.get("num_clicks", args[1] if len(args) > 1 else 1)
             button_type = kwargs.get("button_type", args[2] if len(args) > 2 else "left")
             return Agent.click(coordinate, num_clicks=num_clicks, button_type=button_type)
         if method == "type":
-            coordinate = self._ground_coordinates(desc, screenshot)
+            if "coordinate" in kwargs:
+                coordinate = kwargs["coordinate"]
+            elif args:
+                coordinate = args[0]
+            else:
+                coordinate = None
+            if coordinate is not None:
+                coordinate = self._ground_coordinates(desc, screenshot)
             text = kwargs.get("text", args[1] if len(args) > 1 else "")
             overwrite = kwargs.get("overwrite", False)
             enter = kwargs.get("enter", False)
             return Agent.type(coordinate=coordinate, text=text, overwrite=overwrite, enter=enter)
         if method == "scroll":
-            coordinate = self._ground_coordinates(desc, screenshot)
+            if "coordinate" in kwargs:
+                coordinate = kwargs["coordinate"]
+            elif args:
+                coordinate = args[0]
+            else:
+                coordinate = self._ground_coordinates(desc, screenshot)
             direction = kwargs.get("direction", args[1] if len(args) > 1 else "down")
             return Agent.scroll(coordinate, direction)
         if method == "drag_and_drop":
@@ -424,23 +506,30 @@ class AutoGLMAgent:
         tree = trim_accessibility_tree(tree, 300)
 
         app_info = obs["app_info"].strip() if obs["app_info"] else "None"
+        failure_hint_text = ""
+        if self.failure_hints:
+            failure_hint_text = "* Previous Failures:\n" + "\n".join(
+                f"- {hint}" for hint in self.failure_hints
+            ) + "\n\n"
 
         if history == []:
-            prompt = f'**IMPORTANT** You are asked to complete the following task: {instruction}\n\n'
+            prompt = (
+                f'**IMPORTANT** You are asked to complete the following task: {instruction}\n'
+                'Before declaring success (DONE/Agent.exit), verify in the current UI that the goal is achieved. Do not assume.\n\n'
+            )
         else:
             prompt = ''
-        prompt += "* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}\n\n* Previous Action Result: {}".format(
+        prompt += "* Apps: {}\n\n* Current App: {}{}\n\n* App Info: {}\n\n{}* Previous Action Result: {}".format(
             app_str.strip(),
             obs["cur_window_id"].strip() if obs["cur_window_id"] in app_str else "None",
             '\n\n* A11y Tree: {}'.format(tree.strip()) if self.with_atree else "",
             app_info,
+            failure_hint_text,
             last_result if last_result else "None",
         ) + (
             "\n\n" + func_def_prompt if not self.tool_in_sys_msg else ""
         )
 
-        if self.recovery_mode:
-            prompt += "\n\n" + RECOVERY_MODE_PROMPT
         content = [{"type": "text", "text": prompt}]
         if self.with_image and obs.get('screenshot'):
             screenshot = resize_image(obs['screenshot'], self.image_size[0], self.image_size[1])
@@ -458,15 +547,57 @@ class AutoGLMAgent:
 
         return messages
 
+    def _fix_no_code_response(self, response: str, obs: Dict) -> str:
+        setup_prompt, func_def_prompt, note_prompt = Prompt.construct_procedural_memory(
+            Agent, app_name=None, client_password=self.client_password, with_image=self.with_image, with_atree=self.with_atree, relative_coordinate=self.relative_coordinate, glm41v_format=self.glm41v_format
+        )
+        system_message = setup_prompt + "\n\n" + func_def_prompt + "\n\n" + note_prompt
+        system_message += (
+            "\n\nOnly the action code line will be executed; all other text is ignored. "
+            "Fix the action code only and keep the original intent. Output a single-line action code without explanation."
+        )
+
+        content = [{"type": "text", "text": response or ""}]
+        if self.with_image and obs.get("screenshot"):
+            screenshot = resize_image(obs["screenshot"], self.image_size[0], self.image_size[1])
+            content = [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64encode(screenshot).decode('utf-8')}",
+                        "detail": "high",
+                    },
+                }
+            ] + content
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": content},
+        ]
+        fixed = self.gen_func(messages)
+        return fixed if isinstance(fixed, str) else str(fixed)
+
     def execute(self, response, obs):
         self.last_parse_error = None  # Reset error before each attempt
         try:
             action, thought = extract_action_and_thought(response)
+            if action:
+                action = self._sanitize_action_code(action)
+            self.last_pseudo_action = action
             if action is None:
+                if self.visual_grounder_model is not None and obs.get("screenshot"):
+                    desc = (thought or response or "").strip()
+                    if not desc:
+                        raise ValueError("No action code found in response")
+                    grounded_action = self._ground_action(desc, obs["screenshot"])
+                    actions = [grounded_action]
+                    logger.info(f"The thought is: {thought}")
+                    logger.info(f"The pseudo action is: {action}")
+                    logger.info(f"The grounded action is: {actions[0]}")
+                    return actions
                 raise ValueError("No action code found in response")
             
-            logger.info(f"The pesudo action is: {action}")
             logger.info(f"The thought is: {thought}")
+            logger.info(f"The pseudo action is: {action}")
 
             if action in ["WAIT", "DONE", "FAIL"]:
                 actions = [action]
@@ -493,7 +624,8 @@ class AutoGLMAgent:
                 ]
             else:
                 actions = Agent.tool_commands(action, obs["cur_app"].strip().replace("-", "_").lower())
-                logger.info(f"The grounded action is {actions[0]}")
+            if actions:
+                logger.info(f"The grounded action is: {actions[0]}")
         except Exception as e:
             self.last_parse_error = str(e)  # Store error message for retry feedback
             logger.error(f"Failed to parse action from response: {e}")
@@ -529,18 +661,25 @@ class AutoGLMAgent:
         actions = []
         parse_error_msg = None
         
-        # Retry loop for parsing errors
+        # Retry loop for parsing errors (first try normal; retries are fix-only, no task/history context)
         for attempt in range(self.max_parse_retries):
-            # Add error feedback if this is a retry
-            if attempt > 0 and self.last_error_feedback:
-                logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries} due to parsing error")
-                retry_messages = messages.copy()
-                retry_messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": self.last_error_feedback}]
-                })
-            else:
+            if attempt == 0:
                 retry_messages = messages
+            else:
+                logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries} due to parsing error")
+                retry_messages = [
+                    {
+                        "role": "system",
+                        "content": "Fix the response to a valid action code.",
+                    },
+                    {
+                        "role": "user",
+                        "content": FIX_RESPONSE_PROMPT.format(
+                            error_message=self.last_parse_error or "Failed to parse action from response",
+                            response=response or ""
+                        ),
+                    },
+                ]
             
             # Call gen_func with network retry
             for _ in range(3):
@@ -560,6 +699,18 @@ class AutoGLMAgent:
             if action_probe is None:
                 self.last_parse_error = "No action code in response"
                 actions = []
+                # try:
+                #     response = self._fix_no_code_response(response or "", obs)
+                # except Exception as e:
+                #     self.last_parse_error = f"No action code in response; fix failed: {e}"
+                #     actions = []
+                # else:
+                #     action_probe, _ = extract_action_and_thought(response or "")
+                #     if action_probe is None:
+                #         self.last_parse_error = "No action code in response"
+                #         actions = []
+                #     else:
+                #         actions = self.execute(response, obs)
             else:
                 # Try to execute/parse the response
                 actions = self.execute(response, obs)
@@ -571,26 +722,13 @@ class AutoGLMAgent:
                 self.parse_fail_streak = 0
                 break
             else:
-                # Parsing failed, use stored error or generic message
+                # Parsing failed, update error and continue fix-only retry
                 parse_error_msg = self.last_parse_error or "Failed to parse action from response"
                 logger.error(f"Action parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {parse_error_msg}")
-                # If not last attempt, set error feedback for retry
-                if attempt < self.max_parse_retries - 1:
-                    self.last_error_feedback = FIX_RESPONSE_PROMPT.format(
-                        error_message=parse_error_msg,
-                        response=response
-                    )
-                else:
-                    # Last attempt failed, mark task as FAIL
+                if attempt >= self.max_parse_retries - 1:
                     logger.error("All retry attempts exhausted, cannot parse valid action. Triggering fallback action.")
-                    self.last_error_feedback = None
                     self.parse_fail_streak += 1
-                    if self.recovery_mode:
-                        actions = ["RESET"]
-                    elif self.parse_fail_streak >= self.max_parse_retries:
-                        actions = ["FAIL"]
-                    else:
-                        actions = ["ROLLBACK"]
+                    actions = ["RESTART"]
 
         # update the contents
         self.contents.append(
@@ -609,7 +747,23 @@ class AutoGLMAgent:
         global logger
         logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
 
+        # New task should start from a clean state with no cross-task memory.
         self.contents = []
         self.last_error_feedback = None
         self.last_parse_error = None
         self.parse_fail_streak = 0
+        self.failure_memory = []
+        self.failure_sequences = []
+        self.failure_hints = []
+        self.last_pseudo_action = None
+
+    def reset_for_restart(self, _logger=None):
+        global logger
+        logger = _logger if _logger is not None else logging.getLogger("desktopenv.aguvis_agent")
+
+        # Keep failure memory across restarts in the same task for replanning.
+        self.contents = []
+        self.last_error_feedback = None
+        self.last_parse_error = None
+        self.parse_fail_streak = 0
+        self.last_pseudo_action = None

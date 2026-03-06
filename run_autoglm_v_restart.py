@@ -14,22 +14,457 @@ from tqdm import tqdm
 import shutil
 import textwrap
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
-from mm_agents.autoglm_v_recovery import AutoGLMAgent
-from mm_agents.hisa.llm import AbstractLLM
+from mm_agents.autoglm_v_restart import AutoGLMAgent
+from mm_agents.autoglm_v_restart.llm import AbstractLLM
 from typing import Optional, Dict, Any
 from utils import summary, setup_logger
 import datetime
 import json
 import logging
 import os
+import re
 import time
 from wrapt_timeout_decorator import *
-
-logger = logging.getLogger("desktopenv.experiment")
 
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
 logger = None  # Will be initialized in main
+
+FAILURE_SUMMARY_PROMPT = "You are a strict failure analyst. Summarize failure causes based on all history. Output 3-6 concise bullet points."
+
+
+def config() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
+
+    # environment config
+    parser.add_argument("--path_to_vm", type=str)
+    parser.add_argument(
+        "--provider_name",
+        type=str,
+        default="docker",
+        help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
+    )
+    parser.add_argument("--headless", action="store_true", default=True, help="Run in headless machine")
+    parser.add_argument("--action_space", type=str, default="autoglm_computer_use", help="Action type")
+    parser.add_argument(
+        "--observation_type",
+        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
+        default="a11y_tree",
+        help="Observation type",
+    )# NOTE: Only supports "a11y_tree" and actually uses screenshot (with_image=True, with_atree=False)
+    parser.add_argument("--screen_width", type=int, default=1280) #1920
+    parser.add_argument("--screen_height", type=int, default=720) #1080
+    parser.add_argument("--sleep_after_execution", type=float, default=1.0)
+    parser.add_argument("--max_steps", type=int, default=50)
+
+    # agent config
+    parser.add_argument("--max_trajectory_length", type=int, default=3)
+    parser.add_argument("--test_config_base_dir", type=str, default="evaluation_examples/examples")
+
+    # lm config
+    parser.add_argument("--model", type=str, default="autoglm-os")
+    parser.add_argument("--temperature", type=float, default=0.2) # original: 0.2
+    parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
+    parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
+    parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
+    parser.add_argument("--summary_temperature", type=float, default=0.5)
+    parser.add_argument("--summary_top_p", type=float, default=1.0)
+    parser.add_argument("--summary_max_tokens", type=int, default=512)
+    parser.add_argument("--summary_repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--stop_token", type=str, default=None)
+    parser.add_argument("--visual_grounder_model", type=str, default="autoglm-os",
+                        help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
+    parser.add_argument("--image_width", type=int, default=1280)
+    parser.add_argument("--image_height", type=int, default=720)
+    parser.add_argument("--max_restart", type=int, default=1, help="Max environment restarts allowed per task")
+    parser.add_argument("--max_restart_failure_memory", type=int, default=8, help="Max failure items kept for replanning")
+    parser.add_argument(
+        "--repeat_trigger_count",
+        type=int,
+        default=3,
+        help="Repeat count threshold before auto-restart (count of consecutive repeats)",
+    )
+
+    # example config
+    parser.add_argument("--domain", type=str, default="all")
+    parser.add_argument("--test_all_meta_path", type=str, default="evaluation_examples/test_nogdrive.json")
+
+    # aws config
+    parser.add_argument(
+        "--region", type=str, default="us-east-1", help="AWS region for the VM"
+    )
+    parser.add_argument(
+        "--client_password", type=str, default="", help="Client password"
+    )
+
+    # logging related
+    parser.add_argument("--result_dir", type=str, default="./results")
+    parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
+    
+    # rerun related
+    parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
+    parser.add_argument("--rerun_fail", action="store_true", help="Rerun only failed tasks (score == 0)")
+    
+    args = parser.parse_args()
+
+    return args
+
+
+def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalty):
+    data = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+        "skip_special_tokens": False,
+        "stream": False,
+        "include_stop_str_in_output": True,
+        "stop": ["<|user|>", "<|observation|>", "</answer>"],
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}",
+    }
+
+    base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
+    url = f"{base_url}/chat/completions"
+
+    response = requests.post(
+        url,
+        json=data,
+        headers=headers,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+
+    result = response.json()
+    content = result['choices'][0]['message']['content']
+    usage = result.get('usage', {})
+
+    return {
+        'content': content,
+        'usage': {
+            'prompt_tokens': usage.get('prompt_tokens', 0),
+            'completion_tokens': usage.get('completion_tokens', 0),
+            'total_tokens': usage.get('total_tokens', 0),
+        }
+    }
+
+def _normalize_exe_result(obs):
+    exe_result = obs.get("exe_result", "") if isinstance(obs, dict) else ""
+    if isinstance(exe_result, bytes):
+        exe_result = exe_result.decode("utf-8", errors="replace")
+    return str(exe_result)
+
+def _is_tool_action(action):
+    if not isinstance(action, str):
+        return False
+    if "Tools." in action:
+        return True
+    if action.strip().startswith("from ") and "Tools." in action:
+        return True
+    return False
+
+def _is_execution_error(exe_result, info, action):
+    if _is_tool_action(action):
+        return False
+    if info and info.get("fail", False):
+        return True
+    if not exe_result:
+        return False
+    lower = exe_result.lower()
+    error_markers = [
+        "error",
+        "exception",
+        "traceback",
+        "failed to execute",
+        "no such file",
+        "not found",
+        "permission denied",
+        "invalid",
+    ]
+    return any(marker in lower for marker in error_markers)
+
+def _is_escape_syntax_error(exe_result):
+    if not exe_result:
+        return False
+    return "SyntaxError: unexpected character after line continuation character" in exe_result
+
+def _apply_auto_fix(action):
+    if not isinstance(action, str):
+        return action
+    fixed = action
+    for _ in range(2):
+        fixed = fixed.replace("\\\\'", "\\'")
+        fixed = fixed.replace("\\\\\"", "\\\"")
+        fixed = fixed.replace("\\\\n", "\\n")
+        fixed = fixed.replace("\\\\t", "\\t")
+        fixed = fixed.replace("\\\\r", "\\r")
+    fixed = fixed.replace("\\'", "'")
+    fixed = fixed.replace("\\\"", "\"")
+    fixed = fixed.replace("r'\\\\s", "r'\\s")
+    fixed = fixed.replace('r\"\\\\s', 'r\"\\s')
+    fixed = fixed.replace("r'\\\\.", "r'\\.")
+    fixed = fixed.replace('r\"\\\\.', 'r\"\\.')
+    fixed = fixed.replace("r'\\\\d", "r'\\d")
+    fixed = fixed.replace('r\"\\\\d', 'r\"\\d')
+    fixed = fixed.replace("r'\\\\w", "r'\\w")
+    fixed = fixed.replace('r\"\\\\w', 'r\"\\w')
+    return fixed
+
+def _action_signature(action):
+    if isinstance(action, dict):
+        try:
+            return json.dumps(action, sort_keys=True)
+        except Exception:
+            return str(action)
+    if isinstance(action, str):
+        try:
+            node = ast.parse(action)
+            if len(node.body) == 1 and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Call):
+                call = node.body[0].value
+                if isinstance(call.func, ast.Attribute):
+                    func_base = call.func.value.id if isinstance(call.func.value, ast.Name) else ast.dump(call.func.value)
+                    func_name = f"{func_base}.{call.func.attr}"
+                elif isinstance(call.func, ast.Name):
+                    func_name = call.func.id
+                else:
+                    func_name = ast.dump(call.func)
+                args = []
+                for arg in call.args:
+                    try:
+                        args.append(ast.literal_eval(arg))
+                    except Exception:
+                        args.append(ast.dump(arg))
+                kwargs = {}
+                for kw in call.keywords:
+                    key = kw.arg if kw.arg is not None else "*"
+                    try:
+                        kwargs[key] = ast.literal_eval(kw.value)
+                    except Exception:
+                        kwargs[key] = ast.dump(kw.value)
+                if func_name.startswith("Agent."):
+                    sig = {
+                        "click": ["coordinate", "num_clicks", "button_type"],
+                        "type": ["coordinate", "text", "overwrite", "enter"],
+                        "scroll": ["coordinate", "direction"],
+                        "drag_and_drop": ["drag_from_coordinate", "drop_on_coordinate"],
+                        "hotkey": ["keys"],
+                        "open_app": ["app_name"],
+                        "switch_window": ["window_id"],
+                        "quote": ["content"],
+                        "exit": ["success"],
+                        "restart": [],
+                        "wait": [],
+                    }.get(call.func.attr, [])
+                    for idx, val in enumerate(args):
+                        if idx < len(sig) and sig[idx] not in kwargs:
+                            kwargs[sig[idx]] = val
+                    args = []
+                return json.dumps({"func": func_name, "args": args, "kwargs": kwargs}, sort_keys=True)
+        except Exception:
+            pass
+        return re.sub(r"\s+", "", action)
+    return str(action)
+
+def _extract_type_text(action):
+    if isinstance(action, dict):
+        if action.get("type") == "type" and "text" in action:
+            return action["text"]
+        kwargs = action.get("kwargs")
+        if isinstance(kwargs, dict) and "text" in kwargs:
+            return kwargs["text"]
+        return None
+    if not isinstance(action, str):
+        return None
+    try:
+        node = ast.parse(action)
+        if (
+            len(node.body) == 1
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Call)
+        ):
+            call = node.body[0].value
+            if isinstance(call.func, ast.Attribute) and call.func.attr == "type":
+                for kw in call.keywords:
+                    if kw.arg == "text":
+                        try:
+                            return ast.literal_eval(kw.value)
+                        except Exception:
+                            return ast.dump(kw.value)
+                if len(call.args) >= 2:
+                    try:
+                        return ast.literal_eval(call.args[1])
+                    except Exception:
+                        return ast.dump(call.args[1])
+    except Exception:
+        pass
+    match = re.search(r"pyautogui\.write\((.+?)\)", action)
+    if match:
+        raw = match.group(1)
+        try:
+            return ast.literal_eval(raw)
+        except Exception:
+            return raw
+    return None
+
+def _extract_click_coordinate(action):
+    if isinstance(action, dict):
+        if action.get("type") == "click":
+            x = action.get("x")
+            y = action.get("y")
+            if x is not None and y is not None:
+                return [x, y]
+        params = action.get("parameters")
+        if isinstance(params, dict):
+            x = params.get("x")
+            y = params.get("y")
+            if x is not None and y is not None:
+                return [x, y]
+        return None
+    if not isinstance(action, str):
+        return None
+    try:
+        node = ast.parse(action)
+        if (
+            len(node.body) == 1
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Call)
+        ):
+            call = node.body[0].value
+            if isinstance(call.func, ast.Attribute) and call.func.attr in ("click", "doubleClick"):
+                if len(call.args) >= 2:
+                    try:
+                        return [ast.literal_eval(call.args[0]), ast.literal_eval(call.args[1])]
+                    except Exception:
+                        return None
+                kw_map = {}
+                for kw in call.keywords:
+                    if kw.arg in ("x", "y"):
+                        try:
+                            kw_map[kw.arg] = ast.literal_eval(kw.value)
+                        except Exception:
+                            return None
+                if "x" in kw_map and "y" in kw_map:
+                    return [kw_map["x"], kw_map["y"]]
+    except Exception:
+        pass
+    match = re.search(r"pyautogui\.click\((.+?)\)", action)
+    if match:
+        args_str = match.group(1)
+        parts = [p.strip() for p in args_str.split(",")]
+        if len(parts) >= 2 and "x=" not in parts[0] and "y=" not in parts[1]:
+            try:
+                return [ast.literal_eval(parts[0]), ast.literal_eval(parts[1])]
+            except Exception:
+                return None
+    match = re.search(r"x\s*=\s*([-\d.]+).*?y\s*=\s*([-\d.]+)", action)
+    if match:
+        try:
+            return [ast.literal_eval(match.group(1)), ast.literal_eval(match.group(2))]
+        except Exception:
+            return None
+    return None
+
+def _repeat_signature(action, pseudo_action):
+    if isinstance(pseudo_action, str):
+        signature = _action_signature(pseudo_action)
+        coordinate = _extract_click_coordinate(pseudo_action)
+        if coordinate is None:
+            coordinate = _extract_click_coordinate(action)
+        if coordinate is not None:
+            try:
+                parsed = json.loads(signature)
+                if isinstance(parsed, dict):
+                    func = parsed.get("func", "")
+                    if func.endswith(".click") or func == "click":
+                        parsed.setdefault("kwargs", {})
+                        if "coordinate" not in parsed["kwargs"]:
+                            parsed["kwargs"]["coordinate"] = coordinate
+                            return json.dumps(parsed, sort_keys=True)
+            except Exception:
+                return f"{signature}|coordinate={coordinate!r}"
+        return signature
+    return _action_signature(action)
+
+def _format_branch_tree(branch_parents):
+    lines = ["Branch Tree:"]
+    children = {}
+    for child, parent in branch_parents.items():
+        children.setdefault(parent, []).append(child)
+    for node in children:
+        children[node].sort()
+    stack = [(None, 0, 0)]
+    while stack:
+        node, indent, idx = stack.pop()
+        childs = children.get(node, [])
+        if idx < len(childs):
+            child = childs[idx]
+            stack.append((node, indent, idx + 1))
+            lines.append(f"{'  ' * indent}- branch {child} (parent {node})")
+            stack.append((child, indent + 1, 0))
+    return "\n".join(lines)
+
+def _record_failure_sequence(seq, reason, start_index, end_index, branch_id, branch_parents, failure_sequences, agent):
+    if not seq:
+        return
+    meta = {
+        "branch_id": branch_id,
+        "parent_branch_id": branch_parents.get(branch_id),
+        "start_index": start_index,
+        "end_index": end_index,
+        "reason": reason,
+    }
+    item = {"sequence": [str(a) for a in seq], "meta": meta}
+    failure_sequences.append(item)
+    if hasattr(agent, "record_failure_sequence"):
+        agent.record_failure_sequence(item)
+
+def _summarize_failures_with_llm(agent, action_history_full, instruction, logger, args):
+    if not hasattr(agent, "add_failure_hint") or agent.gen_func is None:
+        return
+    mem = agent._format_failure_memory() if hasattr(agent, "_format_failure_memory") else ""
+    seq = agent._format_failure_sequences() if hasattr(agent, "_format_failure_sequences") else ""
+    history_lines = []
+    for idx, item in enumerate(action_history_full, start=1):
+        history_lines.append(f"{idx}. {item}")
+    history_text = "\n".join(history_lines) if history_lines else "None"
+    if not mem and not seq and history_text == "None":
+        return
+    user_prompt = (
+        f"instruction:\n{instruction}\n\n"
+        f"failure memory:\n{mem or 'none'}\n\n"
+        f"failure sequences:\n{seq or 'none'}\n\n"
+        f"action history:\n{history_text}\n"
+    )
+    try:
+        response = _call_llm(
+            [
+                {"role": "system", "content": FAILURE_SUMMARY_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=args.model,
+            temperature=args.summary_temperature,
+            top_p=args.summary_top_p,
+            max_tokens=args.summary_max_tokens,
+            repetition_penalty=args.summary_repetition_penalty,
+        )["content"]
+    except Exception as exc:
+        logger.warning("Failure summary LLM call failed: %s", exc)
+        return
+    if not isinstance(response, str):
+        response = str(response)
+    summary = response.strip()
+    summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.DOTALL | re.IGNORECASE)
+    summary = re.sub(r"<answer>.*?</answer>", "", summary, flags=re.DOTALL | re.IGNORECASE)
+    summary = summary.replace("```", "").strip()
+    if not summary:
+        return
+    agent.add_failure_hint(summary)
+
 
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
     script = textwrap.dedent(f"""
@@ -82,76 +517,6 @@ def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) 
         raise SystemExit(
             f"VM resolution mismatch: got {size.get('width')}x{size.get('height')}, expected {width}x{height}"
         )
-
-def config() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
-
-    # environment config
-    parser.add_argument("--path_to_vm", type=str)
-    parser.add_argument(
-        "--provider_name",
-        type=str,
-        default="docker",
-        help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
-    )
-    parser.add_argument("--headless", action="store_true", default=True, help="Run in headless machine")
-    parser.add_argument("--action_space", type=str, default="autoglm_computer_use", help="Action type")
-    parser.add_argument(
-        "--observation_type",
-        choices=["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"],
-        default="a11y_tree",
-        help="Observation type",
-    )# NOTE: Only supports "a11y_tree" and actually uses screenshot (with_image=True, with_atree=False)
-    parser.add_argument("--screen_width", type=int, default=1280) #1920
-    parser.add_argument("--screen_height", type=int, default=720) #1080
-    parser.add_argument("--sleep_after_execution", type=float, default=1.0)
-    parser.add_argument("--max_steps", type=int, default=50)
-
-    # agent config
-    parser.add_argument("--max_trajectory_length", type=int, default=3)
-    parser.add_argument("--test_config_base_dir", type=str, default="evaluation_examples/examples")
-
-    # lm config
-    parser.add_argument("--model", type=str, default="autoglm-os")
-    parser.add_argument("--temperature", type=float, default=0.2) # original: 0.2
-    parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
-    parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
-    parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
-    parser.add_argument("--stop_token", type=str, default=None)
-    parser.add_argument("--visual_grounder_model", type=str, default="autoglm-os",
-                        help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
-    parser.add_argument("--image_width", type=int, default=1280)
-    parser.add_argument("--image_height", type=int, default=720)
-    parser.add_argument("--recovery", action="store_true", default=True, help="Enable recovery/rollback mode")
-    parser.add_argument("--recovery_max_resets", type=int, default=1, help="Max environment resets allowed per task")
-    parser.add_argument("--recovery_max_steps", type=int, default=5, help="Max recovery steps before auto-reset")
-    parser.add_argument("--recovery_max_failure_memory", type=int, default=8, help="Max failure items kept for replanning")
-    parser.add_argument("--recovery_debug_force", action="store_true", help="Force recovery mode from the first step (debug)")
-
-    # example config
-    parser.add_argument("--domain", type=str, default="all")
-    parser.add_argument("--test_all_meta_path", type=str, default="evaluation_examples/test_nogdrive.json")
-
-    # aws config
-    parser.add_argument(
-        "--region", type=str, default="us-east-1", help="AWS region for the VM"
-    )
-    parser.add_argument(
-        "--client_password", type=str, default="", help="Client password"
-    )
-
-    # logging related
-    parser.add_argument("--result_dir", type=str, default="./results")
-    parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
-    
-    # rerun related
-    parser.add_argument("--rerun", action="store_true", help="Rerun all tasks (ignore existing results)")
-    parser.add_argument("--rerun_fail", action="store_true", help="Rerun only failed tasks (score == 0)")
-    
-    args = parser.parse_args()
-
-    return args
-
 
 class DesktopEnv(DesktopEnvBase):
     def step(self, action, pause=2):
@@ -263,9 +628,9 @@ class DesktopEnv(DesktopEnvBase):
             
         logger.info("Environment setup complete.")
 
-        # Upload tools from autoglm_v_recovery package
-        import mm_agents.autoglm_v_recovery
-        tool_dir = os.path.join(os.path.dirname(mm_agents.autoglm_v_recovery.__file__), 'tools', 'package')
+        # Upload tools from autoglm_v_restart package
+        import mm_agents.autoglm_v_restart
+        tool_dir = os.path.join(os.path.dirname(mm_agents.autoglm_v_restart.__file__), 'tools', 'package')
         for file in os.listdir(tool_dir):
             if os.path.isdir(os.path.join(tool_dir, file)):
                 continue
@@ -408,59 +773,25 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "max_tokens": args.max_tokens,
         "stop_token": args.stop_token,
         "repetition_penalty": args.repetition_penalty,
+        "summary_temperature": args.summary_temperature,
+        "summary_top_p": args.summary_top_p,
+        "summary_max_tokens": args.summary_max_tokens,
+        "summary_repetition_penalty": args.summary_repetition_penalty,
         "result_dir": args.result_dir,
     }
 
     def call_llm(messages):
         logger.info("Calling LLM...")
-        
-        # Prepare the request data
-        data = {
-            "model": args.model,
-            "messages": messages,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "repetition_penalty": args.repetition_penalty,
-            "skip_special_tokens": False,
-            "stream": False,
-            "include_stop_str_in_output": True,
-            "stop": ["<|user|>", "<|observation|>", "</answer>"]
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
-        }
-        
-        # Get API base URL from environment or use default
-        base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
-        url = f"{base_url}/chat/completions"
-        
-        response = requests.post(
-            url,
-            json=data,
-            headers=headers,
-            timeout=60.0
+        result = _call_llm(
+            messages,
+            model=args.model,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_tokens,
+            repetition_penalty=args.repetition_penalty,
         )
-        response.raise_for_status()
-        
-        result = response.json()
         logger.info("LLM called successfully.")
-        
-        # Return both content and usage information
-        content = result['choices'][0]['message']['content']
-        
-        usage = result.get('usage', {})
-        
-        return {
-            'content': content,
-            'usage': {
-                'prompt_tokens': usage.get('prompt_tokens', 0),
-                'completion_tokens': usage.get('completion_tokens', 0),
-                'total_tokens': usage.get('total_tokens', 0)
-            }
-        }
+        return result
 
     # Create a wrapper to track token usage and image count
     class TokenTracker:
@@ -532,12 +863,11 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         max_trajectory_length=args.max_trajectory_length,
         client_password=args.client_password,
         gen_func=token_tracker,
-        enable_recovery=args.recovery,
-        max_failure_memory=args.recovery_max_failure_memory,
+        max_failure_memory=args.max_restart_failure_memory,
         visual_grounder_model=visual_grounder_model,
     )
     
-    # Attach token_tracker to agent for access in run_single_example_autoglm
+    # Attach token_tracker to agent for access in run_single_example
     agent.token_tracker = token_tracker
 
     for domain in tqdm(test_all_meta, desc="Domain"):
@@ -569,7 +899,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             os.makedirs(example_result_dir, exist_ok=True)
             # example start running
             try:
-                run_single_example_autoglm(
+                run_single_example(
                     agent,
                     env,
                     example,
@@ -600,8 +930,6 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
 
 
 def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, logger=None):
-    """Get unfinished tasks (aligned with run_hisa.filter_tasks logic)."""
-
     if not os.path.exists(target_dir):
         return total_file_json
 
@@ -636,53 +964,10 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, l
     tasks_to_run = {k: v for k, v in tasks_to_run.items() if v}
     return tasks_to_run
 
-
-def run_single_example(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
-    runtime_logger = setup_logger(os.path.basename(args.result_dir), getattr(args, "log_level", "INFO"))
-    try:
-        agent.reset(runtime_logger)
-    except Exception as e:
-        agent.reset()
-
-    env.reset(task_config=example)
-    
-    time.sleep(60) # Wait for the environment to be ready
-    obs = env._get_obs() # Get the initial observation
-    done = False
-    step_idx = 0
-    env.controller.start_recording()
-    while not done and step_idx < max_steps:
-        response, actions = agent.predict(
-            instruction,
-            obs
-        )
-        for action in actions:
-            original_action = action
-            # Capture the timestamp before executing the action
-            action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
-            logger.info("Step %d: %s", step_idx + 1, action)
-            obs, reward, done, info = env.step(action, args.sleep_after_execution)
-
-            logger.info("Reward: %.2f", reward)
-            logger.info("Done: %s", done)
-            # Save screenshot and trajectory information
-            with open(os.path.join(example_result_dir, f"step_{step_idx + 1}_{action_timestamp}.png"),
-                      "wb") as _f:
-                _f.write(obs['screenshot'])
-            if done:
-                logger.info("The episode is done.")
-                break
-        step_idx += 1
-    result = env.evaluate()
-    logger.info("Result: %.2f", result)
-    scores.append(result)
-    with open(os.path.join(example_result_dir, "result.txt"), "w", encoding="utf-8") as f:
-        f.write(f"{result}\n")
-    env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
-
 def run_single_example_human(env, example, example_result_dir, scores):
     runtime_logger = setup_logger(os.path.basename(example_result_dir), "INFO")
     env.reset(task_config=example)
+    _ensure_vm_resolution(env, env.screen_width, env.screen_height, runtime_logger)
     time.sleep(60) # Wait for the environment to be ready
     obs = env._get_obs() # Get the initial observation
     
@@ -698,7 +983,7 @@ def run_single_example_human(env, example, example_result_dir, scores):
     with open(os.path.join(example_result_dir, "result.txt"), "w", encoding="utf-8") as f:
         f.write(f"{result}\n")
 
-def run_single_example_autoglm(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
+def run_single_example(agent, env, example, max_steps, instruction, args, example_result_dir, scores):
     runtime_logger = setup_logger(os.path.basename(args.result_dir), getattr(args, "log_level", "INFO"))
     try:
         agent.reset(runtime_logger)
@@ -713,199 +998,31 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
         agent.token_tracker.reset()
     
     env.reset(task_config=example)
+    _ensure_vm_resolution(env, args.screen_width, args.screen_height, runtime_logger)
     
     time.sleep(60) # Wait for the environment to be ready
     obs = env._get_obs() # Get the initial observation
     done = False
     step_idx = 0
     action_logs = []  # Store action logs for execution_log
-    recovery_active = False
-    recovery_context = None
-    reset_count = 0
-    max_resets = getattr(args, "recovery_max_resets", 0)
-    recovery_steps = 0
-    max_recovery_steps = getattr(args, "recovery_max_steps", 0)
+    restart_count = 0
+    max_restarts = getattr(args, "max_restart", 0)
+    last_action_signature = None
+    repeat_count = 0
+    repeat_trigger_count = max(1, getattr(args, "repeat_trigger_count", 3))
+    parse_error_streak = 0
     action_history_full = []
     replay_index = 0
     failure_end_index = None
     failure_sequences = []
     branch_id = 0
     branch_parents = {0: None}
-    if getattr(args, "recovery_debug_force", False):
-        recovery_active = True
-        recovery_context = {"reason": "debug_force"}
-        logger.info("RECOVERY_DEBUG_FORCE: enter recovery mode at start")
     
-    # Create operations directory like hisa.py
     operations_dir = os.path.join(example_result_dir, "operations")
     os.makedirs(operations_dir, exist_ok=True)
     
     env.controller.start_recording()
-    def _normalize_exe_result(obs):
-        exe_result = obs.get("exe_result", "") if isinstance(obs, dict) else ""
-        if isinstance(exe_result, bytes):
-            exe_result = exe_result.decode("utf-8", errors="replace")
-        return str(exe_result)
-
-    def _is_tool_action(action):
-        if not isinstance(action, str):
-            return False
-        if "Tools." in action:
-            return True
-        if action.strip().startswith("from ") and "Tools." in action:
-            return True
-        return False
-
-    def _is_execution_error(exe_result, info, action):
-        if _is_tool_action(action):
-            return False
-        if info and info.get("fail", False):
-            return True
-        if not exe_result:
-            return False
-        lower = exe_result.lower()
-        error_markers = [
-            "error",
-            "exception",
-            "traceback",
-            "failed to execute",
-            "no such file",
-            "not found",
-            "permission denied",
-            "invalid",
-        ]
-        return any(marker in lower for marker in error_markers)
-
-    def _is_escape_syntax_error(exe_result):
-        if not exe_result:
-            return False
-        return "SyntaxError: unexpected character after line continuation character" in exe_result
-
-    def _apply_auto_fix(action):
-        if not isinstance(action, str):
-            return action
-        fixed = action
-        # unwrap common double-escaped sequences
-        for _ in range(2):
-            fixed = fixed.replace("\\\\'", "\\'")
-            fixed = fixed.replace("\\\\\"", "\\\"")
-            fixed = fixed.replace("\\\\n", "\\n")
-            fixed = fixed.replace("\\\\t", "\\t")
-            fixed = fixed.replace("\\\\r", "\\r")
-        # unescape quotes
-        fixed = fixed.replace("\\'", "'")
-        fixed = fixed.replace("\\\"", "\"")
-        # normalize regex raw string escapes
-        fixed = fixed.replace("r'\\\\s", "r'\\s")
-        fixed = fixed.replace('r\"\\\\s', 'r\"\\s')
-        fixed = fixed.replace("r'\\\\.", "r'\\.")
-        fixed = fixed.replace('r\"\\\\.', 'r\"\\.')
-        fixed = fixed.replace("r'\\\\d", "r'\\d")
-        fixed = fixed.replace('r\"\\\\d', 'r\"\\d')
-        fixed = fixed.replace("r'\\\\w", "r'\\w")
-        fixed = fixed.replace('r\"\\\\w', 'r\"\\w')
-        return fixed
-
-    def _format_branch_tree():
-        lines = ["Branch Tree:"]
-        children = {}
-        for child, parent in branch_parents.items():
-            children.setdefault(parent, []).append(child)
-        def _walk(node, indent):
-            for child in sorted(children.get(node, [])):
-                lines.append(f"{'  ' * indent}- branch {child} (parent {node})")
-                _walk(child, indent + 1)
-        _walk(None, 0)
-        return "\n".join(lines)
-
-    def _record_failure_sequence(seq, reason, start_index, end_index):
-        if not seq:
-            return
-        meta = {
-            "branch_id": branch_id,
-            "parent_branch_id": branch_parents.get(branch_id),
-            "start_index": start_index,
-            "end_index": end_index,
-            "reason": reason,
-        }
-        item = {"sequence": [str(a) for a in seq], "meta": meta}
-        failure_sequences.append(item)
-        if hasattr(agent, "record_failure_sequence"):
-            agent.record_failure_sequence(item)
-
-    def _replay_prefix():
-        nonlocal obs
-        if replay_index <= 0:
-            return
-        logger.info("REPLAY: start %d steps (branch %d)", replay_index, branch_id)
-        for idx, action in enumerate(action_history_full[:replay_index], start=1):
-            if isinstance(action, str) and action in ["WAIT", "DONE", "FAIL", "RESET", "ROLLBACK"]:
-                continue
-            logger.info("REPLAY: step %d/%d action=%s", idx, replay_index, str(action))
-            obs, _, _, _ = env.step(action, args.sleep_after_execution)
-            screenshot_file = f"replay_{idx}.png"
-            with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
-                _f.write(obs["screenshot"])
-            action_logs.append({
-                "step": step_idx + 1,
-                "type": "replay",
-                "execution_success": True,
-                "screenshot": screenshot_file,
-                "action": str(action),
-                "response": "",
-                "exe_result": f"Replay {idx}/{replay_index}",
-                "step_time": 0.0,
-                "token_usage": {},
-                "recovery_mode": True,
-                "branch_id": branch_id,
-                "branch_parent_id": branch_parents.get(branch_id),
-            })
     while not done and step_idx < max_steps:
-        if getattr(args, "recovery", False) and hasattr(agent, "set_recovery_mode"):
-            agent.set_recovery_mode(recovery_active, recovery_context)
-            if recovery_active and max_recovery_steps and recovery_steps >= max_recovery_steps:
-                recovery_steps = 0
-                if reset_count < max_resets:
-                    reset_count += 1
-                    logger.info("AUTO_RESET: recovery_steps exceeded, count %d/%d (branch %d)", reset_count, max_resets, branch_id)
-                    env.reset(task_config=example)
-                    time.sleep(60)
-                    obs = env._get_obs()
-                    recovery_active = False
-                    recovery_context = None
-                    failure_end_index = None
-                    if action_history_full and replay_index < len(action_history_full):
-                        _record_failure_sequence(
-                            action_history_full[replay_index:],
-                            "branch_abandoned",
-                            replay_index,
-                            len(action_history_full) - 1,
-                        )
-                        action_history_full = action_history_full[:replay_index]
-                    _replay_prefix()
-                    action_logs.append({
-                        "step": step_idx + 1,
-                        "type": "reset",
-                        "execution_success": True,
-                        "screenshot": "",
-                        "action": "AUTO_RESET",
-                        "response": "",
-                        "exe_result": f"Auto reset after recovery steps ({reset_count}/{max_resets})",
-                        "step_time": 0.0,
-                        "token_usage": {},
-                        "recovery_mode": True,
-                        "branch_id": branch_id,
-                        "branch_parent_id": branch_parents.get(branch_id),
-                    })
-                    continue
-                else:
-                    env.action_history.append("FAIL")
-                    done = True
-                    info = {"fail": True}
-                    logger.error("AUTO_RESET blocked: max resets exceeded")
-                    logger.error("Auto reset requested but max resets exceeded")
-                    break
-
         response, actions = agent.predict(
             instruction,
             obs
@@ -923,60 +1040,54 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             }
         
         for action in actions:
-            original_action = action
-            # Capture the timestamp before executing the action
-            action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
-            
+            restart_reason = None
             # Record step start time
             step_start_time = time.time()
 
-            if getattr(args, "recovery", False) and isinstance(action, str):
-                if recovery_active and action == "ROLLBACK":
-                    if reset_count < max_resets:
-                        action = "RESET"
+            if action != "WAIT":
+                pseudo_action = getattr(agent, "last_pseudo_action", None)
+                type_text = _extract_type_text(pseudo_action) or _extract_type_text(action)
+                is_type_action = type_text is not None
+                if is_type_action:
+                    repeat_count = 0
+                    last_action_signature = None
+                else:
+                    action_signature = _repeat_signature(action, pseudo_action)
+                    if action_signature == last_action_signature and action not in ["DONE", "FAIL", "RESTART"]:
+                        repeat_count += 1
                     else:
-                        action = "FAIL"
-                if action == "ROLLBACK":
-                    replay_index = max(0, replay_index - 1)
-                    recovery_steps += 1
-                    logger.info("ROLLBACK: replay_index -> %d (branch %d)", replay_index, branch_id)
-                    recovery_active = True
-                    recovery_context = {
-                        "reason": "parse_error",
-                        "action": str(original_action),
-                        "exe_result": "No action code in response",
-                    }
-                    obs = env._get_obs()
-                    if isinstance(obs, dict):
-                        obs["exe_result"] = "Response contains no action code. Triggering ROLLBACK without retry."
-                    screenshot_file = f"step_{step_idx + 1}_rollback.png"
-                    with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
-                        _f.write(obs["screenshot"])
-                    action_logs.append({
-                        "step": step_idx + 1,
-                        "type": "rollback",
-                        "execution_success": True,
-                        "screenshot": screenshot_file,
-                        "action": "ROLLBACK",
-                        "response": str(response) if response else "",
-                        "exe_result": f"Replay index -> {replay_index}",
-                        "step_time": round(time.time() - step_start_time, 2),
-                        "token_usage": step_usage,
-                        "recovery_mode": True,
-                        "branch_id": branch_id,
-                        "branch_parent_id": branch_parents.get(branch_id),
-                    })
-                    continue
-                if action == "RESET":
-                    if reset_count < max_resets:
-                        reset_count += 1
-                        logger.info("RESET: count %d/%d (branch %d)", reset_count, max_resets, branch_id)
+                        repeat_count = 0
+                    last_action_signature = action_signature
+                # type actions are excluded from repeat detection
+                if repeat_count >= repeat_trigger_count:
+                    action = "RESTART"
+                    restart_reason = "auto_repeat_action"
+
+            parse_error_streak = 0
+            if isinstance(action, str):
+                if action == "RESTART":
+                    if restart_count < max_restarts:
+                        if restart_reason:
+                            logger.info("RESTART_TRIGGER: %s", restart_reason)
+                        else:
+                            logger.info("RESTART_TRIGGER: agent_requested")
+                        _summarize_failures_with_llm(
+                            agent,
+                            action_history_full,
+                            instruction,
+                            logger,
+                            args,
+                        )
+                        restart_count += 1
+                        logger.info("RESTART: count %d/%d (branch %d)", restart_count, max_restarts, branch_id)
                         env.reset(task_config=example)
+                        _ensure_vm_resolution(env, args.screen_width, args.screen_height, logger)
                         time.sleep(60)
                         obs = env._get_obs()
-                        recovery_active = False
-                        recovery_context = None
-                        recovery_steps = 0
+                        if hasattr(agent, "reset_for_restart"):
+                            agent.reset_for_restart()
+                        last_action_signature = None
+                        repeat_count = 0
                         failure_end_index = None
                         if action_history_full and replay_index < len(action_history_full):
                             _record_failure_sequence(
@@ -984,23 +1095,28 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                                 "branch_abandoned",
                                 replay_index,
                                 len(action_history_full) - 1,
+                                branch_id,
+                                branch_parents,
+                                failure_sequences,
+                                agent,
                             )
                             action_history_full = action_history_full[:replay_index]
-                        _replay_prefix()
-                        screenshot_file = f"step_{step_idx + 1}_reset.png"
+                        action_history_full = []
+                        replay_index = 0
+                        screenshot_file = f"step_{step_idx + 1}_restart.png"
                         with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
                             _f.write(obs["screenshot"])
                         action_logs.append({
                             "step": step_idx + 1,
-                            "type": "reset",
+                            "type": "restart",
                             "execution_success": True,
                             "screenshot": screenshot_file,
-                            "action": "RESET",
+                            "action": "RESTART",
                             "response": str(response) if response else "",
-                            "exe_result": f"Environment reset ({reset_count}/{max_resets})",
+                            "exe_result": f"Environment restart ({restart_count}/{max_restarts})"
+                                           + (f"; reason={restart_reason}" if restart_reason else ""),
                             "step_time": round(time.time() - step_start_time, 2),
                             "token_usage": step_usage,
-                            "recovery_mode": True,
                             "branch_id": branch_id,
                             "branch_parent_id": branch_parents.get(branch_id),
                         })
@@ -1009,8 +1125,7 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                         env.action_history.append("FAIL")
                         done = True
                         info = {"fail": True}
-                        logger.error("RESET blocked: max resets exceeded")
-                        logger.error("RESET requested but max resets exceeded")
+                        logger.error("RESTART requested but max restarts exceeded")
                         break
             
             obs, reward, done, info = env.step(action, args.sleep_after_execution)
@@ -1021,7 +1136,7 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
             # Calculate step execution time
             step_time = time.time() - step_start_time
             
-            # Determine action type and create screenshot filename (hisa format)
+            # Determine action type and create screenshot filename
             if isinstance(action, dict):
                 # Dict actions like OPEN_APP, OPEN_CHROME_TAB
                 action_type = "gui_action"
@@ -1076,25 +1191,27 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                 "execution_success": reward >= 0 and not info.get("fail", False),
                 "screenshot": screenshot_file,
                 "action": str(action),
-                "action_original": str(original_action),
                 "response": response_str,  # Truncate long responses
                 "exe_result": str(exe_result) if exe_result else "",
                 "step_time": round(step_time, 2),
                 "token_usage": step_usage,
-                "recovery_mode": bool(recovery_active),
                 "branch_id": branch_id,
                 "branch_parent_id": branch_parents.get(branch_id),
                 "auto_fix_attempted": auto_fix_attempted,
                 "auto_fix_applied": auto_fix_applied,
             })
 
-            if not recovery_active and action_type not in ["done", "fail"]:
+            if action_type not in ["done", "fail"]:
                 if replay_index < len(action_history_full):
                     _record_failure_sequence(
                         action_history_full[replay_index:],
                         "branch_abandoned",
                         replay_index,
                         len(action_history_full) - 1,
+                        branch_id,
+                        branch_parents,
+                        failure_sequences,
+                        agent,
                     )
                     action_history_full = action_history_full[:replay_index]
                     new_branch_id = max(branch_parents.keys()) + 1
@@ -1103,20 +1220,12 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                 action_history_full.append(action if isinstance(action, (str, dict)) else str(action))
                 replay_index = len(action_history_full)
 
-            if getattr(args, "recovery", False) and _is_execution_error(exe_result, info, action):
-                recovery_active = True
-                recovery_steps = 0
+            if _is_execution_error(exe_result, info, action):
                 if action_history_full:
                     failure_end_index = len(action_history_full) - 1
                     replay_index = max(0, failure_end_index)
                 else:
                     replay_index = 0
-                recovery_context = {
-                    "reason": "execution_error",
-                    "action": str(action),
-                    "exe_result": exe_result,
-                    "app": obs.get("cur_app"),
-                }
                 if failure_end_index is not None:
                     failed_seq = action_history_full[replay_index:failure_end_index + 1]
                     _record_failure_sequence(
@@ -1124,12 +1233,19 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                         "failure",
                         replay_index,
                         failure_end_index,
+                        branch_id,
+                        branch_parents,
+                        failure_sequences,
+                        agent,
                     )
                 if hasattr(agent, "record_failure"):
-                    agent.record_failure(recovery_context)
+                    agent.record_failure({
+                        "reason": "execution_error",
+                        "action": str(action),
+                        "exe_result": exe_result,
+                        "app": obs.get("cur_app"),
+                    })
                 break
-            if recovery_active:
-                recovery_steps += 1
                 
             if done:
                 logger.info("The episode is done.")
@@ -1137,9 +1253,69 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
         
         # Invalid Action
         if not actions:
+            parse_error_streak += 1
+            if parse_error_streak > 2:
+                if restart_count < max_restarts:
+                    logger.info("RESTART_TRIGGER: auto_parse_error")
+                    _summarize_failures_with_llm(
+                        agent,
+                        action_history_full,
+                        instruction,
+                        logger,
+                        args,
+                    )
+                    restart_count += 1
+                    logger.info("RESTART: count %d/%d (branch %d)", restart_count, max_restarts, branch_id)
+                    env.reset(task_config=example)
+                    _ensure_vm_resolution(env, args.screen_width, args.screen_height, logger)
+                    time.sleep(60)
+                    obs = env._get_obs()
+                    if hasattr(agent, "reset_for_restart"):
+                        agent.reset_for_restart()
+                    last_action_signature = None
+                    repeat_count = 0
+                    parse_error_streak = 0
+                    failure_end_index = None
+                    if action_history_full and replay_index < len(action_history_full):
+                        _record_failure_sequence(
+                            action_history_full[replay_index:],
+                            "branch_abandoned",
+                            replay_index,
+                            len(action_history_full) - 1,
+                            branch_id,
+                            branch_parents,
+                            failure_sequences,
+                            agent,
+                        )
+                        action_history_full = action_history_full[:replay_index]
+                    action_history_full = []
+                    replay_index = 0
+                    screenshot_file = f"step_{step_idx + 1}_restart.png"
+                    with open(os.path.join(operations_dir, screenshot_file), "wb") as _f:
+                        _f.write(obs["screenshot"])
+                    action_logs.append({
+                        "step": step_idx + 1,
+                        "type": "restart",
+                        "execution_success": True,
+                        "screenshot": screenshot_file,
+                        "action": "RESTART",
+                        "response": str(response) if response else "",
+                        "exe_result": f"Environment restart ({restart_count}/{max_restarts}); reason=auto_parse_error",
+                        "step_time": 0.0,
+                        "token_usage": step_usage,
+                        "branch_id": branch_id,
+                        "branch_parent_id": branch_parents.get(branch_id),
+                    })
+                    step_idx += 1
+                    continue
+                else:
+                    env.action_history.append("FAIL")
+                    done = True
+                    info = {"fail": True}
+                    logger.error("RESTART requested but max restarts exceeded")
+                    break
             obs = env._get_obs() # update observation
             # Record this as an invalid action step
-            action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
             screenshot_file = f"step_{step_idx + 1}_invalid.png"
             
             # Save screenshot in operations directory only
@@ -1157,7 +1333,6 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
                 "exe_result": "Invalid action - no actions returned",
                 "step_time": 0.0,
                 "token_usage": step_usage,
-                "recovery_mode": bool(recovery_active),
                 "branch_id": branch_id,
                 "branch_parent_id": branch_parents.get(branch_id),
             })
@@ -1207,7 +1382,6 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
     if failure_reason:
         logger.error("FAILURE_REASON: %s", failure_reason)
     
-    # Create execution_log similar to hisa.py
     execution_log = {
         "statistics": {
             "score": result,
@@ -1233,14 +1407,13 @@ def run_single_example_autoglm(agent, env, example, max_steps, instruction, args
         "task_config": example,
         "additional_context": "",
         "action_logs": action_logs,
-        "recovery": {
-            "enabled": getattr(args, "recovery", False),
-            "reset_count": reset_count,
-            "max_resets": max_resets,
+        "restart": {
+            "restart_count": restart_count,
+            "max_restarts": max_restarts,
             "failure_memory": getattr(agent, "failure_memory", []),
             "failure_sequences": failure_sequences,
             "branch_parents": branch_parents,
-            "branch_summary_text": _format_branch_tree(),
+            "branch_summary_text": _format_branch_tree(branch_parents),
         },
     }
     
@@ -1299,6 +1472,4 @@ if __name__ == "__main__":
 
     test(args, test_file_list)
     
-    # Call summary() from utils.py after all tasks are completed
-    logger.info("Generating summary...")
     summary(args.result_dir, test_all_meta)

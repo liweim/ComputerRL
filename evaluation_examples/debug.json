@@ -1,5 +1,21 @@
 {
-    "libreoffice_impress": [
-        "550ce7e7-747b-495f-b122-acdc4d0b8e54"
+    "vs_code": [
+        "0ed39f63-6049-43d4-ba4d-5fa2fe04a951",
+        "276cc624-87ea-4f08-ab93-f770e3790175",
+        "53ad5833-3455-407b-bbc6-45b4c79ab8fb"
+    ],
+    "os": [
+        "5812b315-e7bd-4265-b51f-863c02174c28",
+        "5ea617a3-0e86-4ba6-aab2-dac9aa2e8d57"
+    ],
+    "vlc": [
+        "59f21cfb-0120-4326-b255-a5b827b38967",
+        "8f080098-ddb1-424c-b438-4e96e5e4786e"
+    ],
+    "multi_apps": [
+        "74d5859f-ed66-4d3e-aa0e-93d7a592ce41"
+    ],
+    "thunderbird": [
+        "dfac9ee8-9bc4-4cdc-b465-4a4bfcd2f397"
     ]
 }

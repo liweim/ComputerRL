@@ -131,6 +131,7 @@ note_prompt = """* Output Format:
 {format_hint}
 
 * Note:
+- Your thought should be wrapped in <think></think> within 100 words.
 - Your code should only be wrapped in ```python```.
 - Only **ONE-LINE-OF-CODE** at a time.
 - Each code block is context independent, and variables from the previous round cannot be used in the next round.
