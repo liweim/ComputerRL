@@ -14,6 +14,9 @@ from PIL import Image
 import cv2
 import re
 import math
+import json
+from pathlib import Path
+import pandas as pd
 
 
 def get_change_roi(
@@ -234,6 +237,57 @@ def setup_logger(result_name, log_level):
 
     logger = logging.getLogger("desktopenv")
     return logger
+
+
+def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, logger=None):
+    """
+    Return task ids that should be executed under ``target_dir``.
+
+    Behavior:
+    - missing ``execution_log.json`` => always rerun.
+    - ``rerun`` => rerun all tasks.
+    - ``rerun_fail`` => rerun only failed tasks (score <= 0.0).
+    - when a task is scheduled for rerun and ``rerun``/``rerun_fail`` is set,
+      stale ``result.txt`` is removed to avoid incorrect intermediate summary.
+    """
+    if not os.path.exists(target_dir):
+        return total_file_json
+
+    tasks_to_run = {}
+    for domain in total_file_json:
+        tasks_to_run[domain] = []
+        for example_id in total_file_json[domain]:
+            example_dir = os.path.join(target_dir, domain, example_id)
+            execution_log_path = os.path.join(example_dir, "execution_log.json")
+            result_path = os.path.join(example_dir, "result.txt")
+            err_reason_path = os.path.join(example_dir, "err_reason.txt")
+
+            missing_execution_log = not os.path.exists(execution_log_path)
+
+            should_skip = False
+            if not rerun and not missing_execution_log and os.path.exists(result_path) and not os.path.exists(err_reason_path):
+                try:
+                    with open(result_path, "r", encoding="utf-8") as f:
+                        result = float(f.read().strip())
+                    if result > 0.0 or not rerun_fail:
+                        should_skip = True
+                except (ValueError, IOError) as exc:
+                    if logger is not None:
+                        logger.warning(f"Failed to read result for {domain}/{example_id}: {exc}")
+                    else:
+                        print(f"[Warning] Failed to read result for {domain}/{example_id}: {exc}")
+
+            if not should_skip:
+                if (rerun or rerun_fail) and os.path.exists(result_path):
+                    try:
+                        os.remove(result_path)
+                    except OSError as exc:
+                        if logger is not None:
+                            logger.warning(f"Failed to remove stale result for {domain}/{example_id}: {exc}")
+                tasks_to_run[domain].append(example_id)
+
+    tasks_to_run = {k: v for k, v in tasks_to_run.items() if v}
+    return tasks_to_run
 
 
 def postprocess_action(action):
@@ -517,21 +571,9 @@ def summary(result_dir, test_all_meta):
     avg_steps = summary_stats['average']['steps']
     avg_execution_time = summary_stats['average']['execution_time']
     print(f"Total tasks: {total_tasks}, Left tasks: {left_tasks}, Error tasks: {error_tasks}")
-    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.3f}\t{avg_score_50:.3f}\t{avg_cost:.3f}\t{avg_total_tokens:.3f}\t{avg_prompt_tokens:.3f}\t{avg_completion_tokens:.3f}\t{avg_steps:.3f}\t{avg_execution_time:.3f}")
+    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.2f}\t{avg_score_50:.2f}\t{avg_cost:.2f}\t{avg_total_tokens:.2f}\t{avg_prompt_tokens:.2f}\t{avg_completion_tokens:.2f}\t{avg_steps:.2f}\t{avg_execution_time:.2f}")
 
     return detailed_stats
-
-import json
-from pathlib import Path
-
-import pandas as pd
-
-RESULTS_ROOT = Path("/data1/lwm/projects/ComputerRL/results")
-RUNS = {
-    "autoglm-os_baseline": RESULTS_ROOT / "autoglm-os_baseline",
-    "autoglm-os_gta1_7b_restart": RESULTS_ROOT / "autoglm-os_gta1_7b_restart",
-}
-
 
 def extract_failure_reason(obj):
     logs = obj.get("action_logs") or []
@@ -581,6 +623,11 @@ def load_run(run_path):
 
 
 def compare_results():
+    RESULTS_ROOT = Path("/data1/lwm/projects/ComputerRL/results")
+    RUNS = {
+        "autoglm-os_baseline": RESULTS_ROOT / "autoglm-os_baseline",
+        "autoglm-os_gta1_7b_restart": RESULTS_ROOT / "autoglm-os_gta1_7b_restart",
+    }
     run_data = {name: load_run(path) for name, path in RUNS.items()}
 
     example_ids = set()
@@ -630,4 +677,5 @@ if __name__ == "__main__":
     #autoglm-os_baseline, hisa_wo_pattern
     # summary('/data1/lwm/projects/ComputerRL/results/hisa_gta1_7b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')

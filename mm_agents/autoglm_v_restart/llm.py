@@ -744,6 +744,7 @@ class Road2allAPI(BaseLLMClient):
         super().__init__(model_name, temperature, max_tokens)
         self.url = "https://api2.road2all.com/v1/chat/completions"
         self.message_formatter = Road2allMessageFormatter()
+        self.request_timeout = 120
     
     def __call__(self, messages: list) -> str:
         headers = {
@@ -761,7 +762,7 @@ class Road2allAPI(BaseLLMClient):
             "messages": formatted_messages,
         }
         
-        response = requests.post(self.url, headers=headers, json=data)
+        response = requests.post(self.url, headers=headers, json=data, timeout=self.request_timeout)
         
         if response.status_code == 200:
             result_json = response.json()
@@ -789,6 +790,7 @@ class OpenRouterAPI(BaseLLMClient):
             "Content-Type": "application/json",
         }
         self.message_formatter = OpenRouterMessageFormatter()
+        self.request_timeout = 120
     
     def __call__(self, messages: list) -> str:
         # Format messages for OpenRouter API
@@ -801,7 +803,7 @@ class OpenRouterAPI(BaseLLMClient):
             "messages": formatted_messages,
         })
         
-        response = requests.post(self.url, headers=self.headers, data=data)
+        response = requests.post(self.url, headers=self.headers, data=data, timeout=self.request_timeout)
         
         if response.status_code == 200:
             result_json = response.json()

@@ -37,6 +37,8 @@ FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 init_proxy_pool(PROXY_CONFIG_FILE)  # initialize the global proxy pool
 
 MAX_RETRIES = 20
+HTTP_TIMEOUT = (10, 120)
+HTTP_UPLOAD_TIMEOUT = (10, 600)
 
 class SetupController:
     def __init__(self, vm_ip: str, server_port: int = 5000, chromium_port: int = 9222, vlc_port: int = 8080, cache_dir: str = "cache", client_password: str = "", screen_width: int = 1920, screen_height: int = 1080):
@@ -73,7 +75,7 @@ class SetupController:
         retry = 0
         while retry < MAX_RETRIES:
             try:
-                _ = requests.get(self.http_server + "/terminal")
+                _ = requests.get(self.http_server + "/terminal", timeout=HTTP_TIMEOUT)
                 break
             except:
                 time.sleep(5)
@@ -267,7 +269,12 @@ class SetupController:
 
         # send request to server to change wallpaper
         try:
-            response = requests.post(self.http_server + "/setup" + "/change_wallpaper", headers=headers, data=payload)
+            response = requests.post(
+                self.http_server + "/setup" + "/change_wallpaper",
+                headers=headers,
+                data=payload,
+                timeout=HTTP_TIMEOUT,
+            )
             if response.status_code == 200:
                 logger.debug("Command executed successfully: %s", response.text)
             else:
@@ -314,7 +321,12 @@ class SetupController:
 
         try:
             logger.info("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/launch")
-            response = requests.post(self.http_server + "/setup" + "/launch", headers=headers, data=payload)
+            response = requests.post(
+                self.http_server + "/setup" + "/launch",
+                headers=headers,
+                data=payload,
+                timeout=HTTP_TIMEOUT,
+            )
             if response.status_code == 200:
                 logger.debug("Command executed successfully: %s", response.text)
             else:
@@ -367,7 +379,12 @@ class SetupController:
 
         while not terminates:
             try:
-                response = requests.post(self.http_server + "/setup" + "/execute", headers=headers, data=payload)
+                response = requests.post(
+                    self.http_server + "/setup" + "/execute",
+                    headers=headers,
+                    data=payload,
+                    timeout=HTTP_TIMEOUT,
+                )
                 if response.status_code == 200:
                     results: Dict[str, str] = response.json()
                     if stdout:
@@ -482,7 +499,12 @@ class SetupController:
 
         # send request to server to open file
         try:
-            response = requests.post(self.http_server + "/setup" + "/activate_window", headers=headers, data=payload)
+            response = requests.post(
+                self.http_server + "/setup" + "/activate_window",
+                headers=headers,
+                data=payload,
+                timeout=HTTP_TIMEOUT,
+            )
             if response.status_code == 200:
                 logger.debug("Command executed successfully: %s", response.text)
             else:
@@ -501,7 +523,12 @@ class SetupController:
 
         # send request to server to open file
         try:
-            response = requests.post(self.http_server + "/setup" + "/close_window", headers=headers, data=payload)
+            response = requests.post(
+                self.http_server + "/setup" + "/close_window",
+                headers=headers,
+                data=payload,
+                timeout=HTTP_TIMEOUT,
+            )
             if response.status_code == 200:
                 logger.debug("Command executed successfully: %s", response.text)
             else:
@@ -518,7 +545,7 @@ class SetupController:
         retry = 0
         while retry < MAX_RETRIES:
             try:
-                _ = requests.get(self.http_server + "/terminal")
+                _ = requests.get(self.http_server + "/terminal", timeout=HTTP_TIMEOUT)
                 break
             except:
                 time.sleep(5)
@@ -735,7 +762,7 @@ class SetupController:
                 params = config['args'][oid]
                 url = params['url']
                 with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tmpf:
-                    response = requests.get(url, stream=True)
+                    response = requests.get(url, stream=True, timeout=300)
                     response.raise_for_status()
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
@@ -820,7 +847,7 @@ class SetupController:
             e = None
             for i in range(max_retries):
                 try:
-                    response = requests.get(db_url, stream=True)
+                    response = requests.get(db_url, stream=True, timeout=300)
                     response.raise_for_status()
 
                     with open(cache_path, 'wb') as f:
@@ -907,7 +934,12 @@ class SetupController:
         # send request to server to upload file
         try:
             logger.debug("REQUEST ADDRESS: %s", self.http_server + "/setup" + "/upload")
-            response = requests.post(self.http_server + "/setup" + "/upload", headers=headers, data=form)
+            response = requests.post(
+                self.http_server + "/setup" + "/upload",
+                headers=headers,
+                data=form,
+                timeout=HTTP_UPLOAD_TIMEOUT,
+            )
             if response.status_code == 200:
                 logger.debug("Command executed successfully: %s", response.text)
             else:

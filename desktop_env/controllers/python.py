@@ -20,6 +20,7 @@ class PythonController:
         self.pkgs_prefix = pkgs_prefix  # fixme: this is a hacky way to execute python commands. fix it and combine it with installation of packages
         self.retry_times = 3
         self.retry_interval = 5
+        self.http_timeout = (5, 60)
 
     @staticmethod
     def _is_valid_image_response(content_type: str, data: Optional[bytes]) -> bool:
@@ -74,7 +75,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response: requests.Response = requests.get(self.http_server + "/accessibility")
+                response: requests.Response = requests.get(self.http_server + "/accessibility", timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got accessibility tree successfully")
                     return response.json()["AT"]
@@ -96,7 +97,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.get(self.http_server + "/terminal")
+                response = requests.get(self.http_server + "/terminal", timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got terminal output successfully")
                     return response.json()["output"]
@@ -118,7 +119,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/file", data={"file_path": file_path})
+                response = requests.post(self.http_server + "/file", data={"file_path": file_path}, timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("File downloaded successfully")
                     return response.content
@@ -465,7 +466,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/screen_size")
+                response = requests.post(self.http_server + "/screen_size", timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got screen size successfully")
                     return response.json()
@@ -487,7 +488,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/window_size", data={"app_class_name": app_class_name})
+                response = requests.post(self.http_server + "/window_size", data={"app_class_name": app_class_name}, timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got window size successfully")
                     return response.json()
@@ -509,7 +510,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/wallpaper")
+                response = requests.post(self.http_server + "/wallpaper", timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got wallpaper successfully")
                     return response.content
@@ -531,7 +532,7 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/desktop_path")
+                response = requests.post(self.http_server + "/desktop_path", timeout=self.http_timeout)
                 if response.status_code == 200:
                     logger.info("Got desktop path successfully")
                     return response.json()["desktop_path"]
@@ -554,7 +555,12 @@ class PythonController:
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/list_directory", headers={'Content-Type': 'application/json'}, data=payload)
+                response = requests.post(
+                    self.http_server + "/list_directory",
+                    headers={'Content-Type': 'application/json'},
+                    data=payload,
+                    timeout=self.http_timeout,
+                )
                 if response.status_code == 200:
                     logger.info("Got directory tree successfully")
                     return response.json()["directory_tree"]

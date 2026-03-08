@@ -58,13 +58,14 @@ nohup \
 python run_autoglm_v_restart.py \
     --provider_name docker \
     --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-    --result_dir results/autoglm-os_gta1_7b_restart \
+    --result_dir results/autoglm-os_gta1_7b_restart_ori_res \
     --visual_grounder_model gta1-7b \
+    --screen_width 1920 \
+    --screen_height 1080 \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_all.json \
-    --rerun_fail \
-    > nohup.out 2>&1 &
+    --test_all_meta_path ./evaluation_examples/test_small.json \
+    > nohup3.out 2>&1 &
 
 nohup \
 python run_hisa.py \
@@ -81,7 +82,7 @@ python run_hisa.py \
   > nohup.out 2>&1 &
 
 # 杀进程
-ps -ef | grep run_autoglm_v.py
+ps -ef | grep run_autoglm_v_restart.py
 pkill -f run_autoglm_v_restart.py
 fuser -k 8001/tcp
 

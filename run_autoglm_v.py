@@ -16,7 +16,7 @@ import lib_run_single
 from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v import AutoGLMAgent
 from typing import Optional, Dict, Any
-from utils import summary, setup_logger
+from utils import summary, setup_logger, get_unfinished
 
 
 # Almost deprecated since it's not multi-env, use run_multienv_*.py instead
@@ -520,43 +520,6 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
     else:
         logger.info("No tasks completed")
 
-
-def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, logger=None):
-    """Get unfinished tasks (aligned with run_hisa.filter_tasks logic)."""
-
-    if not os.path.exists(target_dir):
-        return total_file_json
-
-    tasks_to_run = {}
-    for domain in total_file_json:
-        tasks_to_run[domain] = []
-        for example_id in total_file_json[domain]:
-            example_dir = os.path.join(target_dir, domain, example_id)
-            execution_log_path = os.path.join(example_dir, "execution_log.json")
-            result_path = os.path.join(example_dir, "result.txt")
-            err_reason_path = os.path.join(example_dir, "err_reason.txt")
-
-            if not os.path.exists(execution_log_path) and os.path.exists(result_path):
-                os.remove(result_path)
-
-            should_skip = False
-            if not rerun and os.path.exists(result_path) and not os.path.exists(err_reason_path):
-                try:
-                    with open(result_path, "r") as f:
-                        result = float(f.read().strip())
-                    if result > 0.0 or not rerun_fail:
-                        should_skip = True
-                except (ValueError, IOError) as e:
-                    if logger is not None:
-                        logger.warning(f"Failed to read result for {domain}/{example_id}: {e}")
-                    else:
-                        print(f"[Warning] Failed to read result for {domain}/{example_id}: {e}")
-
-            if not should_skip:
-                tasks_to_run[domain].append(example_id)
-
-    tasks_to_run = {k: v for k, v in tasks_to_run.items() if v}
-    return tasks_to_run
 
 if __name__ == "__main__":
     ####### The complete version of the list of examples #######

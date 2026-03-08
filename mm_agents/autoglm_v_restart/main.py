@@ -310,6 +310,10 @@ class AutoGLMAgent:
             fixed = fixed.replace("\\\\r", "\\r")
         fixed = fixed.replace("\\'", "'")
         fixed = fixed.replace("\\\"", "\"")
+        # Backward-compatible alias occasionally produced by LLM.
+        fixed = re.sub(r"\bAgent\.open_files\s*\(", "Agent.open_app(", fixed)
+        fixed = re.sub(r"\bAgent\.open_file_manager\s*\(", "Agent.open_app(", fixed)
+        fixed = re.sub(r"\bAgent\.open\s*\(", "Agent.open_app(", fixed)
         return fixed
 
     def _parse_agent_call(self, code: str):
@@ -663,6 +667,7 @@ class AutoGLMAgent:
         
         # Retry loop for parsing errors (first try normal; retries are fix-only, no task/history context)
         for attempt in range(self.max_parse_retries):
+            no_code_response = False
             if attempt == 0:
                 retry_messages = messages
             else:
@@ -697,20 +702,14 @@ class AutoGLMAgent:
 
             action_probe, _ = extract_action_and_thought(response or "")
             if action_probe is None:
+                no_code_response = True
                 self.last_parse_error = "No action code in response"
-                actions = []
-                # try:
-                #     response = self._fix_no_code_response(response or "", obs)
-                # except Exception as e:
-                #     self.last_parse_error = f"No action code in response; fix failed: {e}"
-                #     actions = []
-                # else:
-                #     action_probe, _ = extract_action_and_thought(response or "")
-                #     if action_probe is None:
-                #         self.last_parse_error = "No action code in response"
-                #         actions = []
-                #     else:
-                #         actions = self.execute(response, obs)
+                # Fallback: let grounder infer a visual action from free-form text.
+                actions = self.execute(response, obs)
+                if actions:
+                    logger.info("No action code detected; fallback to grounded action succeeded.")
+                else:
+                    self.last_parse_error = "No action code in response; grounding failed"
             else:
                 # Try to execute/parse the response
                 actions = self.execute(response, obs)

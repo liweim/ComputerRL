@@ -17,7 +17,7 @@ from desktop_env.desktop_env import MAX_RETRIES, DesktopEnv as DesktopEnvBase
 from mm_agents.autoglm_v_restart import AutoGLMAgent
 from mm_agents.autoglm_v_restart.llm import AbstractLLM
 from typing import Optional, Dict, Any
-from utils import summary, setup_logger
+from utils import summary, setup_logger, get_unfinished
 import datetime
 import json
 import logging
@@ -467,6 +467,10 @@ def _summarize_failures_with_llm(agent, action_history_full, instruction, logger
 
 
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
+    # Keep default desktop resolution unchanged.
+    if width == 1920 and height == 1080:
+        return
+
     script = textwrap.dedent(f"""
         import os
         import subprocess
@@ -917,6 +921,49 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
                 with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
                     f.write(json.dumps({"Error": f"Exception in {domain}/{example_id}: {e}"}))
                     f.write("\n")
+                # Write a minimal execution log so downstream scripts can rely on this file existing.
+                exception_log = {
+                    "statistics": {
+                        "score": 0.0,
+                        "total_steps": 0,
+                        "cua_steps": 0,
+                        "coding_steps": 0,
+                        "wait_steps": 0,
+                        "image_count": 0,
+                        "total_cost": 0.0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "execution_time": 0.0,
+                        "model_usage": {
+                            "model": {
+                                "model_name": args.model if hasattr(args, "model") else "autoglm-os",
+                                "cost": 0.0,
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "image_count": 0,
+                            }
+                        },
+                    },
+                    "task_config": example,
+                    "additional_context": "",
+                    "action_logs": [],
+                    "restart": {
+                        "restart_count": 0,
+                        "max_restarts": getattr(args, "max_restart", 0),
+                        "failure_memory": [],
+                        "failure_sequences": [],
+                        "branch_parents": {0: None},
+                        "branch_summary_text": _format_branch_tree({0: None}),
+                    },
+                    "exception": {
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "domain": domain,
+                        "example_id": example_id,
+                    },
+                }
+                with open(os.path.join(example_result_dir, "execution_log.json"), "w", encoding="utf-8") as f:
+                    json.dump(exception_log, f, indent=2, ensure_ascii=False)
                 # Write result.txt with score 0 to mark task as completed (failed)
                 with open(os.path.join(example_result_dir, "result.txt"), "w") as f:
                     f.write("0.0\n")
@@ -928,41 +975,6 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
     else:
         logger.info("No tasks completed")
 
-
-def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, logger=None):
-    if not os.path.exists(target_dir):
-        return total_file_json
-
-    tasks_to_run = {}
-    for domain in total_file_json:
-        tasks_to_run[domain] = []
-        for example_id in total_file_json[domain]:
-            example_dir = os.path.join(target_dir, domain, example_id)
-            execution_log_path = os.path.join(example_dir, "execution_log.json")
-            result_path = os.path.join(example_dir, "result.txt")
-            err_reason_path = os.path.join(example_dir, "err_reason.txt")
-
-            if not os.path.exists(execution_log_path) and os.path.exists(result_path):
-                os.remove(result_path)
-
-            should_skip = False
-            if not rerun and os.path.exists(result_path) and not os.path.exists(err_reason_path):
-                try:
-                    with open(result_path, "r") as f:
-                        result = float(f.read().strip())
-                    if result > 0.0 or not rerun_fail:
-                        should_skip = True
-                except (ValueError, IOError) as e:
-                    if logger is not None:
-                        logger.warning(f"Failed to read result for {domain}/{example_id}: {e}")
-                    else:
-                        print(f"[Warning] Failed to read result for {domain}/{example_id}: {e}")
-
-            if not should_skip:
-                tasks_to_run[domain].append(example_id)
-
-    tasks_to_run = {k: v for k, v in tasks_to_run.items() if v}
-    return tasks_to_run
 
 def run_single_example_human(env, example, example_result_dir, scores):
     runtime_logger = setup_logger(os.path.basename(example_result_dir), "INFO")
