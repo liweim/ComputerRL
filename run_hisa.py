@@ -4,135 +4,17 @@ import json
 import logging
 import os
 import shutil
-import requests
+import textwrap
 from typing import Dict, List, Tuple
 from mm_agents.hisa.main import HiSA
 import traceback
-import docker
-import textwrap
 from utils import summary, save_args_to_settings, setup_logger, get_unfinished
 from tqdm import tqdm
-import run_autoglm_v
-from run_autoglm_v import DesktopEnv
-from mm_agents.hisa.llm import AbstractLLM
-
-global_logger = None  # Will be initialized in run function
-
-
-def config() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run dual agent framework evaluation")
-    
-    # Environment config
-    parser.add_argument("--path_to_vm", type=str, default="vm_data/Ubuntu0/Ubuntu0/Ubuntu0.vmx",
-                       help="Path to VM file")
-    parser.add_argument(
-        "--provider_name",
-        type=str,
-        default="docker",
-        help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
-    )
-    parser.add_argument("--snapshot_name", type=str, default="init_state")
-    # NOTE: Docker provider ignores screen_size; effective resolution remains the container's default.
-    parser.add_argument("--screen_width", type=int, default=1280) #1920
-    parser.add_argument("--screen_height", type=int, default=720) #1080
-    parser.add_argument("--image_width", type=int, default=1280)
-    parser.add_argument("--image_height", type=int, default=720)
-    parser.add_argument("--sleep_after_execution", type=float, default=0.5)
-    parser.add_argument("--client_password", type=str, default="password",
-                       help="VM client password")
-    parser.add_argument("--headless", action="store_true", help="Run in headless mode")
-    parser.add_argument("--record", action="store_true", help="Record the execution process")
-
-    # Agent config
-    parser.add_argument("--global_planner_model", type=str, default="autoglm-os",
-                       help="Model for Global Planner agent")
-    parser.add_argument("--global_planner_temperature", type=float, default=0.2,
-                       help="Temperature for Global Planner model")
-    parser.add_argument("--global_planner_top_p", type=float, default=0.1,
-                       help="Top-p for Global Planner model")
-    parser.add_argument("--global_planner_max_tokens", type=int, default=256,
-                       help="Max tokens for Global Planner model")
-    parser.add_argument("--global_planner_repetition_penalty", type=float, default=1.0,
-                       help="Repetition penalty for Global Planner model")
-
-    parser.add_argument("--state_manager_model", type=str, default="autoglm-os",
-                       help="Model for auxiliary tasks (step abstraction, context refinement, pattern induction, etc.)")
-    parser.add_argument("--state_manager_temperature", type=float, default=0.2,
-                       help="Temperature for State Manager model")
-    parser.add_argument("--state_manager_top_p", type=float, default=0.9,
-                       help="Top-p for State Manager model")
-    parser.add_argument("--state_manager_max_tokens", type=int, default=2048,
-                       help="Max tokens for State Manager model")
-    parser.add_argument("--state_manager_repetition_penalty", type=float, default=1.0,
-                       help="Repetition penalty for State Manager model")
-
-    parser.add_argument("--visual_grounder_model", type=str, default="gta1-7b",
-                       help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
-
-    parser.add_argument("--max_steps", type=int, default=15,
-                       help="Maximum steps for Global Planner")
-    parser.add_argument("--wo_pattern", action="store_true", help="Disable pattern induction (pattern induction is enabled by default)")
-    parser.add_argument("--wo_roi", action="store_true",
-                       help="Disable ROI cropping (ROI cropping is enabled by default, reduces token usage)")
-    parser.add_argument("--roi_margin", type=int, default=50,
-                       help="Margin around ROI when cropping (default: 50)")
-    parser.add_argument("--refine_period", type=int, default=5,
-                       help="Period to refine (default: 5)")
-    parser.add_argument("--bash_timeout", type=int, default=60,
-                       help="Timeout for bash script execution in seconds (default: 60)")
-    parser.add_argument("--wo_step", action="store_true",
-                       help="Skip step abstraction and use full conversation history")
-    parser.add_argument("--wo_refinement", action="store_true",
-                       help="Disable context refinement and use sliding window")
-    parser.add_argument("--sliding_window_size", type=int, default=5,
-                       help="Sliding window size (number of conversation turns to keep) (default: 5)")
-    parser.add_argument("--max_parse_retries", type=int, default=3,
-                       help="Maximum number of retries for parsing LLM responses (default: 3)")
-
-    # Task config
-    parser.add_argument("--domain", type=str, default="all")
-    parser.add_argument("--test_all_meta_path", type=str, default=os.path.join('evaluation_examples', 'test_one.json'))
-    parser.add_argument("--test_config_base_dir", type=str, default="evaluation_examples/examples")
-    parser.add_argument("--rerun", action="store_true", help="Rerun tests that have already been run")
-    parser.add_argument("--rerun_fail", action="store_true", help="Rerun failed tests")
-    parser.add_argument("--get_score", action="store_true", help="Get scores")
-
-    # pattern config
-    parser.add_argument("--pattern_dir", type=str, default="D:/projects/qdrant/qdrant_storage", help="Qdrant storage directory")
-    parser.add_argument("--use_qdrant_server", action="store_true", help="Use Qdrant server, otherwise use local file storage")
-    parser.add_argument("--qdrant_server_url", type=str, default="http://localhost:6333", help="Qdrant server URL")
-
-    # docker related
-    # Output config
-    parser.add_argument("--result_dir", type=str, default="./results/dual_agent",
-                       help="Directory to save results")
-    parser.add_argument("--log_level", type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], 
-                       default='INFO', help="Set the logging level")
-    
-    args = parser.parse_args()
-
-    result_name = os.path.basename(args.result_dir)
-    global global_logger
-    global_logger = setup_logger(result_name, args.log_level)
-    run_autoglm_v.logger = global_logger
-
-    args.env = DesktopEnv(
-        provider_name=args.provider_name,
-        path_to_vm=args.path_to_vm,
-        action_space="autoglm_computer_use",
-        screen_size=(args.screen_width, args.screen_height),
-        headless=args.headless,
-        os_type="Ubuntu",
-        require_a11y_tree=False
-    )
-    _ensure_vm_resolution(args.env, args.screen_width, args.screen_height, global_logger)
-    return args
 
 
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
     script = textwrap.dedent(f"""
         import os
-        import shlex
         import subprocess
 
         os.environ["DISPLAY"] = ":0"
@@ -158,7 +40,6 @@ def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) 
             ).splitlines()
             if len(cvt_out) < 2:
                 raise RuntimeError("cvt output is invalid")
-            # Example: Modeline "1280x720_60.00" 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync
             parts = cvt_out[1].split()
             if len(parts) < 3 or parts[0] != "Modeline":
                 raise RuntimeError("Unexpected cvt output: " + cvt_out[1])
@@ -182,175 +63,101 @@ def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) 
         raise SystemExit(
             f"VM resolution mismatch: got {size.get('width')}x{size.get('height')}, expected {width}x{height}"
         )
+    logger.info(f"VM resolution set to {width}x{height}")
 
+def config() -> argparse.Namespace:
+    from desktop_env.desktop_env import DesktopEnv
 
-def create_llm_function(model_name: str, temperature: float = 0.1, top_p: float = 0.9, max_tokens: int = 2048, repetition_penalty: float = 1.0):
-    """Create a callable LLM function from model name string."""
-    # Get API configuration from environment
-    base_url = os.environ.get('OPENAI_BASE_URL', 'http://localhost:30000/v1')
-    api_key = os.environ.get('OPENAI_API_KEY', 'EMPTY')
-
-    def call_llm(messages):
-        """Call LLM API with OpenAI compatible interface."""
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-
-        # Prepare request data with specified parameters
-        data = {
-            "model": model_name,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "repetition_penalty": repetition_penalty,
-            "stream": False
-        }
-
-        url = f"{base_url}/chat/completions"
-
-        try:
-            response = requests.post(
-                url,
-                json=data,
-                headers=headers,
-                timeout=60.0
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            # Return both content and usage info
-            content = result['choices'][0]['message']['content']
-            usage = result.get('usage', {})
-            return content, usage
-
-        except Exception as e:
-            if global_logger:
-                global_logger.error(f"Failed to call LLM {model_name}: {e}")
-            raise
-
-    return call_llm
-
-
-class LLM:
-    """Track token usage for LLM calls."""
-    def __init__(self, model_name: str, temperature: float = 0.1, top_p: float = 0.9, max_tokens: int = 2048, repetition_penalty: float = 1.0):
-        self.model_name = model_name
-        self.call_llm = create_llm_function(model_name, temperature, top_p, max_tokens, repetition_penalty)
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-        self.total_tokens = 0
-        self.total_image_count = 0
-        self.last_usage = {}
-
-    def __call__(self, messages):
-        result, usage = self.call_llm(messages)
-
-        # Count images in the messages
-        image_count = 0
-        for msg in messages:
-            if isinstance(msg.get('content'), list):
-                for item in msg['content']:
-                    if item.get('type') in ['image_url', 'input_image']:
-                        image_count += 1
-
-        # Store usage info from API response
-        self.last_usage = {
-            'prompt_tokens': usage.get('prompt_tokens', 0),
-            'completion_tokens': usage.get('completion_tokens', 0),
-            'total_tokens': usage.get('total_tokens', 0),
-            'image_count': image_count,
-            'cost': 0.0  # Cost calculation would need model-specific pricing
-        }
-
-        # Update total counters
-        self.total_prompt_tokens += self.last_usage['prompt_tokens']
-        self.total_completion_tokens += self.last_usage['completion_tokens']
-        self.total_tokens += self.last_usage['total_tokens']
-        self.total_image_count += image_count
-
-        return result
-
-    def get_last_usage(self):
-        return self.last_usage
-
-    def reset(self):
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-        self.total_tokens = 0
-        self.total_image_count = 0
-
-
-def cleanup_osworld_containers(logger, remove_running=False):
-    """Clean up osworld docker containers before starting.
-
-    Args:
-        logger: Logger instance for consistent logging
-        remove_running: If True, also stop and remove running containers.
-                       If False (default), only remove exited containers.
-    """
-    try:
-        client = docker.from_env()
-        containers = client.containers.list(all=True, filters={"ancestor": "happysixd/osworld-docker"})
-        if not containers:
-            # Fallback: match by image tag or name to handle custom images.
-            all_containers = client.containers.list(all=True)
-            containers = []
-            for container in all_containers:
-                try:
-                    image_tags = container.image.tags or []
-                    image_str = " ".join(image_tags).lower()
-                except Exception:
-                    image_str = ""
-                name_str = (container.name or "").lower()
-                if "osworld" in image_str or "osworld" in name_str:
-                    containers.append(container)
-        if containers:
-            removed_count = 0
-            skipped_count = 0
-            for container in containers:
-                try:
-                    if container.status == "running":
-                        if remove_running:
-                            container.stop(timeout=5)
-                            container.remove(force=True)
-                            logger.info(f"  Stopped and removed running container: {container.name}")
-                            removed_count += 1
-                        else:
-                            skipped_count += 1
-                    else:
-                        # Remove exited/stopped containers
-                        container.remove(force=True)
-                        logger.info(f"  Removed exited container: {container.name}")
-                        removed_count += 1
-                except Exception as e:
-                    logger.warning(f"  Failed to remove container {container.name}: {e}")
-            logger.info(f"Cleanup completed. Removed: {removed_count}, Skipped (running): {skipped_count}")
-        else:
-            logger.info("No existing osworld containers found.")
-    except Exception as e:
-        logger.warning(f"Warning: Failed to cleanup containers: {e}")
-
-def filter_tasks(args, test_all_meta: dict, logger) -> List[tuple]:
-    """
-    Filter tasks based on rerun/rerun_fail flags.
+    parser = argparse.ArgumentParser(description="Run dual agent framework evaluation")
     
-    Returns:
-        List of (domain, example_id) tuples to execute
-    """
-    unfinished = get_unfinished(
-        args.result_dir,
-        test_all_meta,
-        rerun=args.rerun,
-        rerun_fail=args.rerun_fail,
-        logger=logger,
+    # Environment config
+    parser.add_argument("--path_to_vm", type=str, default="vm_data/Ubuntu0/Ubuntu0/Ubuntu0.vmx",
+                       help="Path to VM file")
+    parser.add_argument(
+        "--provider_name",
+        type=str,
+        default="docker",
+        help="Virtualization provider (vmware, docker, aws, azure, gcp, virtualbox)",
     )
-    tasks_to_run = []
-    for domain in unfinished:
-        for example_id in unfinished[domain]:
-            tasks_to_run.append((domain, example_id))
-    return tasks_to_run
+    parser.add_argument("--snapshot_name", type=str, default="init_state")
+    parser.add_argument("--screen_width", type=int, default=1280) #1920
+    parser.add_argument("--screen_height", type=int, default=720) #1080
+    parser.add_argument("--sleep_after_execution", type=float, default=0.5)
+    parser.add_argument("--client_password", type=str, default="password",
+                       help="VM client password")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--record", action="store_true", help="Record the execution process")
+
+    # Agent config
+    parser.add_argument("--global_planner_model", type=str, default="qwen3.5-9b",
+                       help="Model for Global Planner agent")
+    parser.add_argument("--visual_grounder_model", type=str, default="gta1-7b",
+                       help="Model for Visual Grounder agent")
+    parser.add_argument("--visual_grounder_scale", type=float, default=1.0,
+                       help="Scale factor for visual grounder image preprocessing (default: 1.0)")
+    parser.add_argument("--state_manager_model", type=str, default="qwen3.5-9b",
+                       help="Model for auxiliary tasks (step abstraction, context refinement, pattern induction, etc.)")
+    parser.add_argument("--max_steps", type=int, default=15,
+                       help="Maximum steps for Global Planner")
+    parser.add_argument("--wo_pattern", action="store_true", help="Disable pattern induction (pattern induction is enabled by default)")
+    parser.add_argument("--wo_roi", action="store_true",
+                       help="Disable ROI cropping (ROI cropping is enabled by default, reduces token usage)")
+    parser.add_argument("--roi_margin", type=int, default=50,
+                       help="Margin around ROI when cropping (default: 50)")
+    parser.add_argument("--refine_period", type=int, default=5,
+                       help="Period to refine (default: 5)")
+    parser.add_argument("--bash_timeout", type=int, default=60,
+                       help="Timeout for bash script execution in seconds (default: 300)")
+    parser.add_argument("--wo_step", action="store_true",
+                       help="Skip step abstraction and use full conversation history")
+    parser.add_argument("--wo_refinement", action="store_true",
+                       help="Disable context refinement and use sliding window")
+    parser.add_argument("--sliding_window_size", type=int, default=5,
+                       help="Sliding window size (number of conversation turns to keep) (default: 5)")
+
+    # Task config
+    parser.add_argument("--domain", type=str, default="all")
+    parser.add_argument("--test_all_meta_path", type=str, default=os.path.join('evaluation_examples', 'test_one.json'))
+    parser.add_argument("--test_config_base_dir", type=str, default="evaluation_examples/examples")
+    parser.add_argument("--rerun", action="store_true", help="Rerun tests that have already been run")
+    parser.add_argument("--rerun_fail", action="store_true", help="Rerun failed tests")
+    parser.add_argument("--get_score", action="store_true", help="Get scores")
+
+    # RAG config
+    parser.add_argument("--rag", action='store_true', help="Enable RAG context")
+    parser.add_argument("--rag_topk", type=int, default=4)
+    parser.add_argument("--summarize_rag", action='store_true', help="Summarize RAG context")
+    parser.add_argument("--rag_filename", type=str, default="retrieved_chunk_size_512_chunk_overlap_20_topk_4_embed_bge-large-en-v1.5.txt")
+    parser.add_argument("--pattern_dir", type=str, default="D:/projects/qdrant/qdrant_storage", help="Qdrant storage directory")
+    parser.add_argument("--use_qdrant_server", action="store_true", help="Use Qdrant server, otherwise use local file storage")
+    parser.add_argument("--qdrant_server_url", type=str, default="http://localhost:6333", help="Qdrant server URL")
+
+    # Output config
+    parser.add_argument("--result_dir", type=str, default="./results/dual_agent",
+                       help="Directory to save results")
+    parser.add_argument("--log_level", type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], 
+                       default='INFO', help="Set the logging level")
+    
+    args = parser.parse_args()
+    result_name = os.path.basename(args.result_dir)
+    boot_logger = setup_logger(result_name, args.log_level)
+
+    args.env = DesktopEnv(
+        provider_name=args.provider_name,
+        path_to_vm=args.path_to_vm,
+        snapshot_name=args.snapshot_name,
+        screen_size=(args.screen_width, args.screen_height),
+        headless=args.headless,
+        require_a11y_tree=False
+    )
+    _ensure_vm_resolution(
+        args.env,
+        args.screen_width,
+        args.screen_height,
+        boot_logger,
+    )
+    args.logger = boot_logger
+    return args
 
 def process_single_task(
     domain: str,
@@ -362,30 +169,20 @@ def process_single_task(
     """Process a single task with the dual agent framework."""
     # Extract parameters
     result_dir = args.result_dir
+    global_planner_model = args.global_planner_model
+    visual_grounder_model = args.visual_grounder_model
+    visual_grounder_scale = args.visual_grounder_scale
+    state_manager_model = args.state_manager_model
+    screen_width = args.screen_width
+    screen_height = args.screen_height
     max_steps = args.max_steps
     sleep_after_execution = args.sleep_after_execution
     client_password = args.client_password
-    max_parse_retries = args.max_parse_retries
-
-    # Convert model name strings to callable functions
-    global_planner_model = LLM(
-        args.global_planner_model,
-        args.global_planner_temperature,
-        args.global_planner_top_p,
-        args.global_planner_max_tokens,
-        args.global_planner_repetition_penalty
-    )
-    state_manager_model = LLM(
-        args.state_manager_model,
-        args.state_manager_temperature,
-        args.state_manager_top_p,
-        args.state_manager_max_tokens,
-        args.state_manager_repetition_penalty
-    )
-    if args.visual_grounder_model == args.global_planner_model:
-        visual_grounder_model = None
-    else:
-        visual_grounder_model = AbstractLLM(args.visual_grounder_model)
+    rag = args.rag
+    rag_topk = args.rag_topk
+    rag_filename = args.rag_filename
+    summarize_rag = args.summarize_rag
+    test_config_base_dir = args.test_config_base_dir
 
     logger.info(f"[Processing task] {domain}/{task_id}")
     
@@ -399,16 +196,15 @@ def process_single_task(
             env=args.env,
             global_planner_model=global_planner_model,
             visual_grounder_model=visual_grounder_model,
+            visual_grounder_scale=visual_grounder_scale,
             state_manager_model=state_manager_model,
             client_password=client_password,
-            screen_width=args.screen_width,
-            screen_height=args.screen_height,
+            screen_width=screen_width,
+            screen_height=screen_height,
             sleep_after_execution=sleep_after_execution,
             max_steps=max_steps,
             save_dir=save_dir,
             record=args.record,
-            image_width=args.image_width,
-            image_height=args.image_height,
             wo_pattern=args.wo_pattern,
             wo_roi=args.wo_roi,
             roi_margin=args.roi_margin,
@@ -419,13 +215,13 @@ def process_single_task(
             qdrant_server_url=args.qdrant_server_url,
             wo_step=args.wo_step,
             wo_refinement=args.wo_refinement,
-            sliding_window_size=args.sliding_window_size,
-            max_parse_retries=max_parse_retries,
+            sliding_window_size=args.sliding_window_size
         )
 
         # Execute task
         logger.info(f"[Domain]: {domain}")
         logger.info(f"[Example ID]: {task_id}")
+        logger.info(f"[Instruction]: {cfg['instruction']}")
 
         # Add domain to task config
         cfg['domain'] = domain
@@ -473,16 +269,34 @@ def process_single_task(
             except Exception as cleanup_error:
                 logger.warning(f"Error during cleanup: {cleanup_error}")
 
+
+def filter_tasks(args, test_all_meta: dict, logger) -> List[tuple]:
+    """Filter tasks based on rerun/rerun_fail flags."""
+    unfinished = get_unfinished(
+        args.result_dir,
+        test_all_meta,
+        rerun=args.rerun,
+        rerun_fail=args.rerun_fail,
+        logger=logger,
+    )
+    tasks_to_run = []
+    for domain in unfinished:
+        for example_id in unfinished[domain]:
+            tasks_to_run.append((domain, example_id))
+    return tasks_to_run
+
 def run(args, logger=None, tasks=None):
     """
     Run evaluation tasks.
-
+    
     Args:
         args: Command line arguments
         logger: Logger instance (optional, will create if not provided)
         tasks: List of (domain, task_id) tuples (optional, will build from file if not provided)
     """
-
+    # Setup logging configuration
+    result_name = os.path.basename(args.result_dir)
+    
     # Build tasks if not provided
     if tasks is None:
         with open(args.test_all_meta_path, encoding="utf-8") as f:
@@ -490,12 +304,17 @@ def run(args, logger=None, tasks=None):
         
         if args.domain != "all":
             test_all_meta = {args.domain: test_all_meta[args.domain]}
-        
-        tasks = filter_tasks(args, test_all_meta, global_logger)
+
+        task_filter_logger = logger
+        if task_filter_logger is None and hasattr(args, "logger"):
+            task_filter_logger = args.logger
+        tasks = filter_tasks(args, test_all_meta, task_filter_logger)
     
     if not args.get_score:
-        # Use global logger for task processing
-        logger = global_logger
+        if logger is None and hasattr(args, "logger"):
+            logger = args.logger
+        if logger is None:
+            logger = setup_logger(result_name, args.log_level)
 
         save_args_to_settings(args)
 

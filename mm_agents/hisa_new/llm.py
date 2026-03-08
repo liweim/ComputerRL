@@ -9,7 +9,10 @@ import base64
 import io
 from dataclasses import dataclass
 from typing import Any, Tuple, Optional, List, Dict
-# from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
+try:
+    from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
+except:
+    pass
 from openai import OpenAI
 import logging
 import sys
@@ -113,7 +116,6 @@ MODEL_CONFIGS = {
     "gemini-2.5-flash": ModelConfig("OpenRouterAPI", "google/gemini-2.5-flash", 0.3, 2.5),
     "uitars-1.5-7b": ModelConfig("LocalLLM", "uitars-1.5-7b", 0, 0),
     "gta1-7b": ModelConfig("LocalLLM", "gta1-7b", 0, 0),
-    "qwen3.5-9b": ModelConfig("LocalLLM", "qwen3.5-9b", 0, 0),
 }
 
 
@@ -825,16 +827,13 @@ class LocalLLM(BaseLLMClient):
 
     def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
         super().__init__(model_name, temperature, max_tokens)
-        normalized_model_name = model_name.lower()
-        if normalized_model_name == "gta1-7b":
+        if model_name == "gta1-7b":
             base_url = 'http://localhost:1234/v1'
-        elif normalized_model_name == "uitars-1.5-7b":
+        elif model_name == "uitars-1.5-7b":
             base_url = 'http://localhost:1235/v1'
-        elif normalized_model_name in {"qwen3.5-9b", "qwen/qwen3.5-9b"}:
-            base_url = 'http://localhost:30000/v1'
         else:
             raise Exception("model not support")
-        api_key = os.getenv('OPENAI_API_KEY', os.getenv('UITARS_API_KEY', 'empty'))
+        api_key = os.getenv('UITARS_API_KEY', 'empty')
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
         # For uitars-1.5-7b, use OpenAI-compatible local server
@@ -858,8 +857,6 @@ class LocalLLM(BaseLLMClient):
             self.min_pixels = 100 * 28 * 28
             self.image_factor = 28  # patch_size * merge_size = 14 * 2
             self.max_ratio = 200
-        elif "qwen3.5-9b" in model_name.lower() or "qwen/qwen3.5-9b" in model_name.lower():
-            self.model_type = "qwen3.5-9b"
         else:
             raise ValueError(f"Local model {model_name} not supported yet")
 
@@ -896,26 +893,6 @@ class LocalLLM(BaseLLMClient):
                 messages=formatted_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_new_tokens,
-            )
-
-            # Update statistics from response
-            if hasattr(response, 'usage') and response.usage:
-                self.usage_stats.prompt_tokens += getattr(response.usage, 'prompt_tokens', 0)
-                self.usage_stats.completion_tokens += getattr(response.usage, 'completion_tokens', 0)
-            self.usage_stats.image_count += count_images_in_messages(messages)
-
-            return response.choices[0].message.content.strip()
-        elif self.model_type == "qwen3.5-9b":
-            formatted_messages = self._format_messages_for_uitars(messages)
-
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=formatted_messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                top_p=0.95,
-                presence_penalty=1.5,
-                extra_body={"top_k": 20},
             )
 
             # Update statistics from response
@@ -1725,41 +1702,27 @@ def calculate_image_tokens():
 if __name__ == "__main__":
     # calculate_image_tokens()
 
-    # client = AbstractLLM('qwen3.5-9b')
-    # # messages = [
-    # #     {
-    # #         "role": "user",
-    # #         "content": [
-    # #             {"type": "input_text", "text": "hi"},
-    # #         ]
-    # #     }
-    # # ]
-    # image = Image.open("data/screenshot.png")
-    # messages = [
-    #     {
-    #         "role": "user",
-    #         "content": [
-    #             {"type": "input_text", "text": "where is the coordinate of the chrome browser?"},
-    #             {"type": "input_image", "image_url": encode_image(image)},
-    #         ]
-    #     }
-    # ]
-    # response = client(messages)
-    # print(response)
-
-    # draw = ImageDraw.Draw(image)
-    # draw.ellipse((0, 35, 40, 106), fill="red")
-    # image.save('tmp/tmp.jpg')
-    # exit()
+    client = AbstractLLM('gpt-5-mini')
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hi"},
+            ]
+        }
+    ]
+    response = client(messages)
+    print(response)
+    exit()
 
 
     run = 1
-    x, y = 137, 548
-    model_name = "gta1-7b" #"gta1-7b" #"uitars-1.5-7b"
+    x, y = 29.814, 70.22
+    model_name = "gpt-5" #"gta1-7b" #"uitars-1.5-7b"
     
     # instruction = "Click the funnel (filter) icon in the top menu bar — the middle icon directly under the page title 'servicenow' above the Incidents list."
-    instruction = "Click on the 'Search engine' option in the left sidebar"
-    path = "/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern/chrome/bb5e4c0d-f964-439c-97b6-bdb9747de3f4/operations/step_21_gui_action.png"
+    instruction = "click chrome"
+    path = "data/screenshot.png"
     image = Image.open(path)
     screen_width, screen_height = 1280, 720
     image = image.resize((screen_width, screen_height))
@@ -1775,4 +1738,4 @@ if __name__ == "__main__":
     else:
         draw = ImageDraw.Draw(image)
         draw.ellipse((x, y, x+10, y+10), fill="red")
-        image.save('tmp/tmp.jpg')
+        image.show()

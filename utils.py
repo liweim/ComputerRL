@@ -571,7 +571,7 @@ def summary(result_dir, test_all_meta):
     avg_steps = summary_stats['average']['steps']
     avg_execution_time = summary_stats['average']['execution_time']
     print(f"Total tasks: {total_tasks}, Left tasks: {left_tasks}, Error tasks: {error_tasks}")
-    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.2f}\t{avg_score_50:.2f}\t{avg_cost:.2f}\t{avg_total_tokens:.2f}\t{avg_prompt_tokens:.2f}\t{avg_completion_tokens:.2f}\t{avg_steps:.2f}\t{avg_execution_time:.2f}")
+    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.2f},{avg_score_50:.2f},{avg_cost:.2f},{avg_total_tokens:.2f},{avg_prompt_tokens:.2f},{avg_completion_tokens:.2f},{avg_steps:.2f},{avg_execution_time:.2f}")
 
     return detailed_stats
 
@@ -675,7 +675,7 @@ def compare_results():
 
 if __name__ == "__main__":
     #autoglm-os_baseline, hisa_wo_pattern
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_gta1_7b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')

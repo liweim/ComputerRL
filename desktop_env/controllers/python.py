@@ -47,7 +47,7 @@ class PythonController:
 
         for attempt_idx in range(self.retry_times):
             try:
-                response = requests.get(self.http_server + "/screenshot", timeout=10)
+                response = requests.get(self.http_server + "/screenshot", timeout=30)
                 if response.status_code == 200:
                     content_type = response.headers.get("Content-Type", "")
                     content = response.content
