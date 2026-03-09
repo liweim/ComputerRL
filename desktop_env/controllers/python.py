@@ -58,7 +58,16 @@ class PythonController:
                         logger.error("Invalid screenshot payload (attempt %d/%d).", attempt_idx + 1, self.retry_times)
                         logger.info("Retrying to get screenshot.")
                 else:
-                    logger.error("Failed to get screenshot. Status code: %d", response.status_code)
+                    body = ""
+                    try:
+                        body = response.text.strip()
+                    except Exception:
+                        body = "<unreadable response body>"
+                    logger.error(
+                        "Failed to get screenshot. Status code: %d, body: %s",
+                        response.status_code,
+                        body
+                    )
                     logger.info("Retrying to get screenshot.")
             except Exception as e:
                 logger.error("An error occurred while trying to get the screenshot: %s", e)

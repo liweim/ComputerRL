@@ -274,67 +274,78 @@ def capture_screen_with_cursor():
     # Ensure the screenshots directory exists
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-    # fixme: This is a temporary fix for the cursor not being captured on Windows and Linux
-    if user_platform == "Windows":
-        def get_cursor():
-            hcursor = win32gui.GetCursorInfo()[1]
-            hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
-            hbmp = win32ui.CreateBitmap()
-            hbmp.CreateCompatibleBitmap(hdc, 36, 36)
-            hdc = hdc.CreateCompatibleDC()
-            hdc.SelectObject(hbmp)
-            hdc.DrawIcon((0,0), hcursor)
+    try:
+        # fixme: This is a temporary fix for the cursor not being captured on Windows and Linux
+        if user_platform == "Windows":
+            def get_cursor():
+                hcursor = win32gui.GetCursorInfo()[1]
+                hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+                hbmp = win32ui.CreateBitmap()
+                hbmp.CreateCompatibleBitmap(hdc, 36, 36)
+                hdc = hdc.CreateCompatibleDC()
+                hdc.SelectObject(hbmp)
+                hdc.DrawIcon((0,0), hcursor)
 
-            bmpinfo = hbmp.GetInfo()
-            bmpstr = hbmp.GetBitmapBits(True)
-            cursor = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRX', 0, 1).convert("RGBA")
+                bmpinfo = hbmp.GetInfo()
+                bmpstr = hbmp.GetBitmapBits(True)
+                cursor = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRX', 0, 1).convert("RGBA")
 
-            win32gui.DestroyIcon(hcursor)
-            win32gui.DeleteObject(hbmp.GetHandle())
-            hdc.DeleteDC()
+                win32gui.DestroyIcon(hcursor)
+                win32gui.DeleteObject(hbmp.GetHandle())
+                hdc.DeleteDC()
 
-            pixdata = cursor.load()
+                pixdata = cursor.load()
 
-            width, height = cursor.size
-            for y in range(height):
-                for x in range(width):
-                    if pixdata[x, y] == (0, 0, 0, 255):
-                        pixdata[x, y] = (0, 0, 0, 0)
+                width, height = cursor.size
+                for y in range(height):
+                    for x in range(width):
+                        if pixdata[x, y] == (0, 0, 0, 255):
+                            pixdata[x, y] = (0, 0, 0, 0)
 
-            hotspot = win32gui.GetIconInfo(hcursor)[1:3]
+                hotspot = win32gui.GetIconInfo(hcursor)[1:3]
 
-            return (cursor, hotspot)
+                return (cursor, hotspot)
 
-        ratio = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100
+            ratio = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100
 
-        img = ImageGrab.grab(bbox=None, include_layered_windows=True)
+            img = ImageGrab.grab(bbox=None, include_layered_windows=True)
 
-        try:
-            cursor, (hotspotx, hotspoty) = get_cursor()
+            try:
+                cursor, (hotspotx, hotspoty) = get_cursor()
 
-            pos_win = win32gui.GetCursorPos()
-            pos = (round(pos_win[0]*ratio - hotspotx), round(pos_win[1]*ratio - hotspoty))
+                pos_win = win32gui.GetCursorPos()
+                pos = (round(pos_win[0]*ratio - hotspotx), round(pos_win[1]*ratio - hotspoty))
 
-            img.paste(cursor, pos, cursor)
-        except Exception as e:
-            logger.warning(f"Failed to capture cursor on Windows, screenshot will not have a cursor. Error: {e}")
+                img.paste(cursor, pos, cursor)
+            except Exception as e:
+                logger.warning(f"Failed to capture cursor on Windows, screenshot will not have a cursor. Error: {e}")
 
-        img.save(file_path)
-    elif user_platform == "Linux":
-        cursor_obj = Xcursor()
-        imgarray = cursor_obj.getCursorImageArrayFast()
-        cursor_img = Image.fromarray(imgarray)
-        screenshot = pyautogui.screenshot()
-        cursor_x, cursor_y = pyautogui.position()
-        screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
-        screenshot.save(file_path)
-    elif user_platform == "Darwin":  # (Mac OS)
-        # Use the screencapture utility to capture the screen with the cursor
-        subprocess.run(["screencapture", "-C", file_path])
-    else:
-        logger.warning(f"The platform you're using ({user_platform}) is not currently supported")
+            img.save(file_path)
+        elif user_platform == "Linux":
+            # Prefer screenshot with cursor overlay, but degrade gracefully to plain screenshot.
+            try:
+                cursor_obj = Xcursor()
+                imgarray = cursor_obj.getCursorImageArrayFast()
+                cursor_img = Image.fromarray(imgarray)
+                screenshot = pyautogui.screenshot()
+                cursor_x, cursor_y = pyautogui.position()
+                screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
+                screenshot.save(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to capture cursor on Linux, fallback to plain screenshot. Error: {e}")
+                pyautogui.screenshot().save(file_path)
+        elif user_platform == "Darwin":  # (Mac OS)
+            # Use the screencapture utility to capture the screen with the cursor
+            subprocess.run(["screencapture", "-C", file_path], check=True)
+        else:
+            logger.warning(f"The platform you're using ({user_platform}) is not currently supported")
+            pyautogui.screenshot().save(file_path)
 
-    return send_file(file_path, mimetype='image/png')
+        return send_file(file_path, mimetype='image/png')
+
+    except Exception as e:
+        logger.exception(f"Failed to capture screenshot: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 def _has_active_terminal(desktop: Accessible) -> bool:
@@ -1374,7 +1385,7 @@ def open_file():
         if window_found:
             return "File opened and window activated successfully"
         else:
-            return f"Failed to find window for {file_name} within {timeout} seconds.", 500
+            return f"Failed to find window for {file_name} within {TIMEOUT} seconds.", 500
 
     except Exception as e:
         return f"Failed to open {path}. Error: {e}", 500
@@ -1669,7 +1680,6 @@ def run_python():
         return jsonify({
             'status': 'error',
             'message': f'Execution error: {str(e)}',
-            'error': traceback.format_exc(),
             'need_more': False,
             'output': None,
         }), 500

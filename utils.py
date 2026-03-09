@@ -678,4 +678,4 @@ if __name__ == "__main__":
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')

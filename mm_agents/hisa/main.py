@@ -654,6 +654,7 @@ class HiSA:
         roi_margin: int = 50,  # Margin around ROI when cropping
         refine_period: int = 5,
         bash_timeout: int = 60,  # Timeout for bash script execution in seconds
+        bash_working_dir: str = "~",  # Working directory for bash execution
         wo_step: bool = False,  # If True, skip step abstraction and use full conversation history
         wo_refinement: bool = False,  # If True, disable context refinement and use sliding window
         sliding_window_size: int = 5  # Sliding window size (number of conversation turns to keep)
@@ -676,6 +677,7 @@ class HiSA:
         self.roi_margin = roi_margin
         self.refine_period = refine_period
         self.bash_timeout = bash_timeout  # Timeout for bash script execution
+        self.bash_working_dir = bash_working_dir
         self.wo_step = wo_step  # Skip step abstraction if True
         self.wo_refinement = wo_refinement  # Disable context refinement if True
         self.sliding_window_size = sliding_window_size  # Sliding window size for conversation history
@@ -1020,9 +1022,20 @@ class HiSA:
         """Get decision from global planner with retry on parsing errors."""
 
         for attempt in range(self.max_parse_retries):
+            response = ""
             try:
                 # Get current screenshot
-                screenshot = self.env.controller.get_screenshot()
+                screenshot = None
+                for screenshot_attempt in range(3):
+                    screenshot = self.env.controller.get_screenshot()
+                    if screenshot is not None:
+                        break
+                    self.logger.warning(
+                        f"Screenshot unavailable for planning (retry {screenshot_attempt + 1}/3), waiting 2s..."
+                    )
+                    time.sleep(2)
+                if screenshot is None:
+                    raise RuntimeError("Failed to capture screenshot for planning after retries.")
                 screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
 
                 # Context Refinement
@@ -1555,11 +1568,20 @@ Based on the execution_history and current screenshot, decide the next action. A
             # Provider workaround:
             # run_bash_script is unstable on some providers, so execute bash via run_python_script.
             escaped_code = json.dumps(code)
+            escaped_working_dir = json.dumps(self.bash_working_dir)
             py_wrapper = f"""
 import subprocess
 import sys
+import os
 
 cmd = {escaped_code}
+working_dir = os.path.expanduser({escaped_working_dir})
+if not os.path.isdir(working_dir):
+    working_dir = os.path.expanduser("~")
+env = os.environ.copy()
+env.setdefault("HOME", os.path.expanduser("~"))
+env["SHELL"] = "/bin/bash"
+env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 try:
     result = subprocess.run(
         ["/bin/bash", "-lc", cmd],
@@ -1567,6 +1589,8 @@ try:
         stderr=subprocess.STDOUT,
         text=True,
         timeout={int(self.bash_timeout)},
+        cwd=working_dir,
+        env=env,
     )
     sys.stdout.write(result.stdout or "")
     sys.exit(result.returncode)
