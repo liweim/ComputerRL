@@ -290,16 +290,16 @@ def get_unfinished(target_dir, total_file_json, rerun=False, rerun_fail=False, l
     return tasks_to_run
 
 
-def postprocess_action(action):
+def postprocess_action(action, max_amount=10):
     new_action = ""
     if "pyautogui.scroll" in action:
         match = re.findall(r"pyautogui\.scroll\((.*?)\)", action)
         if len(match) > 0:
             scroll_amount = match[0].split(",")[0].strip()
-            if float(scroll_amount) > 5:
-                new_action = action.replace(scroll_amount, "5")
-            elif float(scroll_amount) < -5:
-                new_action = action.replace(scroll_amount, "-5")
+            if float(scroll_amount) > max_amount:
+                new_action = action.replace(scroll_amount, str(max_amount))
+            elif float(scroll_amount) < -max_amount:
+                new_action = action.replace(scroll_amount, str(-max_amount))
     if "pyautogui.sleep" in action:
         match = re.findall(r"pyautogui\.sleep\((.*?)\)", action)
         for sleep_amount in match:
@@ -622,12 +622,9 @@ def load_run(run_path):
     return data
 
 
-def compare_results():
+def compare_results(methods):
     RESULTS_ROOT = Path("/data1/lwm/projects/ComputerRL/results")
-    RUNS = {
-        "autoglm-os_baseline": RESULTS_ROOT / "autoglm-os_baseline",
-        "autoglm-os_gta1_7b_restart": RESULTS_ROOT / "autoglm-os_gta1_7b_restart",
-    }
+    RUNS = {method: RESULTS_ROOT / method for method in methods}
     run_data = {name: load_run(path) for name, path in RUNS.items()}
 
     example_ids = set()
@@ -636,11 +633,7 @@ def compare_results():
 
     rows = []
     for example_id in sorted(example_ids):
-        base = (
-            run_data["autoglm-os_baseline"].get(example_id)
-            or run_data["autoglm-os_gta1_7b_restart"].get(example_id)
-            or {}
-        )
+        base = run_data[methods[0]].get(example_id) or {}
         row = {
             "domain": base.get("domain"),
             "example_id": example_id,
@@ -649,23 +642,13 @@ def compare_results():
         for run_name in RUNS.keys():
             entry = run_data[run_name].get(example_id)
             if entry is None:
-                row[f"{run_name}_score"] = ""
-                row[f"{run_name}_failure_reason"] = "missing_execution_log"
+                row[run_name] = ""
             else:
-                row[f"{run_name}_score"] = entry["score"]
-                row[f"{run_name}_failure_reason"] = entry["failure_reason"]
+                row[run_name] = entry["score"]
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    cols = [
-        "domain",
-        "example_id",
-        "instruction",
-        "autoglm-os_baseline_score",
-        "autoglm-os_baseline_failure_reason",
-        "autoglm-os_gta1_7b_restart_score",
-        "autoglm-os_gta1_7b_restart_failure_reason",
-    ]
+    cols = ["domain", "example_id", "instruction"] + methods
     df = df[cols].sort_values(["domain", "example_id"], ascending=[True, True])
 
     out_path = RESULTS_ROOT / "task_success_failures.xlsx"
@@ -678,4 +661,5 @@ if __name__ == "__main__":
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
     # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')
+    compare_results(['autoglm-os_baseline', 'hisa_qwen3.5-9b_wo_step_refinement_pattern'])

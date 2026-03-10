@@ -6,7 +6,7 @@ import sqlite3
 import time
 from urllib.parse import unquote
 from typing import Dict, Any, List
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunparse
 
 import lxml.etree
 import requests
@@ -34,6 +34,20 @@ WARNING:
 1. Functions from this script assume that no account is registered on Chrome, otherwise the default file path needs to be changed.
 2. The functions are not tested on Windows and Mac, but they should work.
 """
+
+
+def _normalize_navigation_url(url: str) -> str:
+    if not isinstance(url, str) or not url:
+        return url
+
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc.startswith("www."):
+            return urlunparse(parsed._replace(netloc=parsed.netloc[4:]))
+    except Exception:
+        pass
+
+    return url
 
 
 def get_info_from_website(env, config: Dict[Any, Any]) -> Any:
@@ -794,6 +808,7 @@ def get_active_tab_info(env, config: Dict[str, str]):
         logger.error("Failed to get the url of active tab")
         return None
         
+    active_tab_url = _normalize_navigation_url(active_tab_url)
     logger.info(f"[ACTIVE_TAB_INFO] Active tab URL: {active_tab_url}")
     
     host = env.vm_ip
@@ -827,8 +842,11 @@ def get_active_tab_info(env, config: Dict[str, str]):
                 
                 try:
                     logger.info(f"[ACTIVE_TAB_INFO] Navigating to URL: {active_tab_url}")
-                    page.goto(active_tab_url, wait_until='networkidle', timeout=timeout_ms)
-                    page.wait_for_load_state('networkidle', timeout=timeout_ms)  # Wait for the 'load' event to complete
+                    page.goto(active_tab_url, wait_until='domcontentloaded', timeout=timeout_ms)
+                    try:
+                        page.wait_for_load_state('load', timeout=10000)
+                    except Exception as load_e:
+                        logger.info(f"[ACTIVE_TAB_INFO] Page did not reach load state quickly for {active_tab_url}: {load_e}")
                     
                     active_tab_info = {
                         'title': page.title(),

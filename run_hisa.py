@@ -13,6 +13,9 @@ from tqdm import tqdm
 
 
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
+    if width == 1920 and height == 1080:
+        return
+        
     script = textwrap.dedent(f"""
         import os
         import subprocess
@@ -64,6 +67,18 @@ def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) 
             f"VM resolution mismatch: got {size.get('width')}x{size.get('height')}, expected {width}x{height}"
         )
     logger.info(f"VM resolution set to {width}x{height}")
+
+
+def _attach_resolution_guard(env, width: int, height: int, logger: logging.Logger) -> None:
+    """Ensure VM resolution after every env.reset call."""
+    original_reset = env.reset
+
+    def guarded_reset(*args, **kwargs):
+        result = original_reset(*args, **kwargs)
+        _ensure_vm_resolution(env, width, height, logger)
+        return result
+
+    env.reset = guarded_reset
 
 def config() -> argparse.Namespace:
     from desktop_env.desktop_env import DesktopEnv
@@ -149,6 +164,12 @@ def config() -> argparse.Namespace:
         screen_size=(args.screen_width, args.screen_height),
         headless=args.headless,
         require_a11y_tree=False
+    )
+    _attach_resolution_guard(
+        args.env,
+        args.screen_width,
+        args.screen_height,
+        boot_logger,
     )
     _ensure_vm_resolution(
         args.env,

@@ -388,7 +388,7 @@ class DesktopEnv(gym.Env):
         reward = 0  # todo: Define reward calculation for each example
         done = False  # todo: Define episode termination condition for each example
         info = {}
-        logger.info(f"Step {self._step_no} in trajectory {self._traj_no} with action: {action}")
+        logger.info(f"[action] {action}")
         # handle the special actions
         if action in ['WAIT', 'FAIL', 'DONE'] or (type(action) == dict and action['action_type'] in ['WAIT', 'FAIL', 'DONE']):
             if action == 'WAIT':

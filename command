@@ -67,15 +67,17 @@ python run_hisa.py \
   --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/debug.json \
+  --test_all_meta_path ./evaluation_examples/test_small.json \
   --wo_step \
   --wo_refinement \
   --wo_pattern \
+  --rerun_fail \
   > nohup.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py
 pkill -f run_autoglm_v_restart.py
+pkill -f run_hisa.py
 ps -fp 2011314
 tr '\0' ' ' < /proc/2010759/cmdline ; echo
 fuser -k 8001/tcp
@@ -93,3 +95,6 @@ fuser -k 8001/tcp
       )
       for i, m in enumerate(messages)
   )
+
+
+ Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')

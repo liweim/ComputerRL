@@ -1559,7 +1559,6 @@ class LocalLLM(BaseLLMClient):
             # Scale coordinates back to original image space
             scaled_x = int(pred_x * scale_x)
             scaled_y = int(pred_y * scale_y)
-
             py_cmd = (scaled_x, scaled_y)
 
             return py_cmd, ''
@@ -1758,8 +1757,8 @@ if __name__ == "__main__":
     model_name = "gta1-7b" #"gta1-7b" #"uitars-1.5-7b"
     
     # instruction = "Click the funnel (filter) icon in the top menu bar — the middle icon directly under the page title 'servicenow' above the Incidents list."
-    instruction = "Click on the 'Search engine' option in the left sidebar"
-    path = "/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern/chrome/bb5e4c0d-f964-439c-97b6-bdb9747de3f4/operations/step_21_gui_action.png"
+    instruction = "CClick on the 'Discussion' link under the COMMUNITY section"
+    path = "/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern/chrome/a96b564e-dbe9-42c3-9ccf-b4498073438a/operations/step_35_gui_action.png"
     image = Image.open(path)
     screen_width, screen_height = 1280, 720
     image = image.resize((screen_width, screen_height))

@@ -4,6 +4,8 @@ import json
 import os
 import logging
 import traceback
+import re
+import hashlib
 from typing import Optional, Dict, List
 from mm_agents.hisa.llm import AbstractLLM
 from utils import serialize_json, get_change_roi
@@ -42,31 +44,29 @@ When provided:
 
 # Tools
 ## gui_action
-Execute pyautogui code with optional placeholders for visual grounding.
+Execute pyautogui code. Mouse-position actions are visually grounded by the executor using your description.
 Input: PyAutoGUI code string
 
 Use cases:
-- **With placeholders**: `pyautogui.click(X_COORD, Y_COORD)` with description - the system will locate the element
-  - **CRITICAL**: Use X_COORD and Y_COORD placeholders when you need to locate GUI elements
-  - For drag actions, use two placeholder pairs: START and END
+- For click / double-click / right-click / move / drag / scroll on a specific region, describe the target element clearly in `description`
+- For drag actions, `description` MUST include both targets using this format:
+  `START: <start target description>; END: <end target description>`
 
-**CRITICAL**: For text input operations, combine click and type in ONE action: `pyautogui.click(X_COORD, Y_COORD); pyautogui.write('text')`
+**CRITICAL**: For text input operations, combine click and type in ONE action.
 
-**Note**: Don't use pyperclip. Provide a clear element description when using placeholders.
-For drag placeholders, description MUST include both targets using this format:
-`START: <start target description>; END: <end target description>`
+**Note**: Don't use pyperclip. For any mouse-position action, provide a clear `description` so the executor can ground coordinates.
 
 ### Action Schema (MUST follow exactly)
 Use these exact pyautogui APIs in `input`:
-- Single click: `pyautogui.click(X_COORD, Y_COORD)`
-- Double click: `pyautogui.doubleClick(X_COORD, Y_COORD)`
-- Right click: `pyautogui.rightClick(X_COORD, Y_COORD)`
-- Hover/move: `pyautogui.moveTo(X_COORD, Y_COORD)`
-- Drag (two coordinate points): `pyautogui.moveTo(START_X_COORD, START_Y_COORD); pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')`
+- Single click: `pyautogui.click(x, y)`
+- Double click: `pyautogui.doubleClick(x, y)`
+- Right click: `pyautogui.rightClick(x, y)`
+- Hover/move: `pyautogui.moveTo(x, y)`
+- Drag (two coordinate points): `pyautogui.moveTo(x1, y1); pyautogui.dragTo(x2, y2, duration=0.5, button='left')`
 - Type text: `pyautogui.write('text')`
 - Press key: `pyautogui.press('enter')`
 - Hotkey: `pyautogui.hotkey('ctrl', 'c')`
-- Scroll: `pyautogui.scroll(-5)` (down), `pyautogui.scroll(5)` (up)
+- Scroll: `pyautogui.moveTo(x, y); pyautogui.scroll(amount)` (`amount < 0` for down, `amount > 0` for up, keep `amount` within `[-10, 10]`)
 
 ### Consistency Rules (HARD constraints)
 - If thought/description says "double-click", `input` MUST use `pyautogui.doubleClick(...)`.
@@ -86,7 +86,6 @@ Execute bash commands and Python scripts.
 Input: Code string (bash or Python)
 
 ### Available Commands
-- **Sudo**: `echo {CLIENT_PASSWORD} | sudo -S [COMMAND]`
 - **Python**: `python3 -c "code"` or `pip install package && python3 -c "import package"`
 - **Ignore "sudo: /etc/sudoers.d is world writable" errors**
 
@@ -156,13 +155,13 @@ When operations fail:
     "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
     "tool": "gui_action|bash_execution|wait|termination|infeasible",
     "input": "String - tool-specific content (see examples below)",
-    "description": "Optional - only for gui_action with placeholders, describe the element to locate"
+    "description": "Optional for non-mouse actions; required for mouse-position gui_action so the executor can ground coordinates"
 }
 ```
 
 Examples:
-- gui_action with placeholder: `{"tool": "gui_action", "input": "pyautogui.click(X_COORD, Y_COORD)", "description": "Click the Submit button"}`
-- gui_action without placeholder: `{"tool": "gui_action", "input": "pyautogui.write('hello')"}`
+- gui_action with grounding: `{"tool": "gui_action", "input": "pyautogui.click(0, 0)", "description": "Click the Submit button"}`
+- gui_action without grounding: `{"tool": "gui_action", "input": "pyautogui.write('hello')"}`
 - wait: `{"tool": "wait", "input": "15"}`
 - bash_execution: `{"tool": "bash_execution", "input": "ls -la"}`
 - termination: `{"tool": "termination", "input": "Task completed. [summary]"}`
@@ -750,6 +749,66 @@ class HiSA:
             }
         return delta
 
+    def _hash_text(self, text: str) -> str:
+        """Create a stable fingerprint for text."""
+        if text is None:
+            text = ""
+        return hashlib.sha256(str(text).encode("utf-8", errors="replace")).hexdigest()
+
+    def _hash_bytes(self, content: bytes) -> str:
+        """Create a stable fingerprint for bytes."""
+        return hashlib.sha256(content or b"").hexdigest()
+
+    def _get_decision_action_fingerprint(self, decision: Dict) -> str:
+        """Compute action fingerprint from current decision before execution."""
+        tool = decision.get("tool", "")
+        tool_input = decision.get("input", "")
+
+        if tool == "bash_execution":
+            return self._hash_text(self._normalize_bash_command(tool_input))
+        if tool == "gui_action":
+            return self._hash_text(tool_input)
+        return ""
+
+    def _detect_execution_loop(self, decision: Dict) -> Optional[str]:
+        """Detect strict loops with identical action/result fingerprints."""
+        tool = decision.get("tool", "")
+        if tool not in ["gui_action", "bash_execution"] or not self.action_logs:
+            return None
+
+        threshold = 5 if tool == "gui_action" else 3
+        candidate_action_fp = self._get_decision_action_fingerprint(decision)
+        if not candidate_action_fp:
+            return None
+
+        last_log = self.action_logs[-1]
+        if last_log.get("type") != tool:
+            return None
+
+        last_action_fp = last_log.get("loop_action_fingerprint", "")
+        last_result_fp = last_log.get("loop_result_fingerprint", "")
+        if not last_action_fp or not last_result_fp:
+            return None
+        if candidate_action_fp != last_action_fp:
+            return None
+
+        repeat_count = 0
+        for log in reversed(self.action_logs):
+            if log.get("type") != tool:
+                break
+            if log.get("loop_action_fingerprint") != last_action_fp:
+                break
+            if log.get("loop_result_fingerprint") != last_result_fp:
+                break
+            repeat_count += 1
+
+        if repeat_count >= threshold:
+            return (
+                f"Detected strict execution loop: same {tool} action fingerprint and result fingerprint "
+                f"repeated {repeat_count} consecutive times (threshold={threshold})."
+            )
+        return None
+
     def _summarize_history_segment(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
         """Summarize a segment of action logs with context refinement."""
         
@@ -920,6 +979,42 @@ class HiSA:
 
                 # Check termination or infeasible
                 if decision["tool"] == "termination":
+                    step = self.operation_count + 1
+                    global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
+                    screenshot_file = f"step_{step}.png"
+                    try:
+                        screenshot = self.env.controller.get_screenshot()
+                        with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                            f.write(screenshot)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to capture termination screenshot: {e}")
+                        screenshot_file = ""
+
+                    thought_prefix = f"Thought: {decision.get('thought', '')} | " if decision.get('thought') else ""
+                    step_abstract = (
+                        f"Step {step}: termination | {thought_prefix}"
+                        f"Summary: {decision.get('input', 'Task completed.')} | Result: Terminated"
+                    )
+                    self.action_logs.append({
+                        "step": step,
+                        "type": "termination",
+                        "execution_success": True,
+                        "screenshot": screenshot_file,
+                        "step_abstract": step_abstract,
+                        "step_time": 0.0,
+                        "token_usage": {
+                            "global_planner": global_planner_usage["global_planner"],
+                            "visual_grounder": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
+                            "state_manager": global_planner_usage["state_manager"],
+                            "total": {
+                                "cost": global_planner_usage["global_planner"]["cost"] + global_planner_usage["state_manager"]["cost"],
+                                "prompt_tokens": global_planner_usage["global_planner"]["prompt_tokens"] + global_planner_usage["state_manager"]["prompt_tokens"],
+                                "completion_tokens": global_planner_usage["global_planner"]["completion_tokens"] + global_planner_usage["state_manager"]["completion_tokens"],
+                                "image_count": global_planner_usage["global_planner"]["image_count"] + global_planner_usage["state_manager"]["image_count"]
+                            }
+                        }
+                    })
+                    self.operation_count += 1
                     is_infeasible = False
                     self.logger.info("Task COMPLETED")
                     break
@@ -946,6 +1041,20 @@ class HiSA:
                     "state_manager": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
                     "total": global_planner_usage["global_planner"].copy()
                 }
+
+                loop_error = self._detect_execution_loop(decision)
+                if loop_error:
+                    self.logger.warning(loop_error)
+                    self.last_error_feedback = (
+                        f"{loop_error}\n"
+                        "Do not repeat the same action. Switch strategy immediately "
+                        "(different target, different tool, or different command)."
+                    )
+                    if self.wo_step:
+                        self.last_tool_output = f"Execution blocked: {loop_error}"
+                    # Count this as a consumed step to avoid infinite planner-loop cycles.
+                    self.operation_count += 1
+                    continue
 
                 # Execute tool and capture execution result text
                 execution_result_text = self._execute_tool(decision)
@@ -1072,7 +1181,7 @@ class HiSA:
                 if self.wo_step:
                     # Use full conversation history approach
                     messages = [
-                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
+                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
                     ]
                     
                     # Build current query text
@@ -1166,7 +1275,7 @@ Based on the execution_history and current screenshot, decide the next action. A
     "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
     "tool": "gui_action|bash_execution|wait|termination|infeasible",
     "input": "String - tool-specific content (see examples below)",
-    "description": "Optional - only for gui_action with placeholders, describe the element to locate"
+    "description": "Optional for non-mouse actions; required for mouse-position gui_action so the executor can ground coordinates"
 }
 ```""")
 
@@ -1174,7 +1283,7 @@ Based on the execution_history and current screenshot, decide the next action. A
 
                     # Build messages array
                     messages = [
-                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT.replace('{CLIENT_PASSWORD}', self.client_password)},
+                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
                         {
                             "role": "user",
                             "content": [
@@ -1210,7 +1319,10 @@ Based on the execution_history and current screenshot, decide the next action. A
                 if decision["tool"] not in ["gui_action", "bash_execution", "wait", "termination", "infeasible"]:
                     raise ValueError(f"Invalid tool: {decision['tool']}")
 
-                self.logger.info(f"Tool: {decision.get('tool', 'N/A')} | Thought: {decision.get('thought', '')}")
+                try:
+                    self.logger.info(f"[decision]: {json.dumps(decision, indent=4)}")
+                except Exception as e:
+                    self.logger.info(f"[decision]: {decision}")
 
                 # Clear error feedback on success
                 self.last_error_feedback = None
@@ -1271,6 +1383,118 @@ Based on the execution_history and current screenshot, decide the next action. A
             return self._wait(tool_input)
 
         return ""
+
+    def _normalize_bash_command(self, code: str) -> str:
+        """Normalize bash command to enforce non-interactive sudo usage."""
+        if not isinstance(code, str) or not code.strip():
+            return code
+
+        # Collapse common forms to plain "sudo ...":
+        # "echo '' | sudo -S cmd", "echo 'password' | sudo -S cmd", "sudo -S cmd"
+        normalized = re.sub(
+            r"(?:echo\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*\|\s*)?sudo\s+-S\s+",
+            "sudo ",
+            code,
+        )
+
+        # Enforce sudo prefix with configured client password.
+        quoted_password = "'" + self.client_password.replace("'", "'\"'\"'") + "'"
+        sudo_prefix = f"echo {quoted_password} | sudo -S"
+        normalized = re.sub(r"\bsudo\b", sudo_prefix, normalized)
+
+        return normalized.strip()
+
+    def _replace_first_point_action(self, code: str, action_name: str, x: int, y: int) -> str:
+        pattern = rf"(pyautogui\.{re.escape(action_name)}\()\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?"
+        replacement = rf"\g<1>{x}, {y}"
+        new_code, count = re.subn(pattern, replacement, code, count=1)
+        if count == 0:
+            raise ValueError(f"Failed to inject grounded coordinates for {action_name}")
+        return new_code
+
+    def _replace_first_drag_target(self, code: str, x: int, y: int) -> str:
+        pattern = r"(pyautogui\.dragTo\()\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?"
+        replacement = rf"\g<1>{x}, {y}"
+        new_code, count = re.subn(pattern, replacement, code, count=1)
+        if count == 0:
+            raise ValueError("Failed to inject grounded drag target coordinates")
+        return new_code
+
+    def _ground_gui_code(self, code: str, description: str, screenshot: bytes) -> str:
+        """Auto-ground mouse-position gui_action code from action type and description."""
+        if not isinstance(code, str) or not code.strip():
+            return code
+
+        grounded_code = code
+        has_placeholders = any(
+            token in grounded_code
+            for token in [
+                "X_COORD", "Y_COORD",
+                "START_X_COORD", "START_Y_COORD", "END_X_COORD", "END_Y_COORD",
+            ]
+        )
+        if has_placeholders:
+            if not description:
+                raise ValueError("Description required when using placeholders")
+            return self._call_visual_grounder(description, screenshot, grounded_code)
+
+        if "pyautogui.dragTo(" in grounded_code:
+            if not description:
+                raise ValueError("Description is required for drag actions")
+            start_desc, end_desc = self._parse_drag_descriptions(description)
+            start_cmd = self._call_visual_grounder(start_desc, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
+            end_cmd = self._call_visual_grounder(end_desc, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
+            start_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", start_cmd)
+            end_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", end_cmd)
+            if not start_match or not end_match:
+                raise ValueError("Failed to ground drag start/end coordinates")
+            grounded_code = self._replace_first_point_action(
+                grounded_code, "moveTo", int(start_match.group(1)), int(start_match.group(2))
+            )
+            grounded_code = self._replace_first_drag_target(
+                grounded_code, int(end_match.group(1)), int(end_match.group(2))
+            )
+            return grounded_code
+
+        single_point_actions = ["click", "doubleClick", "rightClick", "moveTo"]
+        matched_single_action = next(
+            (name for name in single_point_actions if f"pyautogui.{name}(" in grounded_code),
+            None
+        )
+        if matched_single_action:
+            if not description:
+                raise ValueError(f"Description is required for {matched_single_action} actions")
+            grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
+            point_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", grounded_point)
+            if not point_match:
+                raise ValueError(f"Failed to ground coordinates for {matched_single_action}")
+            grounded_code = self._replace_first_point_action(
+                grounded_code, matched_single_action, int(point_match.group(1)), int(point_match.group(2))
+            )
+            return grounded_code
+
+        if "pyautogui.scroll(" in grounded_code:
+            if not description:
+                raise ValueError("Description is required for scroll actions")
+            grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
+            point_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", grounded_point)
+            if not point_match:
+                raise ValueError("Failed to ground coordinates for scroll action")
+            x, y = int(point_match.group(1)), int(point_match.group(2))
+            if "pyautogui.moveTo(" in grounded_code:
+                grounded_code = self._replace_first_point_action(grounded_code, "moveTo", x, y)
+            elif re.search(r"pyautogui\.scroll\([^)]*x\s*=\s*-?\d+(?:\.\d+)?\s*,\s*y\s*=\s*-?\d+(?:\.\d+)?", grounded_code):
+                grounded_code = re.sub(
+                    r"(pyautogui\.scroll\([^)]*x\s*=\s*)-?\d+(?:\.\d+)?(\s*,\s*y\s*=\s*)-?\d+(?:\.\d+)?",
+                    rf"\1{x}\2{y}",
+                    grounded_code,
+                    count=1,
+                )
+            else:
+                grounded_code = f"pyautogui.moveTo({x}, {y}); " + grounded_code
+            return grounded_code
+
+        return grounded_code
     
     def _call_visual_grounder(self, description: str, screenshot: bytes, code: str):
         """Call visual grounder to get coordinates or code using call_cua.
@@ -1292,7 +1516,6 @@ Based on the execution_history and current screenshot, decide the next action. A
                 screen_height=self.screen_height,
                 scale=scale
             )
-            self.logger.info(f"Visual Grounder result: {py_cmd}")
             if not py_cmd:
                 raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
             return py_cmd
@@ -1357,6 +1580,7 @@ Based on the execution_history and current screenshot, decide the next action. A
 
     def _gui_action(self, code: str, description: str = "") -> str:
         """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
+        requested_action_fingerprint = self._hash_text(code)
         if description:
             self.logger.info(f"[gui_action] {description}")
         else:
@@ -1370,26 +1594,8 @@ Based on the execution_history and current screenshot, decide the next action. A
         try:
             # Get before screenshot
             before_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_gui_action.png"
-
-            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
-                f.write(before_screenshot)
-
-            # Check if code contains placeholders
-            has_placeholders = any(
-                token in code
-                for token in [
-                    "X_COORD", "Y_COORD",
-                    "START_X_COORD", "START_Y_COORD", "END_X_COORD", "END_Y_COORD",
-                ]
-            )
-            
-            if has_placeholders:
-                if not description:
-                    raise ValueError("Description required when using placeholders")
-                
-                # Call visual grounder
-                code = self._call_visual_grounder(description, before_screenshot, code)
+            screenshot_file = f"step_{step}.png"
+            code = self._ground_gui_code(code, description, before_screenshot)
 
             # Execute code
             final_code = postprocess_action(code)
@@ -1400,6 +1606,8 @@ Based on the execution_history and current screenshot, decide the next action. A
 
             # Get after screenshot and evaluate
             after_screenshot = obs['screenshot']
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(after_screenshot)
 
             # Create description for step abstraction
             eval_desc = description if description else code
@@ -1422,6 +1630,9 @@ Based on the execution_history and current screenshot, decide the next action. A
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
+            # GUI loop detection should be robust to dynamic pixels (clock/cursor/animations),
+            # so do not fingerprint raw screenshots.
+            result_fingerprint = self._hash_text("success=True")
 
             self.action_logs.append({
                 "step": step,
@@ -1430,7 +1641,9 @@ Based on the execution_history and current screenshot, decide the next action. A
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
                 "step_time": round(step_time, 2),
-                "token_usage": self.step_token_usage
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": requested_action_fingerprint,
+                "loop_result_fingerprint": result_fingerprint
             })
 
             # Return execution result text for wo_step mode
@@ -1451,6 +1664,7 @@ Based on the execution_history and current screenshot, decide the next action. A
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
+            result_fingerprint = self._hash_text(f"success=False|error={str(e)}")
 
             self.action_logs.append({
                 "step": step,
@@ -1459,7 +1673,9 @@ Based on the execution_history and current screenshot, decide the next action. A
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
                 "step_time": round(step_time, 2),
-                "token_usage": self.step_token_usage
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": requested_action_fingerprint,
+                "loop_result_fingerprint": result_fingerprint
             })
 
             # Return execution result text for wo_step mode
@@ -1554,6 +1770,8 @@ Based on the execution_history and current screenshot, decide the next action. A
 
     def _bash_execution(self, code: str) -> str:
         """Execute bash commands or Python scripts (not pyautogui)."""
+        code = self._normalize_bash_command(code)
+        action_fingerprint = self._hash_text(code)
         self.logger.info(f"[bash_execution] {code}")
 
         # Record step start time
@@ -1613,7 +1831,7 @@ except subprocess.TimeoutExpired as e:
 
             # Get after screenshot
             after_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_bash.png"
+            screenshot_file = f"step_{step}.png"
 
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(after_screenshot)
@@ -1632,6 +1850,9 @@ except subprocess.TimeoutExpired as e:
             # Generate step_abstract summary
             thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
             step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Output: {logs} | {step_abstraction}"
+            result_fingerprint = self._hash_text(
+                f"status={status}|exitcode={exitcode}|output={logs}"
+            )
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -1643,7 +1864,9 @@ except subprocess.TimeoutExpired as e:
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
                 "step_time": round(step_time, 2),
-                "token_usage": self.step_token_usage
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": action_fingerprint,
+                "loop_result_fingerprint": result_fingerprint
             })
 
             # Return execution result text for wo_step mode
@@ -1654,7 +1877,7 @@ except subprocess.TimeoutExpired as e:
             self.logger.error(f"Bash execution error: {e}")
 
             screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_bash_error.png"
+            screenshot_file = f"step_{step}.png"
 
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(screenshot)
@@ -1662,6 +1885,7 @@ except subprocess.TimeoutExpired as e:
             # Generate step_abstract summary for error
             thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
             step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
+            result_fingerprint = self._hash_text(f"error={str(e)}")
 
             self.action_logs.append({
                 "step": step,
@@ -1669,7 +1893,9 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
-                "token_usage": self.step_token_usage
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": action_fingerprint,
+                "loop_result_fingerprint": result_fingerprint
             })
 
             # Return execution result text for wo_step mode
@@ -1695,19 +1921,14 @@ except subprocess.TimeoutExpired as e:
         try:
             # Get before screenshot
             before_screenshot = self.env.controller.get_screenshot()
-            screenshot_file = f"step_{step}_wait_before.png"
-
-            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
-                f.write(before_screenshot)
+            screenshot_file = f"step_{step}.png"
 
             # Wait
             time.sleep(wait_seconds)
 
             # Get after screenshot
             after_screenshot = self.env.controller.get_screenshot()
-            after_screenshot_file = f"step_{step}_wait_after.png"
-
-            with open(os.path.join(self.operations_dir, after_screenshot_file), "wb") as f:
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(after_screenshot)
 
             # Step abstraction for wait
