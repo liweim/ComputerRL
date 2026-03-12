@@ -372,22 +372,24 @@ def summary(result_dir, test_all_meta):
             error_file = os.path.join(result_dir, f"{domain}/{ex_id}/err_reason.txt")
 
             # --- 1. Get Score ---
-            if os.path.exists(score_file):
+            has_completed_score = os.path.exists(score_file)
+            if has_completed_score:
                 with open(score_file, "r") as f:
                     try:
                         score = eval(f.read()) * 100
                     except:
                         score = 0
             else:
-                # If no result file exists, treat score as 0 and count as remaining task
+                # Missing result file means the task has not completed yet.
                 score = 0
             if score > 0 and os.path.exists(error_file):
                 os.remove(error_file)
             if not os.path.exists(score_file) or os.path.exists(error_file):
                 count_remain += 1
-            
-            all_scores.append(score)
-            stats[domain]["score"].append(score)
+
+            if has_completed_score:
+                all_scores.append(score)
+                stats[domain]["score"].append(score)
 
             # --- 2. Check for Errors ---
             # If an error file exists, skip statistics and fail logging after recording the score.
@@ -463,10 +465,11 @@ def summary(result_dir, test_all_meta):
                     print(f"not found: {execution_log_file}")
                 continue
 
-    num_tasks = len(all_scores)
+    num_tasks = sum(len(example_ids) for example_ids in test_all_meta.values())
+    num_completed_scores = len(all_scores)
     num_tasks_with_log = len(all_costs)  # Number of tasks with execution_log
-    avg_score = np.mean(all_scores)
-    avg_score_50 = np.sum(all_scores_50) / num_tasks
+    avg_score = np.mean(all_scores) if num_completed_scores > 0 else 0
+    avg_score_50 = np.mean(all_scores_50) if len(all_scores_50) > 0 else 0
     total_cost = sum(all_costs)
 
     # Calculate total operations and tokens
@@ -500,7 +503,7 @@ def summary(result_dir, test_all_meta):
             "score": avg_score,
             "score_50": avg_score_50,
             "total_tasks": num_tasks,
-            "completed_tasks": num_tasks_with_log,
+            "completed_tasks": num_completed_scores,
             "left_tasks": count_remain,  # All incomplete tasks
             "error_tasks": count_errors,  # Only tasks with err_reason.txt
             "total": {
@@ -535,19 +538,21 @@ def summary(result_dir, test_all_meta):
         },
         "domain_breakdown": {
             domain: {
-                "score": np.mean(stats[domain]["score"]),
-                "cost": np.mean(stats[domain]["cost"]),
-                "tokens": np.mean(stats[domain]["prompt_tokens"])
-                + np.mean(stats[domain]["completion_tokens"]),
-                "prompt_tokens": np.mean(stats[domain]["prompt_tokens"]),
+                "score": np.mean(stats[domain]["score"]) if len(stats[domain]["score"]) > 0 else 0,
+                "cost": np.mean(stats[domain]["cost"]) if len(stats[domain]["cost"]) > 0 else 0,
+                "tokens": (
+                    np.mean(stats[domain]["prompt_tokens"])
+                    + np.mean(stats[domain]["completion_tokens"])
+                ) if len(stats[domain]["prompt_tokens"]) > 0 and len(stats[domain]["completion_tokens"]) > 0 else 0,
+                "prompt_tokens": np.mean(stats[domain]["prompt_tokens"]) if len(stats[domain]["prompt_tokens"]) > 0 else 0,
                 "completion_tokens": np.mean(
                     stats[domain]["completion_tokens"]
-                ),
-                "image_counts": np.mean(stats[domain]["image_counts"]),
-                "steps": np.mean(stats[domain]["total_steps"]),
-                "cua_steps": np.mean(stats[domain]["gui_steps"]),
-                "code_steps": np.mean(stats[domain]["code_steps"]),
-                "execution_time": np.mean(stats[domain]["execution_time"]),
+                ) if len(stats[domain]["completion_tokens"]) > 0 else 0,
+                "image_counts": np.mean(stats[domain]["image_counts"]) if len(stats[domain]["image_counts"]) > 0 else 0,
+                "steps": np.mean(stats[domain]["total_steps"]) if len(stats[domain]["total_steps"]) > 0 else 0,
+                "cua_steps": np.mean(stats[domain]["gui_steps"]) if len(stats[domain]["gui_steps"]) > 0 else 0,
+                "code_steps": np.mean(stats[domain]["code_steps"]) if len(stats[domain]["code_steps"]) > 0 else 0,
+                "execution_time": np.mean(stats[domain]["execution_time"]) if len(stats[domain]["execution_time"]) > 0 else 0,
             }
             for domain in test_all_meta
         },
@@ -570,6 +575,8 @@ def summary(result_dir, test_all_meta):
     avg_completion_tokens = summary_stats['average']['completion_tokens']
     avg_steps = summary_stats['average']['steps']
     avg_execution_time = summary_stats['average']['execution_time']
+    print('*'*100)
+    print(result_dir)
     print(f"Total tasks: {total_tasks}, Left tasks: {left_tasks}, Error tasks: {error_tasks}")
     print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.2f},{avg_score_50:.2f},{avg_cost:.2f},{avg_total_tokens:.2f},{avg_prompt_tokens:.2f},{avg_completion_tokens:.2f},{avg_steps:.2f},{avg_execution_time:.2f}")
 
@@ -657,9 +664,10 @@ def compare_results(methods):
 
 
 if __name__ == "__main__":
-    #autoglm-os_baseline, hisa_wo_pattern
-    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/autoglm-os_gta1_7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_small.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')
-    compare_results(['autoglm-os_baseline', 'hisa_qwen3.5-9b_wo_step_refinement_pattern'])
+    #computerRL_baseline, hisa_wo_pattern
+    summary('/data1/lwm/projects/ComputerRL/results/computerRL_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # compare_results(['computerRL_baseline', 'computerRL_gta1-7b_restart_ori_res'])

@@ -67,10 +67,12 @@ def config() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
     parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
     parser.add_argument("--repetition_penalty", type=float, default=1)  # original: 1
+    parser.add_argument("--presence_penalty", type=float, default=0.0)
     parser.add_argument("--summary_temperature", type=float, default=0.5)
     parser.add_argument("--summary_top_p", type=float, default=1.0)
     parser.add_argument("--summary_max_tokens", type=int, default=512)
     parser.add_argument("--summary_repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--summary_presence_penalty", type=float, default=0.0)
     parser.add_argument("--stop_token", type=str, default=None)
     parser.add_argument("--visual_grounder_model", type=str, default="autoglm-os",
                         help="Model for visual grounding (e.g., autoglm-os, gta1-7b)")
@@ -110,7 +112,7 @@ def config() -> argparse.Namespace:
     return args
 
 
-def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalty):
+def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalty, presence_penalty):
     data = {
         "model": model,
         "messages": messages,
@@ -118,6 +120,7 @@ def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalt
         "temperature": temperature,
         "top_p": top_p,
         "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
         "skip_special_tokens": False,
         "stream": False,
         "include_stop_str_in_output": True,
@@ -451,6 +454,7 @@ def _summarize_failures_with_llm(agent, action_history_full, instruction, logger
             top_p=args.summary_top_p,
             max_tokens=args.summary_max_tokens,
             repetition_penalty=args.summary_repetition_penalty,
+            presence_penalty=args.summary_presence_penalty,
         )["content"]
     except Exception as exc:
         logger.warning("Failure summary LLM call failed: %s", exc)
@@ -777,10 +781,12 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "max_tokens": args.max_tokens,
         "stop_token": args.stop_token,
         "repetition_penalty": args.repetition_penalty,
+        "presence_penalty": args.presence_penalty,
         "summary_temperature": args.summary_temperature,
         "summary_top_p": args.summary_top_p,
         "summary_max_tokens": args.summary_max_tokens,
         "summary_repetition_penalty": args.summary_repetition_penalty,
+        "summary_presence_penalty": args.summary_presence_penalty,
         "result_dir": args.result_dir,
     }
 
@@ -793,6 +799,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             top_p=args.top_p,
             max_tokens=args.max_tokens,
             repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
         )
         logger.info("LLM called successfully.")
         return result
@@ -847,129 +854,132 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
     else:
         visual_grounder_model = AbstractLLM(args.visual_grounder_model)
     
-    env = DesktopEnv(
-        provider_name=args.provider_name,
-        region=args.region,
-        client_password=args.client_password,
-        path_to_vm=args.path_to_vm,
-        action_space=args.action_space,
-        screen_size=(args.screen_width, args.screen_height),
-        headless=args.headless,
-        os_type="Ubuntu",
-        require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
-    )
-    _ensure_vm_resolution(env, args.screen_width, args.screen_height, logger)
-    agent = AutoGLMAgent(
-        action_space=args.action_space,
-        observation_type=args.observation_type,
-        screen_size=(args.screen_width, args.screen_height),
-        image_size=(args.image_width, args.image_height),
-        max_trajectory_length=args.max_trajectory_length,
-        client_password=args.client_password,
-        gen_func=token_tracker,
-        max_failure_memory=args.max_restart_failure_memory,
-        visual_grounder_model=visual_grounder_model,
-    )
-    
-    # Attach token_tracker to agent for access in run_single_example
-    agent.token_tracker = token_tracker
+    env = None
+    try:
+        env = DesktopEnv(
+            provider_name=args.provider_name,
+            region=args.region,
+            client_password=args.client_password,
+            path_to_vm=args.path_to_vm,
+            action_space=args.action_space,
+            screen_size=(args.screen_width, args.screen_height),
+            headless=args.headless,
+            os_type="Ubuntu",
+            require_a11y_tree=args.observation_type in ["a11y_tree", "screenshot_a11y_tree", "som"],
+        )
+        _ensure_vm_resolution(env, args.screen_width, args.screen_height, logger)
+        agent = AutoGLMAgent(
+            action_space=args.action_space,
+            observation_type=args.observation_type,
+            screen_size=(args.screen_width, args.screen_height),
+            image_size=(args.image_width, args.image_height),
+            max_trajectory_length=args.max_trajectory_length,
+            client_password=args.client_password,
+            gen_func=token_tracker,
+            max_failure_memory=args.max_restart_failure_memory,
+            visual_grounder_model=visual_grounder_model,
+        )
+        
+        # Attach token_tracker to agent for access in run_single_example
+        agent.token_tracker = token_tracker
 
-    for domain in tqdm(test_all_meta, desc="Domain"):
-        for example_id in tqdm(test_all_meta[domain], desc="Example", leave=False):
-            config_file = os.path.join(args.test_config_base_dir, f"{domain}/{example_id}.json")
-            with open(config_file, "r", encoding="utf-8") as f:
-                example = json.load(f)
+        for domain in tqdm(test_all_meta, desc="Domain"):
+            for example_id in tqdm(test_all_meta[domain], desc="Example", leave=False):
+                config_file = os.path.join(args.test_config_base_dir, f"{domain}/{example_id}.json")
+                with open(config_file, "r", encoding="utf-8") as f:
+                    example = json.load(f)
 
-            logger.info(f"[Domain]: {domain}")
-            logger.info(f"[Example ID]: {example_id}")
+                logger.info(f"[Domain]: {domain}")
+                logger.info(f"[Example ID]: {example_id}")
 
-            instruction = example["instruction"]
+                instruction = example["instruction"]
 
-            logger.info(f"[Instruction]: {instruction}")
-            # wandb each example config settings
-            cfg_args["instruction"] = instruction
-            cfg_args["start_time"] = datetime.datetime.now().strftime("%Y:%m:%d-%H:%M:%S")
+                logger.info(f"[Instruction]: {instruction}")
+                # wandb each example config settings
+                cfg_args["instruction"] = instruction
+                cfg_args["start_time"] = datetime.datetime.now().strftime("%Y:%m:%d-%H:%M:%S")
 
-            example_result_dir = os.path.join(
-                args.result_dir,
-                domain,
-                example_id,
-            )
-            # Clean up old results if this is a rerun task
-            if args.rerun or args.rerun_fail:
-                if os.path.exists(example_result_dir):
-                    logger.info(f"Removing old results for {domain}/{example_id}")
-                    shutil.rmtree(example_result_dir)
-            os.makedirs(example_result_dir, exist_ok=True)
-            # example start running
-            try:
-                run_single_example(
-                    agent,
-                    env,
-                    example,
-                    max_steps,
-                    instruction,
-                    args,
-                    example_result_dir,
-                    scores,
+                example_result_dir = os.path.join(
+                    args.result_dir,
+                    domain,
+                    example_id,
                 )
-            except Exception as e:
-                logger.error(f"Exception in {domain}/{example_id}: {e}")
-                # Only attempt to end recording if controller exists (not Docker provider)
-                if hasattr(env, "controller") and env.controller is not None:
-                    env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
-                with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
-                    f.write(json.dumps({"Error": f"Exception in {domain}/{example_id}: {e}"}))
-                    f.write("\n")
-                # Write a minimal execution log so downstream scripts can rely on this file existing.
-                exception_log = {
-                    "statistics": {
-                        "score": 0.0,
-                        "total_steps": 0,
-                        "cua_steps": 0,
-                        "coding_steps": 0,
-                        "wait_steps": 0,
-                        "image_count": 0,
-                        "total_cost": 0.0,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "execution_time": 0.0,
-                        "model_usage": {
-                            "model": {
-                                "model_name": args.model if hasattr(args, "model") else "autoglm-os",
-                                "cost": 0.0,
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "image_count": 0,
-                            }
+                # Clean up old results if this is a rerun task
+                if args.rerun or args.rerun_fail:
+                    if os.path.exists(example_result_dir):
+                        logger.info(f"Removing old results for {domain}/{example_id}")
+                        shutil.rmtree(example_result_dir)
+                os.makedirs(example_result_dir, exist_ok=True)
+                # example start running
+                try:
+                    run_single_example(
+                        agent,
+                        env,
+                        example,
+                        max_steps,
+                        instruction,
+                        args,
+                        example_result_dir,
+                        scores,
+                    )
+                except Exception as e:
+                    logger.error(f"Exception in {domain}/{example_id}: {e}")
+                    # Only attempt to end recording if controller exists (not Docker provider)
+                    if hasattr(env, "controller") and env.controller is not None:
+                        env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
+                    with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
+                        f.write(json.dumps({"Error": f"Exception in {domain}/{example_id}: {e}"}))
+                        f.write("\n")
+                    # Write a minimal execution log so downstream scripts can rely on this file existing.
+                    exception_log = {
+                        "statistics": {
+                            "score": 0.0,
+                            "total_steps": 0,
+                            "cua_steps": 0,
+                            "coding_steps": 0,
+                            "wait_steps": 0,
+                            "image_count": 0,
+                            "total_cost": 0.0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "execution_time": 0.0,
+                            "model_usage": {
+                                "model": {
+                                    "model_name": args.model if hasattr(args, "model") else "autoglm-os",
+                                    "cost": 0.0,
+                                    "prompt_tokens": 0,
+                                    "completion_tokens": 0,
+                                    "image_count": 0,
+                                }
+                            },
                         },
-                    },
-                    "task_config": example,
-                    "additional_context": "",
-                    "action_logs": [],
-                    "restart": {
-                        "restart_count": 0,
-                        "max_restarts": getattr(args, "max_restart", 0),
-                        "failure_memory": [],
-                        "failure_sequences": [],
-                        "branch_parents": {0: None},
-                        "branch_summary_text": _format_branch_tree({0: None}),
-                    },
-                    "exception": {
-                        "type": type(e).__name__,
-                        "message": str(e),
-                        "domain": domain,
-                        "example_id": example_id,
-                    },
-                }
-                with open(os.path.join(example_result_dir, "execution_log.json"), "w", encoding="utf-8") as f:
-                    json.dump(exception_log, f, indent=2, ensure_ascii=False)
-                # Write result.txt with score 0 to mark task as completed (failed)
-                with open(os.path.join(example_result_dir, "result.txt"), "w") as f:
-                    f.write("0.0\n")
-                scores.append(0.0)
-
-    env.close()
+                        "task_config": example,
+                        "additional_context": "",
+                        "action_logs": [],
+                        "restart": {
+                            "restart_count": 0,
+                            "max_restarts": getattr(args, "max_restart", 0),
+                            "failure_memory": [],
+                            "failure_sequences": [],
+                            "branch_parents": {0: None},
+                            "branch_summary_text": _format_branch_tree({0: None}),
+                        },
+                        "exception": {
+                            "type": type(e).__name__,
+                            "message": str(e),
+                            "domain": domain,
+                            "example_id": example_id,
+                        },
+                    }
+                    with open(os.path.join(example_result_dir, "execution_log.json"), "w", encoding="utf-8") as f:
+                        json.dump(exception_log, f, indent=2, ensure_ascii=False)
+                    # Write result.txt with score 0 to mark task as completed (failed)
+                    with open(os.path.join(example_result_dir, "result.txt"), "w") as f:
+                        f.write("0.0\n")
+                    scores.append(0.0)
+    finally:
+        if env is not None:
+            env.close()
     if len(scores) > 0:
         logger.info(f"Average score: {sum(scores) / len(scores)}")
     else:

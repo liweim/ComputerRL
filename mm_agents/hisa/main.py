@@ -6,7 +6,7 @@ import logging
 import traceback
 import re
 import hashlib
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from mm_agents.hisa.llm import AbstractLLM
 from utils import serialize_json, get_change_roi
 from json_repair import repair_json
@@ -24,15 +24,15 @@ GLOBAL_PLANNER_PROMPT = """You are an expert in GUIs and bash code executing tas
 
 # General Instructions
 1. **CRITICAL: Do ONLY what the task asks - nothing more, nothing less**
-2. **CRITICAL: Use as LEAST steps as possible to complete the task**
-3. **CRITICAL: When all required steps are done, termination IMMEDIATELY**
+2. **CRITICAL: Use as FEW steps as possible, but include a final verification before termination**
+3. **CRITICAL: NEVER terminate immediately after the last edit/click/command**
 4. **CRITICAL: ALWAYS review <execution_history> before deciding next action:**
    - Check what actions have been done and their results
    - Avoid repeating the same action more than 3 times
    - Count completed steps to judge task completion
 5. You receive: screenshot, execution history, past patterns
 6. Never modify user requirements (file names, paths, etc.)
-7. Each action gets automatic evaluation - you don't need separate verification steps
+7. Each action gets automatic evaluation, but that only checks the immediate response, not task completion
 8. **You can read text directly from screenshots** - no need for GUI copy/paste operations. When you read text, record it in your `thought` field so it appears in execution history
 
 # Learning from Past Patterns
@@ -49,8 +49,7 @@ Input: PyAutoGUI code string
 
 Use cases:
 - For click / double-click / right-click / move / drag / scroll on a specific region, describe the target element clearly in `description`
-- For drag actions, `description` MUST include both targets using this format:
-  `START: <start target description>; END: <end target description>`
+- For drag actions, describe the intended drag naturally in `description`; the executor will ground the start and end points automatically
 
 **CRITICAL**: For text input operations, combine click and type in ONE action.
 
@@ -79,7 +78,7 @@ Use these exact pyautogui APIs in `input`:
 Wait for async operations to complete and observe UI changes.
 Input: Number of seconds to wait (5-30 recommended)
 
-**When to use**: After triggering async operations (Submit/Apply/Run buttons, page loads, etc.), use wait to confirm completion before termination.
+**When to use**: After triggering async operations, use wait before verification/termination.
 
 ## bash_execution
 Execute bash commands and Python scripts.
@@ -135,12 +134,12 @@ After **EVERY** action, you automatically receive an evaluation comparing before
   - **DO NOT** retry just because evaluation says "Failed" - may be slow async operations
 
 ## When to termination
-**Judge task completion by counting required steps, NOT by evaluation results:**
   - Track which steps the task requires and which are done
-  - When all required steps are executed, termination IMMEDIATELY
-  - **Exception**: If unsure whether the async operation finished, use the wait tool first, then termination
-  - Ignore "Failed" evaluations if all required steps are done
-  - **DO NOT** add verification steps unless the task explicitly asks
+  - The final step is usually **verify**, not **terminate**
+  - Before termination, verify the exact task outcome with concrete evidence from the screenshot or a read-only command
+  - Do not verify the action itself. Do not terminate based only on a click succeeding, a popup/toast appearing, or a file name appearing
+  - If verification fails, do not terminate. Change approach, or use `wait` if the result may still be processing
+  - If verification is inconclusive, continue working instead of terminating
 
 ## Error Recovery Strategy
 When operations fail:
@@ -168,12 +167,12 @@ Examples:
 - infeasible: `{"tool": "infeasible", "input": "Chrome doesn't support changing search results per page - this is a search engine setting, not a browser feature"}`
 
 ## Termination (Task Complete)
-When **all required actions are done and succeeded**:
+When **all required actions are done and the final state is verified**:
 ```json
 {
-    "thought": "All task requirements completed successfully.",
+    "thought": "All task requirements completed successfully, and I verified the final required state.",
     "tool": "termination",
-    "input": "Task completed. [brief summary of what was done]"
+    "input": "Task completed. [brief summary of what was done and what was verified]"
 }
 ```
 
@@ -1420,6 +1419,12 @@ Based on the execution_history and current screenshot, decide the next action. A
             raise ValueError("Failed to inject grounded drag target coordinates")
         return new_code
 
+    def _extract_grounded_point(self, grounded_cmd: str, action_name: str = "moveTo") -> Tuple[int, int]:
+        match = re.search(rf"pyautogui\.{re.escape(action_name)}\((\d+), (\d+)\)", grounded_cmd)
+        if not match:
+            raise ValueError(f"Failed to extract grounded coordinates from: {grounded_cmd}")
+        return int(match.group(1)), int(match.group(2))
+
     def _ground_gui_code(self, code: str, description: str, screenshot: bytes) -> str:
         """Auto-ground mouse-position gui_action code from action type and description."""
         if not isinstance(code, str) or not code.strip():
@@ -1440,20 +1445,16 @@ Based on the execution_history and current screenshot, decide the next action. A
 
         if "pyautogui.dragTo(" in grounded_code:
             if not description:
-                raise ValueError("Description is required for drag actions")
-            start_desc, end_desc = self._parse_drag_descriptions(description)
+                return grounded_code
+
+            start_desc = f"Locate the drag starting point for: {description}"
+            end_desc = f"Locate the drag ending point for: {description}"
             start_cmd = self._call_visual_grounder(start_desc, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             end_cmd = self._call_visual_grounder(end_desc, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
-            start_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", start_cmd)
-            end_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", end_cmd)
-            if not start_match or not end_match:
-                raise ValueError("Failed to ground drag start/end coordinates")
-            grounded_code = self._replace_first_point_action(
-                grounded_code, "moveTo", int(start_match.group(1)), int(start_match.group(2))
-            )
-            grounded_code = self._replace_first_drag_target(
-                grounded_code, int(end_match.group(1)), int(end_match.group(2))
-            )
+            start_x, start_y = self._extract_grounded_point(start_cmd)
+            end_x, end_y = self._extract_grounded_point(end_cmd)
+            grounded_code = self._replace_first_point_action(grounded_code, "moveTo", start_x, start_y)
+            grounded_code = self._replace_first_drag_target(grounded_code, end_x, end_y)
             return grounded_code
 
         single_point_actions = ["click", "doubleClick", "rightClick", "moveTo"]
@@ -1465,11 +1466,9 @@ Based on the execution_history and current screenshot, decide the next action. A
             if not description:
                 raise ValueError(f"Description is required for {matched_single_action} actions")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
-            point_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", grounded_point)
-            if not point_match:
-                raise ValueError(f"Failed to ground coordinates for {matched_single_action}")
+            point_x, point_y = self._extract_grounded_point(grounded_point)
             grounded_code = self._replace_first_point_action(
-                grounded_code, matched_single_action, int(point_match.group(1)), int(point_match.group(2))
+                grounded_code, matched_single_action, point_x, point_y
             )
             return grounded_code
 
@@ -1477,10 +1476,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             if not description:
                 raise ValueError("Description is required for scroll actions")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
-            point_match = re.search(r"pyautogui\.moveTo\((\d+), (\d+)\)", grounded_point)
-            if not point_match:
-                raise ValueError("Failed to ground coordinates for scroll action")
-            x, y = int(point_match.group(1)), int(point_match.group(2))
+            x, y = self._extract_grounded_point(grounded_point)
             if "pyautogui.moveTo(" in grounded_code:
                 grounded_code = self._replace_first_point_action(grounded_code, "moveTo", x, y)
             elif re.search(r"pyautogui\.scroll\([^)]*x\s*=\s*-?\d+(?:\.\d+)?\s*,\s*y\s*=\s*-?\d+(?:\.\d+)?", grounded_code):
@@ -1520,30 +1516,6 @@ Based on the execution_history and current screenshot, decide the next action. A
                 raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
             return py_cmd
 
-        has_drag_placeholders = all(
-            token in code for token in ["START_X_COORD", "START_Y_COORD", "END_X_COORD", "END_Y_COORD"]
-        )
-
-        if has_drag_placeholders:
-            start_desc, end_desc = self._parse_drag_descriptions(description)
-            start_cmd = call_grounder(start_desc)
-            end_cmd = call_grounder(end_desc)
-
-            if "gta1" in self.visual_grounder_model.lower():
-                if not (isinstance(start_cmd, tuple) and len(start_cmd) == 2):
-                    raise ValueError(f"[GTA1] Expected START (x, y) tuple, got: {start_cmd}")
-                if not (isinstance(end_cmd, tuple) and len(end_cmd) == 2):
-                    raise ValueError(f"[GTA1] Expected END (x, y) tuple, got: {end_cmd}")
-                sx, sy = start_cmd
-                ex, ey = end_cmd
-                return (
-                    code.replace("START_X_COORD", str(sx))
-                        .replace("START_Y_COORD", str(sy))
-                        .replace("END_X_COORD", str(ex))
-                        .replace("END_Y_COORD", str(ey))
-                )
-            raise ValueError("Drag placeholders are currently supported only for gta1 visual grounder.")
-
         # Single-point placeholder mode
         py_cmd = call_grounder(description)
         if "gta1" in self.visual_grounder_model.lower():
@@ -1552,31 +1524,6 @@ Based on the execution_history and current screenshot, decide the next action. A
                 return code.replace("X_COORD", str(x)).replace("Y_COORD", str(y))
             raise ValueError(f"[GTA1] Expected (x, y) tuple, got: {py_cmd}")
         return py_cmd
-
-    def _parse_drag_descriptions(self, description: str):
-        """Parse drag START/END descriptions from one description field."""
-        if not description:
-            raise ValueError(
-                "Description is required for drag placeholders. "
-                "Use: START: <start target>; END: <end target>"
-            )
-        normalized = description.replace("\n", " ").strip()
-        upper = normalized.upper()
-        start_idx = upper.find("START:")
-        end_idx = upper.find("END:")
-        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-            raise ValueError(
-                "Invalid drag description format. "
-                "Use: START: <start target>; END: <end target>"
-            )
-        start_desc = normalized[start_idx + len("START:"):end_idx].strip(" ;")
-        end_desc = normalized[end_idx + len("END:"):].strip(" ;")
-        if not start_desc or not end_desc:
-            raise ValueError(
-                "Both START and END descriptions must be non-empty. "
-                "Use: START: <start target>; END: <end target>"
-            )
-        return start_desc, end_desc
 
     def _gui_action(self, code: str, description: str = "") -> str:
         """Execute gui_action tool - pyautogui code with optional placeholder replacement."""

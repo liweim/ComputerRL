@@ -331,44 +331,54 @@ def run(args, logger=None, tasks=None):
             task_filter_logger = args.logger
         tasks = filter_tasks(args, test_all_meta, task_filter_logger)
     
-    if not args.get_score:
-        if logger is None and hasattr(args, "logger"):
-            logger = args.logger
-        if logger is None:
-            logger = setup_logger(result_name, args.log_level)
+    try:
+        if not args.get_score:
+            if logger is None and hasattr(args, "logger"):
+                logger = args.logger
+            if logger is None:
+                logger = setup_logger(result_name, args.log_level)
 
-        save_args_to_settings(args)
+            save_args_to_settings(args)
 
-        scores: Dict[str, List[float]] = {}
-        
-        # Execute all tasks
-        if not tasks:
-            logger.info("No tasks to process.")
-        else:
-            for domain, task_id in tqdm(tasks, desc="Processing tasks"):
-                # Prepare task directory and config
-                target_dir = os.path.join(args.result_dir, f"{domain}/{task_id}")
-                cfg_path = os.path.join(args.test_config_base_dir, f"{domain}/{task_id}/{task_id}.json")
-                if not os.path.exists(cfg_path):
-                    cfg_path = os.path.join(args.test_config_base_dir, f"{domain}/{task_id}.json")
-                cfg = json.load(open(cfg_path, 'r', encoding='utf-8'))
-                
-                # Clean up existing directory and prepare for execution
-                if os.path.exists(target_dir):
-                    shutil.rmtree(target_dir)
-                os.makedirs(target_dir, exist_ok=True)
-                
-                result_domain, score = process_single_task(domain, task_id, cfg, logger, args)
-                
-                # Collect scores
-                if result_domain not in scores:
-                    scores[result_domain] = []
-                scores[result_domain].append(score)
+            scores: Dict[str, List[float]] = {}
+            
+            # Execute all tasks
+            if not tasks:
+                logger.info("No tasks to process.")
+            else:
+                for domain, task_id in tqdm(tasks, desc="Processing tasks"):
+                    # Prepare task directory and config
+                    target_dir = os.path.join(args.result_dir, f"{domain}/{task_id}")
+                    cfg_path = os.path.join(args.test_config_base_dir, f"{domain}/{task_id}/{task_id}.json")
+                    if not os.path.exists(cfg_path):
+                        cfg_path = os.path.join(args.test_config_base_dir, f"{domain}/{task_id}.json")
+                    cfg = json.load(open(cfg_path, 'r', encoding='utf-8'))
+                    
+                    # Clean up existing directory and prepare for execution
+                    if os.path.exists(target_dir):
+                        shutil.rmtree(target_dir)
+                    os.makedirs(target_dir, exist_ok=True)
+                    
+                    result_domain, score = process_single_task(domain, task_id, cfg, logger, args)
+                    
+                    # Collect scores
+                    if result_domain not in scores:
+                        scores[result_domain] = []
+                    scores[result_domain].append(score)
 
-    # Calculate and display final results with cost information
-    # Summary accepts tasks list directly
-    if tasks:
-        summary(args.result_dir, tasks)
+        # Calculate and display final results with cost information
+        # Summary accepts tasks list directly
+        if tasks:
+            summary(args.result_dir, tasks)
+    finally:
+        env = getattr(args, "env", None)
+        if env is not None:
+            try:
+                env.close()
+            except Exception as close_error:
+                active_logger = logger or getattr(args, "logger", None)
+                if active_logger is not None:
+                    active_logger.warning(f"Error while closing environment: {close_error}")
 
 if __name__ == "__main__":
     args = config()

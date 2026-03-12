@@ -3,8 +3,8 @@ import docker
 import logging
 
 
-def cleanup_osworld_containers(remove_running: bool = True) -> None:
-    """Cleanup all osworld-related containers (running and exited)."""
+def cleanup_osworld_containers(remove_running: bool = False) -> None:
+    """Cleanup osworld-related containers, skipping running ones by default."""
     logger = logging.getLogger("cleanup_docker")
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()
@@ -42,4 +42,4 @@ def cleanup_osworld_containers(remove_running: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    cleanup_osworld_containers(remove_running=True)
+    cleanup_osworld_containers(remove_running=False)
