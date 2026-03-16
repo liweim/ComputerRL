@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ast
 import base64
 import json
 import os
@@ -137,6 +138,9 @@ After **EVERY** action, you automatically receive an evaluation comparing before
   - Track which steps the task requires and which are done
   - The final step is usually **verify**, not **terminate**
   - Before termination, verify the exact task outcome with concrete evidence from the screenshot or a read-only command
+  - **CRITICAL**: Before termination, check every requested constraint one-by-one in your thought: exact target, exact name/location/page, and whether the task requires full coverage
+  - **CRITICAL**: Do not substitute a nearby/related result for the exact target
+  - **CRITICAL**: "Looks close", "relevant page is open", or "partially done" are not sufficient for termination
   - Do not verify the action itself. Do not terminate based only on a click succeeding, a popup/toast appearing, or a file name appearing
   - If verification fails, do not terminate. Change approach, or use `wait` if the result may still be processing
   - If verification is inconclusive, continue working instead of terminating
@@ -170,7 +174,7 @@ Examples:
 When **all required actions are done and the final state is verified**:
 ```json
 {
-    "thought": "All task requirements completed successfully, and I verified the final required state.",
+    "thought": "All task requirements completed successfully. I checked each requested constraint one-by-one and verified the exact final state with concrete evidence.",
     "tool": "termination",
     "input": "Task completed. [brief summary of what was done and what was verified]"
 }
@@ -645,7 +649,7 @@ class HiSA:
         record: bool = False,
         max_parse_retries: int = 3,
         wo_pattern: bool = False,  # If True, disable pattern induction (default: False means pattern induction is enabled)
-        pattern_dir: str = "D:/projects/qdrant/qdrant_storage",
+        pattern_dir: str = "../qdrant/qdrant_storage",
         use_qdrant_server: bool = False,  # Use server mode by default for multi-process
         qdrant_server_url: str = "http://localhost:6333",
         wo_roi: bool = False,  # If True, disable ROI cropping (default: False means ROI cropping is enabled)
@@ -1131,6 +1135,7 @@ class HiSA:
 
         for attempt in range(self.max_parse_retries):
             response = ""
+            json_str = ""
             try:
                 # Get current screenshot
                 screenshot = None
@@ -1338,6 +1343,19 @@ Based on the execution_history and current screenshot, decide the next action. A
                 
             except Exception as e:
                 self.logger.error(f"Decision parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {e}")
+                self.logger.error(
+                    "Raw model response (attempt %d/%d): %s",
+                    attempt + 1,
+                    self.max_parse_retries,
+                    response or "<empty response>",
+                )
+                if json_str and json_str != response:
+                    self.logger.error(
+                        "Extracted JSON candidate (attempt %d/%d): %s",
+                        attempt + 1,
+                        self.max_parse_retries,
+                        json_str,
+                    )
                 
                 # If not last attempt, set error feedback for retry
                 if attempt < self.max_parse_retries - 1:
@@ -1403,21 +1421,80 @@ Based on the execution_history and current screenshot, decide the next action. A
 
         return normalized.strip()
 
-    def _replace_first_point_action(self, code: str, action_name: str, x: int, y: int) -> str:
-        pattern = rf"(pyautogui\.{re.escape(action_name)}\()\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?"
-        replacement = rf"\g<1>{x}, {y}"
-        new_code, count = re.subn(pattern, replacement, code, count=1)
-        if count == 0:
-            raise ValueError(f"Failed to inject grounded coordinates for {action_name}")
-        return new_code
+    def _parse_pyautogui_code(self, code: str) -> List[Dict]:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            raise ValueError(f"Failed to parse gui_action code: {e}") from e
 
-    def _replace_first_drag_target(self, code: str, x: int, y: int) -> str:
-        pattern = r"(pyautogui\.dragTo\()\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?"
-        replacement = rf"\g<1>{x}, {y}"
-        new_code, count = re.subn(pattern, replacement, code, count=1)
-        if count == 0:
-            raise ValueError("Failed to inject grounded drag target coordinates")
-        return new_code
+        statements = []
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "pyautogui"
+                ):
+                    statements.append(
+                        {
+                            "type": "call",
+                            "method": call.func.attr,
+                            "args": [ast.literal_eval(arg) for arg in call.args],
+                            "kwargs": [(kw.arg, ast.literal_eval(kw.value)) for kw in call.keywords],
+                        }
+                    )
+                    continue
+            statements.append({"type": "raw", "code": ast.unparse(stmt)})
+        return statements
+
+    def _format_py_value(self, value) -> str:
+        return repr(value)
+
+    def _build_pyautogui_call(self, method: str, args: List, kwargs: List[Tuple[str, object]]) -> str:
+        params = [self._format_py_value(arg) for arg in args]
+        params.extend(f"{key}={self._format_py_value(value)}" for key, value in kwargs)
+        return f"pyautogui.{method}({', '.join(params)})"
+
+    def _serialize_pyautogui_code(self, statements: List[Dict]) -> str:
+        rendered = []
+        for stmt in statements:
+            if stmt["type"] == "call":
+                rendered.append(self._build_pyautogui_call(stmt["method"], stmt["args"], stmt["kwargs"]))
+            else:
+                rendered.append(stmt["code"])
+        return "; ".join(part for part in rendered if part).strip()
+
+    def _find_first_call(self, statements: List[Dict], method: str) -> Optional[Dict]:
+        for stmt in statements:
+            if stmt.get("type") == "call" and stmt.get("method") == method:
+                return stmt
+        return None
+
+    def _set_call_point(self, stmt: Dict, x: int, y: int) -> None:
+        kwargs = dict(stmt["kwargs"])
+        if "x" in kwargs or "y" in kwargs:
+            kwargs["x"] = x
+            kwargs["y"] = y
+            stmt["kwargs"] = [(key, kwargs[key]) for key, _ in stmt["kwargs"] if key in kwargs] + [
+                (key, value) for key, value in kwargs.items() if key not in {k for k, _ in stmt["kwargs"]}
+            ]
+            return
+
+        args = list(stmt["args"])
+        if len(args) >= 2:
+            args[0], args[1] = x, y
+        else:
+            args = [x, y] + args
+        stmt["args"] = args
+
+    def _insert_move_to_before(self, statements: List[Dict], target_stmt: Dict, x: int, y: int) -> None:
+        move_stmt = {"type": "call", "method": "moveTo", "args": [x, y], "kwargs": []}
+        for idx, stmt in enumerate(statements):
+            if stmt is target_stmt:
+                statements.insert(idx, move_stmt)
+                return
+        statements.insert(0, move_stmt)
 
     def _extract_grounded_point(self, grounded_cmd: str, action_name: str = "moveTo") -> Tuple[int, int]:
         match = re.search(rf"pyautogui\.{re.escape(action_name)}\((\d+), (\d+)\)", grounded_cmd)
@@ -1431,6 +1508,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             return code
 
         grounded_code = code
+        statements = self._parse_pyautogui_code(grounded_code)
         has_placeholders = any(
             token in grounded_code
             for token in [
@@ -1453,9 +1531,16 @@ Based on the execution_history and current screenshot, decide the next action. A
             end_cmd = self._call_visual_grounder(end_desc, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             start_x, start_y = self._extract_grounded_point(start_cmd)
             end_x, end_y = self._extract_grounded_point(end_cmd)
-            grounded_code = self._replace_first_point_action(grounded_code, "moveTo", start_x, start_y)
-            grounded_code = self._replace_first_drag_target(grounded_code, end_x, end_y)
-            return grounded_code
+            drag_stmt = self._find_first_call(statements, "dragTo")
+            if drag_stmt is None:
+                raise ValueError("Failed to find dragTo action in gui_action code")
+            move_stmt = self._find_first_call(statements, "moveTo")
+            if move_stmt is not None:
+                self._set_call_point(move_stmt, start_x, start_y)
+            else:
+                self._insert_move_to_before(statements, drag_stmt, start_x, start_y)
+            self._set_call_point(drag_stmt, end_x, end_y)
+            return self._serialize_pyautogui_code(statements)
 
         single_point_actions = ["click", "doubleClick", "rightClick", "moveTo"]
         matched_single_action = next(
@@ -1467,28 +1552,29 @@ Based on the execution_history and current screenshot, decide the next action. A
                 raise ValueError(f"Description is required for {matched_single_action} actions")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             point_x, point_y = self._extract_grounded_point(grounded_point)
-            grounded_code = self._replace_first_point_action(
-                grounded_code, matched_single_action, point_x, point_y
-            )
-            return grounded_code
+            action_stmt = self._find_first_call(statements, matched_single_action)
+            if action_stmt is None:
+                raise ValueError(f"Failed to find {matched_single_action} action in gui_action code")
+            self._set_call_point(action_stmt, point_x, point_y)
+            return self._serialize_pyautogui_code(statements)
 
         if "pyautogui.scroll(" in grounded_code:
             if not description:
                 raise ValueError("Description is required for scroll actions")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             x, y = self._extract_grounded_point(grounded_point)
-            if "pyautogui.moveTo(" in grounded_code:
-                grounded_code = self._replace_first_point_action(grounded_code, "moveTo", x, y)
-            elif re.search(r"pyautogui\.scroll\([^)]*x\s*=\s*-?\d+(?:\.\d+)?\s*,\s*y\s*=\s*-?\d+(?:\.\d+)?", grounded_code):
-                grounded_code = re.sub(
-                    r"(pyautogui\.scroll\([^)]*x\s*=\s*)-?\d+(?:\.\d+)?(\s*,\s*y\s*=\s*)-?\d+(?:\.\d+)?",
-                    rf"\1{x}\2{y}",
-                    grounded_code,
-                    count=1,
-                )
+            move_stmt = self._find_first_call(statements, "moveTo")
+            scroll_stmt = self._find_first_call(statements, "scroll")
+            if scroll_stmt is None:
+                raise ValueError("Failed to find scroll action in gui_action code")
+            scroll_kwargs = dict(scroll_stmt["kwargs"])
+            if "x" in scroll_kwargs or "y" in scroll_kwargs:
+                self._set_call_point(scroll_stmt, x, y)
+            elif move_stmt is not None:
+                self._set_call_point(move_stmt, x, y)
             else:
-                grounded_code = f"pyautogui.moveTo({x}, {y}); " + grounded_code
-            return grounded_code
+                self._insert_move_to_before(statements, scroll_stmt, x, y)
+            return self._serialize_pyautogui_code(statements)
 
         return grounded_code
     

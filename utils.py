@@ -341,6 +341,24 @@ def summary(result_dir, test_all_meta):
             meta_dict[domain].append(example_id)
         test_all_meta = meta_dict
 
+    examples_root = Path(__file__).resolve().parent / "evaluation_examples" / "examples"
+    infeasible_cache = {}
+
+    def is_infeasible_task(domain, example_id):
+        key = (domain, example_id)
+        if key in infeasible_cache:
+            return infeasible_cache[key]
+
+        meta_file = examples_root / domain / f"{example_id}.json"
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                task_meta = json.load(f)
+            result = task_meta.get("evaluator", {}).get("func") == "infeasible"
+        except Exception:
+            result = False
+        infeasible_cache[key] = result
+        return result
+
     all_scores = []
     all_scores_50 = []
     all_costs = []
@@ -387,6 +405,7 @@ def summary(result_dir, test_all_meta):
             if not os.path.exists(score_file) or os.path.exists(error_file):
                 count_remain += 1
 
+            score_50 = 0
             if has_completed_score:
                 all_scores.append(score)
                 stats[domain]["score"].append(score)
@@ -398,6 +417,7 @@ def summary(result_dir, test_all_meta):
                 print(f"Error file exists: {error_file}")
                 assert score == 0, f"Score is not 0 when error file exists: {error_file}"
                 count_errors += 1
+                all_scores_50.append(score_50)
                 continue 
 
             # --- 3. Process Execution Log ---
@@ -453,23 +473,29 @@ def summary(result_dir, test_all_meta):
                     stats[domain]["prompt_tokens"].append(prompt_tokens)
                     stats[domain]["completion_tokens"].append(completion_tokens)
                     stats[domain]["image_counts"].append(image_count)
-                    if gui_steps+code_steps > 50:
-                        all_scores_50.append(0)
-                    else:
-                        all_scores_50.append(score)
+                    total_task_steps = gui_steps + code_steps
+                    if total_task_steps <= 50:
+                        score_50 = score
+                    elif is_infeasible_task(domain, ex_id):
+                        score_50 = 100
+                    all_scores_50.append(score_50)
                 except:
                     print(f"error loading execution_log_file: {execution_log_file}")
+                    if has_completed_score:
+                        all_scores_50.append(score_50)
                     continue
             else:
                 if os.path.exists(score_file):
                     print(f"not found: {execution_log_file}")
+                if has_completed_score:
+                    all_scores_50.append(score_50)
                 continue
 
     num_tasks = sum(len(example_ids) for example_ids in test_all_meta.values())
     num_completed_scores = len(all_scores)
     num_tasks_with_log = len(all_costs)  # Number of tasks with execution_log
     avg_score = np.mean(all_scores) if num_completed_scores > 0 else 0
-    avg_score_50 = np.mean(all_scores_50) if len(all_scores_50) > 0 else 0
+    avg_score_50 = np.mean(all_scores_50) if num_completed_scores > 0 else 0
     total_cost = sum(all_costs)
 
     # Calculate total operations and tokens
@@ -575,11 +601,10 @@ def summary(result_dir, test_all_meta):
     avg_completion_tokens = summary_stats['average']['completion_tokens']
     avg_steps = summary_stats['average']['steps']
     avg_execution_time = summary_stats['average']['execution_time']
-    print('*'*100)
-    print(result_dir)
+    
     print(f"Total tasks: {total_tasks}, Left tasks: {left_tasks}, Error tasks: {error_tasks}")
-    print(f"score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{avg_score:.2f},{avg_score_50:.2f},{avg_cost:.2f},{avg_total_tokens:.2f},{avg_prompt_tokens:.2f},{avg_completion_tokens:.2f},{avg_steps:.2f},{avg_execution_time:.2f}")
-
+    print(f"method, score, score_50, cost, tokens, prompt_tokens, completion_tokens, steps, execution_time:\n{os.path.basename(result_dir)},{avg_score:.2f},{avg_score_50:.2f},{avg_cost:.2f},{avg_total_tokens:.2f},{avg_prompt_tokens:.2f},{avg_completion_tokens:.2f},{avg_steps:.2f},{avg_execution_time:.2f}")
+    print('*'*100)
     return detailed_stats
 
 def extract_failure_reason(obj):
@@ -665,9 +690,12 @@ def compare_results(methods):
 
 if __name__ == "__main__":
     #computerRL_baseline, hisa_wo_pattern
-    summary('/data1/lwm/projects/ComputerRL/results/computerRL_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # compare_results(['computerRL_baseline', 'computerRL_gta1-7b_restart_ori_res'])
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_all.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    
+    # compare_results(['computerRL_baseline', 'computerRL_gta1-7b_restart_ori_res', 'hisa_qwen3.5-9b_wo_step_refinement_pattern', 'computerRL_qwen3.5-9b_gta1-7b_restart'])

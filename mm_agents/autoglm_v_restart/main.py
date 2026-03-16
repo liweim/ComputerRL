@@ -73,6 +73,30 @@ def parse_code_from_string(input_string):
 
     return codes
 
+def _extract_tag_content(text: str, tag: str) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+def _is_action_candidate(code: str) -> bool:
+    if not code:
+        return False
+    stripped = code.strip()
+    if stripped in ["WAIT", "DONE", "FAIL"]:
+        return True
+    return "Agent." in stripped or "BrowserTools." in stripped
+
+def _pick_action_candidate(candidates: List[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if _is_action_candidate(candidate):
+            return candidate
+    return candidates[0].strip() if candidates else None
+
 def has_code_block(input_string: str) -> bool:
     if not input_string:
         return False
@@ -82,29 +106,36 @@ def has_code_block(input_string: str) -> bool:
     return len(parse_code_from_string(input_string)) > 0
 
 def extract_action_and_thought(response: str):
-    actions = parse_code_from_string(response)
-    if not actions:
-        response = response or ""
-        action = None
-        if "Action:" in response or "Action：" in response:
-            marker = "Action：" if "Action：" in response else "Action:"
-            action = response.split(marker)[-1].strip()
-            if "\n" in action:
-                action = action.splitlines()[0].strip()
-        if not action:
-            call_pattern = re.compile(r"\b[A-Za-z_]\w*\.\w+\s*\(")
-            for line in response.splitlines():
+    response = response or ""
+    answer = _extract_tag_content(response, "answer")
+    answer_actions = parse_code_from_string(answer) if answer else []
+    full_actions = parse_code_from_string(response)
+    action = _pick_action_candidate(answer_actions) or _pick_action_candidate(full_actions)
+    if not action:
+        search_spaces = [answer, response] if answer else [response]
+        call_pattern = re.compile(r"\b[A-Za-z_]\w*\.\w+\s*\(")
+        for text in search_spaces:
+            if not text:
+                continue
+            if "Action:" in text or "Action：" in text:
+                marker = "Action：" if "Action：" in text else "Action:"
+                action = text.split(marker)[-1].strip()
+                if "\n" in action:
+                    action = action.splitlines()[0].strip()
+                if action:
+                    break
+            for line in text.splitlines():
                 if call_pattern.search(line):
                     action = line.strip()
                     break
-        if not action:
-            stripped = response.strip()
+            if action:
+                break
+            stripped = text.strip()
             if stripped in ["WAIT", "DONE", "FAIL"]:
                 action = stripped
-        if not action:
-            return None, None
-        actions = [action]
-    action = actions[0]
+                break
+    if not action:
+        return None, None
 
     pattern = r'^python\s*(\\+n|\n)+'
     action = re.sub(pattern, '', action, flags=re.IGNORECASE)
@@ -314,6 +345,12 @@ class AutoGLMAgent:
         fixed = re.sub(r"\bAgent\.open_files\s*\(", "Agent.open_app(", fixed)
         fixed = re.sub(r"\bAgent\.open_file_manager\s*\(", "Agent.open_app(", fixed)
         fixed = re.sub(r"\bAgent\.open\s*\(", "Agent.open_app(", fixed)
+        # Some prompts still emit bare action calls without the Agent. prefix.
+        fixed = re.sub(
+            r"^\s*(click|type|scroll|drag_and_drop|hotkey|wait|done|fail)\s*\(",
+            lambda m: f"Agent.{m.group(1)}(",
+            fixed,
+        )
         return fixed
 
     def _parse_agent_call(self, code: str):

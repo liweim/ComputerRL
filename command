@@ -75,6 +75,7 @@ python run_autoglm_v_restart.py \
     --headless \
     --max_steps 100 \
     --test_all_meta_path ./evaluation_examples/test_medium.json \
+    --rerun_fail \
     > nohup2.out 2>&1 &
 
 nohup \
@@ -84,12 +85,34 @@ python run_hisa.py \
   --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_all.json \
   --wo_step \
   --wo_refinement \
   --wo_pattern \
-  --rerun_fail \
   > nohup.out 2>&1 &
+
+nohup \
+python run_hisa.py \
+  --provider_name docker \
+  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_refinement_pattern \
+  --headless \
+  --max_steps 100 \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --wo_refinement \
+  --wo_pattern \
+  > nohup2.out 2>&1 &
+
+nohup \
+python run_hisa.py \
+  --provider_name docker \
+  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern \
+  --headless \
+  --max_steps 100 \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --wo_pattern \
+  > nohup3.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py
@@ -113,14 +136,14 @@ fuser -k 8001/tcp
       for i, m in enumerate(messages)
   )
 
+Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
 
- Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
-
-帮我分析一下/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern下面的任务的
-主要失败原因，只需要每个domain找一两个失败的例子分析一下就行，失败的例子汇总在/data1/lwm/projects/
-ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_step_refinement_pattern这一列为0的样
-本，可以通过/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern/*/*/
+帮我分析一下/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart下面的任务的
+主要失败原因，只需要每个domain找两三个失败的例子分析一下，失败的例子汇总在/data1/lwm/projects/
+ComputerRL/results/task_success_failures.xlsx的computerRL_qwen3.5-9b_gta1-7b_restart这一列为0的样
+本，可以通过/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart/*/*/
 execution_log.json来看任务描述和每一步操作
+通过改prompt(/data1/lwm/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
 
 npm install -g @openai/codex@latest
 

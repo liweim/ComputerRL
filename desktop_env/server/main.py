@@ -1,10 +1,12 @@
 import ctypes
+from io import BytesIO
 import os
 import platform
 import shlex
 import json
 import subprocess, signal
 import time
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from typing import List, Dict, Tuple, Literal
@@ -267,14 +269,10 @@ def launch_app():
 @app.route('/screenshot', methods=['GET'])
 def capture_screen_with_cursor():
     # fixme: when running on virtual machines, the cursor is not captured, don't know why
-
-    file_path = os.path.join(os.path.dirname(__file__), "screenshots", "screenshot.png")
     user_platform = platform.system()
 
-    # Ensure the screenshots directory exists
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
     try:
+        screenshot_image = None
         # fixme: This is a temporary fix for the cursor not being captured on Windows and Linux
         if user_platform == "Windows":
             def get_cursor():
@@ -320,7 +318,7 @@ def capture_screen_with_cursor():
             except Exception as e:
                 logger.warning(f"Failed to capture cursor on Windows, screenshot will not have a cursor. Error: {e}")
 
-            img.save(file_path)
+            screenshot_image = img
         elif user_platform == "Linux":
             # Prefer screenshot with cursor overlay, but degrade gracefully to plain screenshot.
             try:
@@ -330,18 +328,26 @@ def capture_screen_with_cursor():
                 screenshot = pyautogui.screenshot()
                 cursor_x, cursor_y = pyautogui.position()
                 screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
-                screenshot.save(file_path)
+                screenshot_image = screenshot
             except Exception as e:
                 logger.warning(f"Failed to capture cursor on Linux, fallback to plain screenshot. Error: {e}")
-                pyautogui.screenshot().save(file_path)
+                screenshot_image = pyautogui.screenshot()
         elif user_platform == "Darwin":  # (Mac OS)
             # Use the screencapture utility to capture the screen with the cursor
-            subprocess.run(["screencapture", "-C", file_path], check=True)
+            with tempfile.NamedTemporaryFile(suffix=".png") as tmp_file:
+                subprocess.run(["screencapture", "-C", tmp_file.name], check=True)
+                screenshot_image = Image.open(tmp_file.name).copy()
         else:
             logger.warning(f"The platform you're using ({user_platform}) is not currently supported")
-            pyautogui.screenshot().save(file_path)
+            screenshot_image = pyautogui.screenshot()
 
-        return send_file(file_path, mimetype='image/png')
+        if screenshot_image is None:
+            raise RuntimeError("Screenshot capture returned no image")
+
+        image_buffer = BytesIO()
+        screenshot_image.save(image_buffer, format='PNG')
+        image_buffer.seek(0)
+        return send_file(image_buffer, mimetype='image/png')
 
     except Exception as e:
         logger.exception(f"Failed to capture screenshot: {e}")

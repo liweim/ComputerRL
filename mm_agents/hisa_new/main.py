@@ -935,6 +935,7 @@ class HiSA:
         """Get decision from global planner with retry on parsing errors."""
 
         for attempt in range(self.max_parse_retries):
+            response = ""
             try:
                 # Get current screenshot
                 screenshot = self.env.controller.get_screenshot()
@@ -1020,6 +1021,12 @@ class HiSA:
                 
             except Exception as e:
                 self.logger.error(f"Decision parsing error (attempt {attempt + 1}/{self.max_parse_retries}): {e}")
+                self.logger.error(
+                    "Raw model response (attempt %d/%d): %s",
+                    attempt + 1,
+                    self.max_parse_retries,
+                    response or "<empty response>",
+                )
                 
                 # If not last attempt, set error feedback for retry
                 if attempt < self.max_parse_retries - 1:
