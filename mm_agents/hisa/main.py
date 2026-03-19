@@ -301,6 +301,7 @@ class PatternManager:
     def __init__(
         self,
         llm: Optional[AbstractLLM] = None,
+        enable_thinking: bool = True,
         qdrant_path: str = "D:/projects/qdrant/qdrant_storage",
         embedding_service_url: str = "http://localhost:8000",
         similarity_threshold: float = 0.7,
@@ -308,6 +309,7 @@ class PatternManager:
         qdrant_server_url: str = "http://localhost:6333"
     ):
         self.llm = llm
+        self.enable_thinking = enable_thinking
         self.similarity_threshold = similarity_threshold
         self.logger = logging.getLogger("desktopenv.pattern")
         if not os.path.exists(qdrant_path):
@@ -474,7 +476,7 @@ class PatternManager:
                 {"role": "user", "content": prompt}
             ]
 
-            response = self.llm(messages)
+            response = self.llm(messages, enable_thinking=self.enable_thinking)
 
             # Try to parse as JSON
             if "```json" in response:
@@ -501,6 +503,16 @@ class PatternManager:
                             self.logger.warning(f"Invalid lesson type '{item['type']}', skipping")
                     else:
                         self.logger.warning(f"Invalid lesson format: {item}, skipping")
+                if validated_lessons:
+                    formatted_lessons = "\n".join(
+                        f"  {i+1}. [{lesson['type']}] {lesson['lesson']}"
+                        for i, lesson in enumerate(validated_lessons)
+                    )
+                    self.logger.info(
+                        f"Pattern induction extracted {len(validated_lessons)} lesson(s):\n{formatted_lessons}"
+                    )
+                else:
+                    self.logger.info("Pattern induction extracted no valid lessons")
                 return validated_lessons
             else:
                 self.logger.warning(f"Expected list, got {type(lessons)}")
@@ -659,7 +671,8 @@ class HiSA:
         bash_working_dir: str = "~",  # Working directory for bash execution
         wo_step: bool = False,  # If True, skip step abstraction and use full conversation history
         wo_refinement: bool = False,  # If True, disable context refinement and use sliding window
-        sliding_window_size: int = 5  # Sliding window size (number of conversation turns to keep)
+        sliding_window_size: int = 5,  # Sliding window size (number of conversation turns to keep)
+        enable_thinking: bool = True,
     ):
         self.env = env
         self.global_planner_model = global_planner_model
@@ -683,6 +696,7 @@ class HiSA:
         self.wo_step = wo_step  # Skip step abstraction if True
         self.wo_refinement = wo_refinement  # Disable context refinement if True
         self.sliding_window_size = sliding_window_size  # Sliding window size for conversation history
+        self.enable_thinking = enable_thinking
 
         self.logger = logging.getLogger("desktopenv")
 
@@ -695,6 +709,7 @@ class HiSA:
         if not self.wo_pattern:
             self.pattern_manager = PatternManager(
                 llm=self.global_planner_llm,
+                enable_thinking=self.enable_thinking,
                 qdrant_path=pattern_dir,
                 similarity_threshold=0.7,
                 use_qdrant_server=use_qdrant_server,
@@ -885,7 +900,10 @@ class HiSA:
             messages = [
                 {"role": "user", "content": prompt}
             ]
-            summary_with_context_refinement = self.state_manager_llm(messages)
+            summary_with_context_refinement = self.state_manager_llm(
+                messages,
+                enable_thinking=self.enable_thinking,
+            )
             return summary_with_context_refinement.strip()
         except Exception as e:
             self.logger.error(f"Failed to summarize history segment with context refinement: {e}")
@@ -1175,6 +1193,7 @@ class HiSA:
 
                     self.last_full_summary = summary
                     self.last_summary_step = total_logs
+                    self.logger.info(f"[refinement] {summary}")
                     
                     # Clear conversation messages and last tool output after context refinement
                     if self.wo_step:
@@ -1301,7 +1320,10 @@ Based on the execution_history and current screenshot, decide the next action. A
                     self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
 
                 # Call global planner
-                response = self.global_planner_llm(messages)
+                response = self.global_planner_llm(
+                    messages,
+                    enable_thinking=self.enable_thinking,
+                )
                 
                 # Extract JSON
                 json_str = response
@@ -1653,6 +1675,7 @@ Based on the execution_history and current screenshot, decide the next action. A
                     before_screenshot, after_screenshot, eval_desc,
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
+                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract
             thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
@@ -1794,7 +1817,10 @@ Based on the execution_history and current screenshot, decide the next action. A
                 }
             ]
 
-            step_abstraction = self.state_manager_llm(messages)
+            step_abstraction = self.state_manager_llm(
+                messages,
+                enable_thinking=self.enable_thinking,
+            )
             return step_abstraction.strip()
 
         except Exception as e:
@@ -1879,6 +1905,7 @@ except subprocess.TimeoutExpired as e:
                     before_screenshot, after_screenshot, bash_description,
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
+                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract summary
             thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
@@ -1974,6 +2001,7 @@ except subprocess.TimeoutExpired as e:
                     f"Waited {wait_seconds} seconds to observe UI changes",
                     wo_roi=self.wo_roi, roi_margin=self.roi_margin
                 )
+                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract
             thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""

@@ -33,6 +33,17 @@ logger = None  # Will be initialized in main
 FAILURE_SUMMARY_PROMPT = "You are a strict failure analyst. Summarize failure causes based on all history. Output 3-6 concise bullet points."
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run end-to-end evaluation on the benchmark")
 
@@ -63,6 +74,7 @@ def config() -> argparse.Namespace:
 
     # lm config
     parser.add_argument("--model", type=str, default="autoglm-os")
+    parser.add_argument("--enable_thinking", action="store_true", help="Enable thinking/reasoning mode for compatible models",)
     parser.add_argument("--temperature", type=float, default=0.2) # original: 0.2
     parser.add_argument("--top_p", type=float, default=0.1)  # original: 0.1
     parser.add_argument("--max_tokens", type=int, default=256) # original: 2048
@@ -112,7 +124,7 @@ def config() -> argparse.Namespace:
     return args
 
 
-def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalty, presence_penalty):
+def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalty, presence_penalty, enable_thinking=True):
     data = {
         "model": model,
         "messages": messages,
@@ -126,6 +138,8 @@ def _call_llm(messages, model, temperature, top_p, max_tokens, repetition_penalt
         "include_stop_str_in_output": True,
         "stop": ["<|user|>", "<|observation|>", "</answer>"],
     }
+    if "qwen3.5" in str(model).lower():
+        data["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
     headers = {
         "Content-Type": "application/json",
@@ -455,6 +469,7 @@ def _summarize_failures_with_llm(agent, action_history_full, instruction, logger
             max_tokens=args.summary_max_tokens,
             repetition_penalty=args.summary_repetition_penalty,
             presence_penalty=args.summary_presence_penalty,
+            enable_thinking=args.enable_thinking,
         )["content"]
     except Exception as exc:
         logger.warning("Failure summary LLM call failed: %s", exc)
@@ -788,6 +803,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "summary_repetition_penalty": args.summary_repetition_penalty,
         "summary_presence_penalty": args.summary_presence_penalty,
         "result_dir": args.result_dir,
+        "enable_thinking": args.enable_thinking,
     }
 
     def call_llm(messages):
@@ -800,6 +816,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
             max_tokens=args.max_tokens,
             repetition_penalty=args.repetition_penalty,
             presence_penalty=args.presence_penalty,
+            enable_thinking=args.enable_thinking,
         )
         logger.info("LLM called successfully.")
         return result

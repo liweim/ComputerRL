@@ -12,6 +12,17 @@ from utils import summary, save_args_to_settings, setup_logger, get_unfinished
 from tqdm import tqdm
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
     if width == 1920 and height == 1080:
         return
@@ -112,6 +123,7 @@ def config() -> argparse.Namespace:
                        help="Scale factor for visual grounder image preprocessing (default: 1.0)")
     parser.add_argument("--state_manager_model", type=str, default="qwen3.5-9b",
                        help="Model for auxiliary tasks (step abstraction, context refinement, pattern induction, etc.)")
+    parser.add_argument("--enable_thinking", action="store_true", help="Enable thinking/reasoning mode for compatible models",)
     parser.add_argument("--max_steps", type=int, default=15,
                        help="Maximum steps for Global Planner")
     parser.add_argument("--wo_pattern", action="store_true", help="Disable pattern induction (pattern induction is enabled by default)")
@@ -236,7 +248,8 @@ def process_single_task(
             qdrant_server_url=args.qdrant_server_url,
             wo_step=args.wo_step,
             wo_refinement=args.wo_refinement,
-            sliding_window_size=args.sliding_window_size
+            sliding_window_size=args.sliding_window_size,
+            enable_thinking=args.enable_thinking,
         )
 
         # Execute task
