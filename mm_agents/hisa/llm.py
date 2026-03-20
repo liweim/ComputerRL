@@ -9,7 +9,7 @@ import base64
 import io
 from dataclasses import dataclass
 from typing import Any, Tuple, Optional, List, Dict
-# from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
+from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY, LOCAL_API_KEY, LOCAL_API_URL
 from openai import OpenAI
 import logging
 import sys
@@ -824,15 +824,14 @@ class LocalLLM(BaseLLMClient):
         super().__init__(model_name, temperature)
         normalized_model_name = model_name.lower()
         if normalized_model_name == "gta1-7b":
-            base_url = 'http://localhost:1234/v1'
+            base_url = LOCAL_API_URL + ':1234/v1'
         elif normalized_model_name == "uitars-1.5-7b":
-            base_url = 'http://localhost:1235/v1'
+            base_url = LOCAL_API_URL + ':1235/v1'
         elif normalized_model_name == "qwen3.5-9b":
-            base_url = 'http://localhost:30000/v1'
+            base_url = LOCAL_API_URL + ':30000/v1'
         else:
             raise Exception("model not support")
-        api_key = os.getenv('OPENAI_API_KEY', os.getenv('UITARS_API_KEY', 'empty'))
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = OpenAI(base_url=base_url, api_key=LOCAL_API_KEY)
 
         # For uitars-1.5-7b, use OpenAI-compatible local server
         if "uitars" in model_name.lower():
