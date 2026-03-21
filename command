@@ -140,10 +140,10 @@ fuser -k 8001/tcp
 
 Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
 
-帮我分析一下/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart下面的任务的
+帮我分析一下/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking下面的任务的
 主要失败原因，只需要每个domain找两三个失败的例子分析一下，失败的例子汇总在/data1/lwm/projects/
-ComputerRL/results/task_success_failures.xlsx的computerRL_qwen3.5-9b_gta1-7b_restart这一列为0的样
-本，可以通过/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart/*/*/
+ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern_thinking这一列为0的样
+本，可以通过/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking/*/*/
 execution_log.json来看任务描述和每一步操作
 通过改prompt(/data1/lwm/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
 
@@ -160,5 +160,6 @@ openclaw onboard --install-daemon
     model provider: vLLM
         http://127.0.0.1:30000/v1
         xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg
-
+openclaw configure
 openclaw dashboard
+brave api key: BSAWSqJBK2rEsGgKJLdMvlhj9JmUQpi

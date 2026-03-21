@@ -17,8 +17,8 @@ computerRL_gta1-7b_restart_ori_res,40.54,40.54,0.00,63.84,62.21,1.63,12.62,244.3
 computerRL_qwen3.5-9b_gta1-7b_restart,27.06,27.06,0.00,108.14,103.71,4.43,22.89,337.74,
 hisa_qwen3.5-9b_wo_step_refinement_pattern_think,43.08,39.48,0.00,373.00,360.36,12.64,32.19,588.46,
 hisa_qwen3.5-9b_wo_step_refinement_pattern,19.40,19.40,0.00,486.15,477.92,8.23,40.66,633.20,
-hisa_qwen3.5-9b_wo_refinement_pattern,34.66,33.72,0.00,357.16,312.10,45.06,26.14,1048.48,
-hisa_qwen3.5-9b_wo_pattern,27.53,28.48,0.00,312.78,266.14,46.64,23.72,1041.91,
+hisa_qwen3.5-9b_wo_refinement_pattern_thinking,41.23,41.23,0.00,164.90,126.40,38.50,20.36,1009.92,
+hisa_qwen3.5-9b_wo_pattern_thinking,39.27,36.80,0.00,232.06,163.44,68.62,26.75,1586.95,
 ,,,,,,,,,
 OSWorld/all (369),,,,,,,,,
 Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step
