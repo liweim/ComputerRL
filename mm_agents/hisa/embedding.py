@@ -194,11 +194,11 @@ def test():
     # [[0.6265, 0.3477], [0.3499, 0.678 ]]
     
 if __name__ == "__main__":
-    # nohup python embedding_service.py > embedding_service.log 2>&1 &
+    # nohup python embedding.py > embedding.log 2>&1 &
     uvicorn.run(
-        "embedding_service:app",
+        "embedding:app",
         host="0.0.0.0",
-        port=8000,
+        port=8888,
         reload=False,
         log_level="info"
     )

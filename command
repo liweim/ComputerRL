@@ -11,12 +11,22 @@ export SGLANG_DISABLE_CUDNN_CHECK=1
 conda activate uitars
 export CUDA_VISIBLE_DEVICES=0
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name computerRL --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > uitars.log 2>&1 &
 
 # 启动UI-TARS
 conda activate uitars
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > uitars.log 2>&1 &
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --host 127.0.0.1 --port 1234 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > gta1.log 2>&1 &
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name qwen3.5-9b --model /data1/lwm/models/Qwen3.5-9B --gpu-memory-utilization 0.4 --max-model-len 65536 --host 127.0.0.1 --port 30000 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg --enable-auto-tool-choice --tool-call-parser hermes > qwen.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 127.0.0.1 --port 1234 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > gta1.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server \
+  --served-model-name qwen3.5-9b \
+  --model /data1/lwm/models/Qwen3.5-9B \
+  --gpu-memory-utilization 0.4 \
+  --max-model-len 65536 \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder > qwen.log 2>&1 &
 
 
 # 启动embedding service
@@ -149,8 +159,6 @@ execution_log.json来看任务描述和每一步操作
 
 npm install -g @openai/codex@latest
 
-T4: NkNzqwLK5oBDVj9n
-
 # 本地启动qwen3.5-9b
 ssh -fN -L 30000:127.0.0.1:30000 CSE_T4
 curl -v http://127.0.0.1:30000/v1/models
@@ -162,4 +170,3 @@ openclaw onboard --install-daemon
         xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg
 openclaw configure
 openclaw dashboard
-brave api key: BSAWSqJBK2rEsGgKJLdMvlhj9JmUQpi

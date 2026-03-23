@@ -27,14 +27,14 @@ GLOBAL_PLANNER_PROMPT = """You are an expert in GUIs and bash code executing tas
 1. **CRITICAL: Do ONLY what the task asks - nothing more, nothing less**
 2. **CRITICAL: Use as FEW steps as possible, but include a final verification before termination**
 3. **CRITICAL: NEVER terminate immediately after the last edit/click/command**
-4. **CRITICAL: ALWAYS review <execution_history> before deciding next action:**
+4. **CRITICAL: ALWAYS review the prior messages, summaries, and recent steps before deciding next action:**
    - Check what actions have been done and their results
    - Avoid repeating the same action more than 3 times
    - Count completed steps to judge task completion
-5. You receive: screenshot, execution history, past patterns
+5. You receive: screenshot, prior messages, summaries of previous steps, recent steps, and past patterns
 6. Never modify user requirements (file names, paths, etc.)
 7. Each action gets automatic evaluation, but that only checks the immediate response, not task completion
-8. **You can read text directly from screenshots** - no need for GUI copy/paste operations. When you read text, record it in your `thought` field so it appears in execution history
+8. **You can read text directly from screenshots** - no need for GUI copy/paste operations. When you read text, record it in your `thought` field so it appears in later summaries and recent-step history
 
 # Learning from Past Patterns
 When provided:
@@ -220,23 +220,41 @@ Example: "Succeeded. Cursor at target, no immediate change."
 Example: "Failed. Error dialog: [text]."
 """
 
+BASH_OUTPUT_ABSTRACTION_PROMPT = """Summarize a bash execution result in 1-3 concise sentences for future planning.
+
+Focus on:
+- whether the command succeeded or failed
+- the most important outcome or error
+- any concrete next-step signal that matters
+
+Rules:
+- Be concise
+- Do not repeat the full output
+- Prefer key files/results/errors over incidental logs
+- If output is long, compress it to the essential result only
+
+Example: "Succeeded. Listed the target directory and confirmed report.csv exists."
+Example: "Failed. Python raised ModuleNotFoundError for openpyxl."
+Example: "Succeeded. Script updated the spreadsheet and printed 12 matching rows."
+"""
+
 CONTEXT_REFINEMENT_PROMPT = """Analyze task execution progress and provide guidance.
 
-Task instruction: {task_instruction}
-
-Execution history (Steps {start_step}~{end_step}):
-{history_text}
+You will receive:
+- a task instruction and execution history range
+- optionally a message containing <previous_summary>
+- optionally a message containing <new_steps>
 
 Instructions:
-- If history contains <previous_summary>, combine it with <new_steps> to create a comprehensive summary
-- If no <previous_summary>, directly summarize the provided steps
+- If <previous_summary> is provided, combine it with <new_steps> to create a comprehensive summary
+- If no <previous_summary> is provided, directly summarize the provided steps
 - List what was done in order (successes and failures)
 - **IMPORTANT**: Preserve coordinates in click actions (e.g., "click(500,300)") - these can be reused later
 - Identify if we're stuck in loops, making progress, or blocked
 - Provide actionable suggestions for the next step if there are issues
 
 Return a concise summary string in this format:
-"Steps {start_step}~{end_step}: [ordered list of what was done, keeping coordinates]. Suggestion: [actionable advice, or 'Continue' if progressing well]"
+"Steps X~Y: [ordered list of what was done, keeping coordinates]. Suggestion: [actionable advice, or 'Continue' if progressing well]"
 
 Examples:
 - "Steps 1~5: Opened file, tried to edit (failed 3 times with permission error), attempted sudo (failed). Suggestion: Try a different approach - copy file to temp location first."
@@ -788,6 +806,36 @@ class HiSA:
             return self._hash_text(tool_input)
         return ""
 
+    def _normalize_gui_description(self, description: str) -> str:
+        """Normalize gui_action description for repeat detection."""
+        if not description:
+            return ""
+        return re.sub(r"\s+", " ", str(description).strip()).lower()
+
+    def _detect_repeated_gui_description(self, decision: Dict) -> Optional[str]:
+        """Fail fast if the same gui_action description is planned 3 consecutive times."""
+        if decision.get("tool") != "gui_action":
+            return None
+
+        normalized_description = self._normalize_gui_description(decision.get("description", ""))
+        if not normalized_description:
+            return None
+
+        repeat_count = 1  # Count current candidate decision.
+        for log in reversed(self.action_logs):
+            if log.get("type") != "gui_action":
+                break
+            if self._normalize_gui_description(log.get("description", "")) != normalized_description:
+                break
+            repeat_count += 1
+
+        if repeat_count >= 3:
+            return (
+                "Detected repeated gui_action description loop: "
+                f"'{decision.get('description', '')}' repeated {repeat_count} consecutive times."
+            )
+        return None
+
     def _detect_execution_loop(self, decision: Dict) -> Optional[str]:
         """Detect strict loops with identical action/result fingerprints."""
         tool = decision.get("tool", "")
@@ -873,33 +921,30 @@ class HiSA:
                 if "step_abstract" in log:
                     history_lines.append(log["step_abstract"])
 
-        # Build complete history text
-        if previous_summary:
-            # Include previous summary + new logs
-            if history_lines:
-                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>\n\n<new_steps>\n" + "\n".join(history_lines) + "\n</new_steps>"
-            else:
-                # Only previous summary, no new steps
-                history_text = f"<previous_summary>\n{previous_summary}\n</previous_summary>"
-        else:
-            # First time, only new logs
-            history_text = "\n".join(history_lines) if history_lines else ""
-
-        if not history_text.strip():
+        if not previous_summary and not history_lines:
             return f"Steps {start_step}~{end_step}: No detailed records. Suggestion: Continue"
-
-        # Use LLM to summarize with context refinement
-        prompt = CONTEXT_REFINEMENT_PROMPT.format(
-            task_instruction=self.task_instruction,
-            start_step=start_step,
-            end_step=end_step,
-            history_text=history_text
-        )
 
         try:
             messages = [
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": CONTEXT_REFINEMENT_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task instruction: {self.task_instruction}\n"
+                        f"Execution history range: Steps {start_step}~{end_step}"
+                    ),
+                },
             ]
+            if previous_summary:
+                messages.append({
+                    "role": "user",
+                    "content": f"<previous_summary>\n{previous_summary}\n</previous_summary>"
+                })
+            if history_lines:
+                messages.append({
+                    "role": "user",
+                    "content": "<new_steps>\n" + "\n".join(history_lines) + "\n</new_steps>"
+                })
             summary_with_context_refinement = self.state_manager_llm(
                 messages,
                 enable_thinking=self.enable_thinking,
@@ -1063,6 +1108,17 @@ class HiSA:
                     "total": global_planner_usage["global_planner"].copy()
                 }
 
+                repeated_description_error = self._detect_repeated_gui_description(decision)
+                if repeated_description_error:
+                    self.logger.warning(repeated_description_error)
+                    is_infeasible = True
+                    infeasible_reason = repeated_description_error
+                    try:
+                        self.env.step("FAIL", 0)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send FAIL action: {e}")
+                    break
+
                 loop_error = self._detect_execution_loop(decision)
                 if loop_error:
                     self.logger.warning(loop_error)
@@ -1206,34 +1262,7 @@ class HiSA:
                     messages = [
                         {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
                     ]
-                    
-                    # Build current query text
-                    current_query_parts = []
-                    
-                    # Add observation from previous action to maintain dialogue structure
-                    if self.last_tool_output:
-                        current_query_parts.append(f"Observation from previous action:\n{self.last_tool_output}\n")
-                        self.last_tool_output = None  # Clear after use to prevent duplicate appending
-                    
-                    # Task instruction + pattern + summary (only after context refinement)
-                    if len(self.conversation_messages) == 0:
-                        current_query_parts.append(f"Task: {self.task_instruction}\n")
-                        if self.past_pattern_text:
-                            current_query_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
-                        
-                        # Add refined context if available (only when context refinement is enabled)
-                        if not self.wo_refinement and self.last_full_summary:
-                            current_query_parts.append(f"\n<execution_history_summary>\n{self.last_full_summary}\n</execution_history_summary>\n")
-                        
-                    # Add error feedback or standard prompt
-                    if self.last_error_feedback:
-                        current_query_parts.append(f"\n<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n\nPlease fix the error and try again. Current screenshot:")
-                    else:
-                        if len(self.conversation_messages) == 0:
-                            current_query_parts.append("\nBased on the execution history and current screenshot, what's the next action?")
-                        else:
-                            current_query_parts.append("\nBased on the conversation history and current screenshot, what's the next action?")
-                    
+
                     # ========== Sliding Window Logic (for wo_step mode) ==========
                     # If context refinement is disabled, apply sliding window
                     conversation_to_append = self.conversation_messages
@@ -1242,13 +1271,52 @@ class HiSA:
                         conversation_to_append = self.conversation_messages[-max_messages:]
                         conversation_to_append[0]["content"][0]["text"] = f'Task: {self.task_instruction}\n\n{conversation_to_append[0]["content"][0]["text"]}'
                     
+                    # Add task / summary context when starting a fresh conversation window
+                    if len(conversation_to_append) == 0:
+                        messages.append({"role": "user", "content": f"Task: {self.task_instruction}"})
+                        if self.past_pattern_text:
+                            messages.append({
+                                "role": "user",
+                                "content": f"Relevant past patterns:\n{self.past_pattern_text}"
+                            })
+                        if not self.wo_refinement and self.last_full_summary:
+                            messages.append({
+                                "role": "user",
+                                "content": f"Summary of previous steps:\n{self.last_full_summary}"
+                            })
+
                     messages.extend(conversation_to_append)
                     
+                    # Add observation from previous action to maintain dialogue structure
+                    if self.last_tool_output:
+                        messages.append({
+                            "role": "user",
+                            "content": f"Observation from previous action:\n{self.last_tool_output}"
+                        })
+                        self.last_tool_output = None  # Clear after use to prevent duplicate appending
+
+                    # Add error feedback or standard prompt
+                    if self.last_error_feedback:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n\n"
+                                "Please fix the error and try again."
+                            )
+                        })
+                    else:
+                        prompt_text = (
+                            "Based on the execution history and current screenshot, what's the next action?"
+                            if len(conversation_to_append) == 0
+                            else "Based on the conversation history and current screenshot, what's the next action?"
+                        )
+                        messages.append({"role": "user", "content": prompt_text})
+
                     # Add current user message with screenshot
                     current_user_message = {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": "".join(current_query_parts)},
+                            {"type": "input_text", "text": "Current screenshot:"},
                             {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"}
                         ]
                     }
@@ -1276,23 +1344,48 @@ class HiSA:
                             if "step_abstract" in log:
                                 condensed_history.append(log["step_abstract"])
                     
-                    user_message_parts = []
-                    user_message_parts.append(f"Task: {self.task_instruction}\n")
+                    # Build messages array
+                    messages = [
+                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
+                        {"role": "user", "content": f"Task: {self.task_instruction}"}
+                    ]
 
                     if self.past_pattern_text:
-                        user_message_parts.append(f"\n<past_pattern>\n{self.past_pattern_text}\n</past_pattern>\n")
+                        messages.append({
+                            "role": "user",
+                            "content": f"Relevant past patterns:\n{self.past_pattern_text}"
+                        })
 
-                    # Add condensed history
-                    if condensed_history:
-                        user_message_parts.append(f"\n<execution_history>\n" + "\n".join(condensed_history) + "\n</execution_history>\n")
-
-                    # Add error feedback if this is a retry
-                    if self.last_error_feedback:
-                        user_message_parts.append(f"\n<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n")
-                        user_message_parts.append("\nPlease fix the error and try again.")
+                    if not self.wo_refinement and self.last_full_summary:
+                        messages.append({
+                            "role": "user",
+                            "content": f"Summary of previous steps:\n{self.last_full_summary}"
+                        })
+                        for log in self.action_logs[self.last_summary_step:]:
+                            if "step_abstract" in log:
+                                messages.append({
+                                    "role": "user",
+                                    "content": log["step_abstract"]
+                                })
                     else:
-                        user_message_parts.append("""
-Based on the execution_history and current screenshot, decide the next action. Avoid repeating failed actions. You should strictly follow the JSON format below: 
+                        for history_item in condensed_history:
+                            messages.append({
+                                "role": "user",
+                                "content": history_item
+                            })
+
+                    if self.last_error_feedback:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n\n"
+                                "Please fix the error and try again."
+                            )
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": """Based on the execution history and current screenshot, decide the next action. Avoid repeating failed actions. You should strictly follow the JSON format below:
 ```json
 {
     "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
@@ -1300,21 +1393,16 @@ Based on the execution_history and current screenshot, decide the next action. A
     "input": "String - tool-specific content (see examples below)",
     "description": "Optional for non-mouse actions; required for mouse-position gui_action so the executor can ground coordinates"
 }
-```""")
+```"""
+                        })
 
-                    user_message_text = "".join(user_message_parts)
-
-                    # Build messages array
-                    messages = [
-                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "input_text", "text": user_message_text},
-                                {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"}
-                            ]
-                        }
-                    ]
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Current screenshot:"},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"}
+                        ]
+                    })
 
                 if attempt > 0:
                     self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
@@ -1678,11 +1766,24 @@ Based on the execution_history and current screenshot, decide the next action. A
                 self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            thought_prefix = self.current_thought if self.current_thought else ""
             if description:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {final_code} | {step_abstraction}"
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"GUI action.\n"
+                    f"Description: {description}.\n"
+                    f"Code: {final_code}."
+                )
             else:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {final_code} | {step_abstraction}"
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"GUI action.\n"
+                    f"Code: {final_code}."
+                )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            if step_abstraction:
+                step_abstract += f"\n{step_abstraction}"
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -1693,6 +1794,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             self.action_logs.append({
                 "step": step,
                 "type": "gui_action",
+                "description": description,
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
@@ -1712,11 +1814,23 @@ Based on the execution_history and current screenshot, decide the next action. A
             self.logger.error(f"GUI action execution error: {e}")
 
             # Generate step_abstract for error
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
+            thought_prefix = self.current_thought if self.current_thought else ""
             if description:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Description: {description} | Code: {code} | Result: Error - {str(e)}"
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"GUI action failed.\n"
+                    f"Description: {description}.\n"
+                    f"Code: {code}."
+                )
             else:
-                step_abstract = f"Step {step}: gui_action | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"GUI action failed.\n"
+                    f"Code: {code}."
+                )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            step_abstract += f"\nError: {str(e)}"
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -1725,6 +1839,7 @@ Based on the execution_history and current screenshot, decide the next action. A
             self.action_logs.append({
                 "step": step,
                 "type": "gui_action",
+                "description": description,
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
@@ -1827,6 +1942,36 @@ Based on the execution_history and current screenshot, decide the next action. A
             self.logger.error(f"Failed to abstract step: {e}")
             return "Step abstraction failed due to error."
 
+    def _bash_output_abstraction_result(self, code: str, logs: str, status: str, exitcode: int) -> str:
+        """Abstract bash execution result from command output instead of screenshots."""
+        try:
+            messages = [
+                {"role": "system", "content": BASH_OUTPUT_ABSTRACTION_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Command:\n{code}\n\n"
+                        f"Status: {status}\n"
+                        f"Exit code: {exitcode}\n\n"
+                        f"Output:\n{logs}"
+                    ),
+                },
+            ]
+            step_abstraction = self.state_manager_llm(
+                messages,
+                enable_thinking=self.enable_thinking,
+            )
+            return step_abstraction.strip()
+        except Exception as e:
+            self.logger.error(f"Failed to abstract bash output: {e}")
+            status_str = "Succeeded" if exitcode == 0 and status == "success" else "Failed"
+            fallback_output = (logs or "").strip().replace("\n", " ")
+            if len(fallback_output) > 200:
+                fallback_output = fallback_output[:200] + "..."
+            if fallback_output:
+                return f"{status_str}. {fallback_output}"
+            return f"{status_str}. No output."
+
     def _bash_execution(self, code: str) -> str:
         """Execute bash commands or Python scripts (not pyautogui)."""
         code = self._normalize_bash_command(code)
@@ -1839,9 +1984,6 @@ Based on the execution_history and current screenshot, decide the next action. A
         step = self.operation_count + 1
 
         try:
-            # Get before screenshot
-            before_screenshot = self.env.controller.get_screenshot()
-
             # Provider workaround:
             # run_bash_script is unstable on some providers, so execute bash via run_python_script.
             escaped_code = json.dumps(code)
@@ -1900,16 +2042,32 @@ except subprocess.TimeoutExpired as e:
             if self.wo_step:
                 step_abstraction = ""
             else:
-                bash_description = f"Bash command: {code}\nOutput: {logs}..."  # Truncate long output
-                step_abstraction = "Result: " + self._step_abstraction_result(
-                    before_screenshot, after_screenshot, bash_description,
-                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                step_abstraction = "Result: " + self._bash_output_abstraction_result(
+                    code=code,
+                    logs=logs,
+                    status=status,
+                    exitcode=exitcode,
                 )
                 self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract summary
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Output: {logs} | {step_abstraction}"
+            thought_prefix = self.current_thought if self.current_thought else ""
+            if step_abstraction:
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"Bash command.\n"
+                    f"Code: {code}."
+                )
+            else:
+                step_abstract = (
+                    f"Step {step}:\n"
+                    f"Bash command.\n"
+                    f"Code: {code}."
+                )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            if step_abstraction:
+                step_abstract += f"\n{step_abstraction}"
             result_fingerprint = self._hash_text(
                 f"status={status}|exitcode={exitcode}|output={logs}"
             )
@@ -1943,8 +2101,15 @@ except subprocess.TimeoutExpired as e:
                 f.write(screenshot)
 
             # Generate step_abstract summary for error
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            step_abstract = f"Step {step}: Bash execution | {thought_prefix}Code: {code} | Result: Error - {str(e)}"
+            thought_prefix = self.current_thought if self.current_thought else ""
+            step_abstract = (
+                f"Step {step}:\n"
+                f"Bash execution failed.\n"
+                f"Code: {code}."
+            )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            step_abstract += f"\nError: {str(e)}"
             result_fingerprint = self._hash_text(f"error={str(e)}")
 
             self.action_logs.append({
@@ -2004,8 +2169,16 @@ except subprocess.TimeoutExpired as e:
                 self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
 
             # Generate step_abstract
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            step_abstract = f"Step {step}: wait | {thought_prefix}Duration: {wait_seconds}s | {step_abstraction}"
+            thought_prefix = self.current_thought if self.current_thought else ""
+            step_abstract = (
+                f"Step {step}:\n"
+                f"Wait.\n"
+                f"Duration: {wait_seconds} seconds."
+            )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            if step_abstraction:
+                step_abstract += f"\n{step_abstraction}"
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -2027,8 +2200,15 @@ except subprocess.TimeoutExpired as e:
             self.logger.error(f"Wait execution error: {e}")
 
             # Generate step_abstract for error
-            thought_prefix = f"Thought: {self.current_thought} | " if self.current_thought else ""
-            step_abstract = f"Step {step}: wait | {thought_prefix}Duration: {wait_seconds}s | Result: Error - {str(e)}"
+            thought_prefix = self.current_thought if self.current_thought else ""
+            step_abstract = (
+                f"Step {step}:\n"
+                f"Wait failed.\n"
+                f"Duration: {wait_seconds} seconds."
+            )
+            if thought_prefix:
+                step_abstract += f"\nReasoning: {thought_prefix}"
+            step_abstract += f"\nError: {str(e)}"
 
             # Calculate step execution time
             step_time = time.time() - step_start_time

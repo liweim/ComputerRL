@@ -341,24 +341,6 @@ def summary(result_dir, test_all_meta):
             meta_dict[domain].append(example_id)
         test_all_meta = meta_dict
 
-    examples_root = Path(__file__).resolve().parent / "evaluation_examples" / "examples"
-    infeasible_cache = {}
-
-    def is_infeasible_task(domain, example_id):
-        key = (domain, example_id)
-        if key in infeasible_cache:
-            return infeasible_cache[key]
-
-        meta_file = examples_root / domain / f"{example_id}.json"
-        try:
-            with open(meta_file, "r", encoding="utf-8") as f:
-                task_meta = json.load(f)
-            result = task_meta.get("evaluator", {}).get("func") == "infeasible"
-        except Exception:
-            result = False
-        infeasible_cache[key] = result
-        return result
-
     all_scores = []
     all_scores_50 = []
     all_costs = []
@@ -476,8 +458,6 @@ def summary(result_dir, test_all_meta):
                     total_task_steps = gui_steps + code_steps
                     if total_task_steps <= 50:
                         score_50 = score
-                    elif is_infeasible_task(domain, ex_id):
-                        score_50 = 100
                     all_scores_50.append(score_50)
                 except:
                     print(f"error loading execution_log_file: {execution_log_file}")
@@ -696,6 +676,6 @@ if __name__ == "__main__":
     # summary('/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_refinement_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     
-    compare_results(['hisa_qwen3.5-9b_wo_refinement_pattern_thinking', 'hisa_qwen3.5-9b_wo_pattern_thinking'])
+    # compare_results(['hisa_qwen3.5-9b_wo_refinement_pattern_thinking', 'hisa_qwen3.5-9b_wo_pattern_thinking'])
