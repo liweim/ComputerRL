@@ -41,7 +41,6 @@ fastar==0.8.0
 fastrlock==0.8.3
 filelock==3.20.0
 FlagEmbedding==1.3.5
-flashinfer==0.1.6+cu124torch2.4
 flashinfer-python==0.6.4
 frozendict==2.4.7
 frozenlist==1.8.0
