@@ -674,7 +674,7 @@ if __name__ == "__main__":
     # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_refinement_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
     

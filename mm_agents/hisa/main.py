@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ast
 import base64
+import copy
 import json
 import os
 import logging
@@ -240,27 +241,23 @@ Example: "Succeeded. Script updated the spreadsheet and printed 12 matching rows
 
 CONTEXT_REFINEMENT_PROMPT = """Analyze task execution progress and provide guidance.
 
-You will receive:
-- a task instruction and execution history range
-- optionally a message containing <previous_summary>
-- optionally a message containing <new_steps>
+You will receive: a task instruction, execution history range and execution history
 
 Instructions:
-- If <previous_summary> is provided, combine it with <new_steps> to create a comprehensive summary
-- If no <previous_summary> is provided, directly summarize the provided steps
+- Summarize the full execution history into one unified summary covering the entire range
 - List what was done in order (successes and failures)
 - **IMPORTANT**: Preserve coordinates in click actions (e.g., "click(500,300)") - these can be reused later
 - Identify if we're stuck in loops, making progress, or blocked
 - Provide actionable suggestions for the next step if there are issues
 
 Return a concise summary string in this format:
-"Steps X~Y: [ordered list of what was done, keeping coordinates]. Suggestion: [actionable advice, or 'Continue' if progressing well]"
+Steps X~Y: [ordered list of what was done, keeping coordinates]. Suggestion: [actionable advice, or 'Continue' if progressing well]
 
 Examples:
-- "Steps 1~5: Opened file, tried to edit (failed 3 times with permission error), attempted sudo (failed). Suggestion: Try a different approach - copy file to temp location first."
-- "Steps 1~5: Clicked Submit button at click(850,620), typed text, clicked Save at click(920,580). Suggestion: Continue - forms being filled correctly."
-- "Steps 1~10: Previously installed package and ran script (steps 1~5). Then verified output, tested functionality (steps 6~10). Suggestion: Continue - good progress."
-- "Steps 1~15: Clicked the same button 5 times with no response, tried alternative buttons (failed). Suggestion: This approach isn't working - try an alternative method or termination as infeasible."
+- Steps 1~5: Opened file, tried to edit (failed 3 times with permission error), attempted sudo (failed). Suggestion: Try a different approach - copy file to temp location first.
+- Steps 1~5: Clicked Submit button at click(850,620), typed text, clicked Save at click(920,580). Suggestion: Continue - forms being filled correctly.
+- Steps 1~10: Previously installed package and ran script (steps 1~5). Then verified output, tested functionality (steps 6~10). Suggestion: Continue - good progress.
+- Steps 1~15: Clicked the same button 5 times with no response, tried alternative buttons (failed). Suggestion: This approach isn't working - try an alternative method or termination as infeasible.
 """
 
 PATTERN_INDUCTION_PROMPT = """Analyze this task execution and extract ONLY the most important, reusable lessons.
@@ -741,7 +738,7 @@ class HiSA:
         self.action_logs = []
         self.last_error_feedback = None  # Store error feedback for retry
         self.last_full_summary = None  # Last complete history summary
-        self.last_summary_step = 0  # Step number of last summary
+        self.last_summary_log_index = 0  # Number of action logs already folded into last_full_summary
         self.step_token_usage = {}  # Store token usage for current step
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
@@ -925,40 +922,36 @@ class HiSA:
             return f"Steps {start_step}~{end_step}: No detailed records. Suggestion: Continue"
 
         try:
+            execution_history_parts = []
+            if previous_summary:
+                execution_history_parts.append(
+                    f"Previous summary covering earlier steps:\n{previous_summary}"
+                )
+            if history_lines:
+                execution_history_parts.append(
+                    "Newly added detailed steps:\n" + "\n".join(history_lines)
+                )
+            execution_history = "\n\n".join(execution_history_parts)
+
             messages = [
                 {"role": "system", "content": CONTEXT_REFINEMENT_PROMPT},
                 {
                     "role": "user",
                     "content": (
                         f"Task instruction: {self.task_instruction}\n"
-                        f"Execution history range: Steps {start_step}~{end_step}"
-                    ),
+                        f"Execution history range: Steps {start_step}~{end_step}\n"
+                        f"Execution history:\n{execution_history}"
+                    )
                 },
             ]
-            if previous_summary:
-                messages.append({
-                    "role": "user",
-                    "content": f"<previous_summary>\n{previous_summary}\n</previous_summary>"
-                })
-            if history_lines:
-                messages.append({
-                    "role": "user",
-                    "content": "<new_steps>\n" + "\n".join(history_lines) + "\n</new_steps>"
-                })
             summary_with_context_refinement = self.state_manager_llm(
                 messages,
-                enable_thinking=self.enable_thinking,
+                enable_thinking=False,
             )
             return summary_with_context_refinement.strip()
         except Exception as e:
             self.logger.error(f"Failed to summarize history segment with context refinement: {e}")
-            # Fallback: combine previous summary with brief new summary
-            if previous_summary:
-                brief_new = f"Steps {start_step}~{end_step}: {len(logs)} actions" if logs else "no new actions"
-                return f"{previous_summary} + {brief_new}. Suggestion: Continue"
-            else:
-                brief_summary = f"{len(logs)} actions executed"
-                return f"Steps {start_step}~{end_step}: {brief_summary}. Suggestion: Continue"
+            raise
 
     def execute_task(
         self,
@@ -978,7 +971,7 @@ class HiSA:
         self.operation_count = 0
         self.action_logs = []
         self.last_full_summary = None
-        self.last_summary_step = 0
+        self.last_summary_log_index = 0
         self.conversation_messages = []  # Store full conversation history when wo_step=True
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
 
@@ -1233,7 +1226,7 @@ class HiSA:
                     # Trigger context refinement
                     if self.last_full_summary:
                         # Not first time: use previous summary + new logs since last summary
-                        logs_to_summarize = self.action_logs[self.last_summary_step:]
+                        logs_to_summarize = self.action_logs[self.last_summary_log_index:]
                         start_step = self.action_logs[0]["step"]
                         end_step = self.action_logs[-1]["step"]
                         summary = self._summarize_history_segment(
@@ -1248,7 +1241,7 @@ class HiSA:
                         summary = self._summarize_history_segment(logs_to_summarize, start_step, end_step)
 
                     self.last_full_summary = summary
-                    self.last_summary_step = total_logs
+                    self.last_summary_log_index = total_logs
                     self.logger.info(f"[refinement] {summary}")
                     
                     # Clear conversation messages and last tool output after context refinement
@@ -1268,8 +1261,15 @@ class HiSA:
                     conversation_to_append = self.conversation_messages
                     max_messages = self.sliding_window_size * 2
                     if self.wo_refinement and len(self.conversation_messages) > max_messages:
-                        conversation_to_append = self.conversation_messages[-max_messages:]
-                        conversation_to_append[0]["content"][0]["text"] = f'Task: {self.task_instruction}\n\n{conversation_to_append[0]["content"][0]["text"]}'
+                        conversation_to_append = copy.deepcopy(self.conversation_messages[-max_messages:])
+                        first_content = conversation_to_append[0].get("content")
+                        if (
+                            isinstance(first_content, list)
+                            and first_content
+                            and isinstance(first_content[0], dict)
+                            and "text" in first_content[0]
+                        ):
+                            first_content[0]["text"] = f'Task: {self.task_instruction}\n\n{first_content[0]["text"]}'
                     
                     # Add task / summary context when starting a fresh conversation window
                     if len(conversation_to_append) == 0:
@@ -1335,7 +1335,7 @@ class HiSA:
                     if not self.wo_refinement and self.last_full_summary:
                         # Context refinement enabled: use summary + recent logs
                         condensed_history = [self.last_full_summary]
-                        for log in self.action_logs[self.last_summary_step:]:
+                        for log in self.action_logs[self.last_summary_log_index:]:
                             if "step_abstract" in log:
                                 condensed_history.append(log["step_abstract"])
                     else:
@@ -1361,7 +1361,7 @@ class HiSA:
                             "role": "user",
                             "content": f"Summary of previous steps:\n{self.last_full_summary}"
                         })
-                        for log in self.action_logs[self.last_summary_step:]:
+                        for log in self.action_logs[self.last_summary_log_index:]:
                             if "step_abstract" in log:
                                 messages.append({
                                     "role": "user",
@@ -1934,7 +1934,7 @@ class HiSA:
 
             step_abstraction = self.state_manager_llm(
                 messages,
-                enable_thinking=self.enable_thinking,
+                enable_thinking=False,
             )
             return step_abstraction.strip()
 
@@ -1959,7 +1959,7 @@ class HiSA:
             ]
             step_abstraction = self.state_manager_llm(
                 messages,
-                enable_thinking=self.enable_thinking,
+                enable_thinking=False,
             )
             return step_abstraction.strip()
         except Exception as e:
