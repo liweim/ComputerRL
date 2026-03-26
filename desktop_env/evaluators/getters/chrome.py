@@ -2106,7 +2106,11 @@ def get_gotoRecreationPage_and_get_html_content(env, config: Dict[str, Any]):
                     # Step 5: Handle new page
                     newpage = popup_info.value
                     newpage.set_default_timeout(timeout_ms)
-                    newpage.wait_for_load_state('networkidle', timeout=timeout_ms)
+                    newpage.wait_for_load_state('load', timeout=timeout_ms)
+                    try:
+                        newpage.wait_for_load_state('networkidle', timeout=5000)
+                    except Exception as idle_error:
+                        logger.warning(f"[RECREATION_PAGE] Popup networkidle wait timed out, continuing with loaded page: {idle_error}")
                     
                     page_title = newpage.title()
                     logger.info(f"[RECREATION_PAGE] New page loaded successfully")

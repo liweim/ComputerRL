@@ -635,7 +635,7 @@ def load_run(run_path):
 
 
 def compare_results(methods):
-    RESULTS_ROOT = Path("/data1/lwm/projects/ComputerRL/results")
+    RESULTS_ROOT = Path("/home/weimingli/projects/ComputerRL/results")
     RUNS = {method: RESULTS_ROOT / method for method in methods}
     run_data = {name: load_run(path) for name, path in RUNS.items()}
 
@@ -670,12 +670,12 @@ def compare_results(methods):
 
 if __name__ == "__main__":
     #computerRL_baseline, hisa_wo_pattern
-    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_baseline', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    # summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_refinement_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
-    summary('/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking', '/data1/lwm/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/computerRL_baseline', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/computerRL_gta1-7b_restart', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/computerRL_gta1-7b_restart_ori_res', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/computerRL_qwen3.5-9b_gta1-7b_restart', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    # summary('/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_refinement_pattern_thinking', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
+    summary('/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking', '/home/weimingli/projects/ComputerRL/evaluation_examples/test_medium.json')
     
     # compare_results(['hisa_qwen3.5-9b_wo_refinement_pattern_thinking', 'hisa_qwen3.5-9b_wo_pattern_thinking'])

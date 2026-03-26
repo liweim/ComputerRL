@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-QCOW_PATH="/data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2"
-SOURCE_MAIN="/data1/lwm/projects/ComputerRL/desktop_env/server/main.py"
+QCOW_PATH="/home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2"
+SOURCE_MAIN="/home/weimingli/projects/ComputerRL/desktop_env/server/main.py"
 MOUNT_DIR="/mnt/qcow"
 NBD_DEV="/dev/nbd0"
 

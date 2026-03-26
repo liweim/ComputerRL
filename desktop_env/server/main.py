@@ -4,6 +4,7 @@ import os
 import platform
 import shlex
 import json
+import shutil
 import subprocess, signal
 import time
 import tempfile
@@ -74,9 +75,29 @@ logger = app.logger
 recording_process = None  # fixme: this is a temporary solution for recording, need to be changed to support multiple-process
 recording_path = "/tmp/recording.mp4"
 
+OFFICE_FILE_EXTENSIONS = {
+    ".doc", ".docx", ".odt", ".rtf",
+    ".xls", ".xlsx", ".ods", ".csv",
+    ".ppt", ".pptx", ".odp",
+}
+
 def _append_event(*_args, **_kwargs):
     # No-op placeholder to avoid NameError when trajectory logging is enabled.
     return None
+
+
+def _is_office_document(path_obj: Path) -> bool:
+    return path_obj.suffix.lower() in OFFICE_FILE_EXTENSIONS
+
+
+def _get_linux_open_command(path_obj: Path) -> List[str]:
+    if _is_office_document(path_obj) and shutil.which("libreoffice"):
+        return ["libreoffice", str(path_obj)]
+    if shutil.which("xdg-open"):
+        return ["xdg-open", str(path_obj)]
+    if shutil.which("gio"):
+        return ["gio", "open", str(path_obj)]
+    raise FileNotFoundError("No supported Linux file opener found (tried libreoffice, xdg-open, gio).")
 
 
 @app.route('/setup/execute', methods=['POST'])
@@ -1319,7 +1340,6 @@ def open_file():
     # If it's not a file path, treat it as an application name/command
     if not is_file_path:
         # Check if it's a valid command by trying to find it in PATH
-        import shutil
         if not shutil.which(path):
             return f"Application/file not found: {path}", 404
 
@@ -1329,8 +1349,14 @@ def open_file():
             if platform.system() == "Windows":
                 os.startfile(path_obj)
             else:
-                open_cmd: str = "open" if platform.system() == "Darwin" else "xdg-open"
-                subprocess.Popen([open_cmd, str(path_obj)])
+                if platform.system() == "Darwin":
+                    open_command = ["open", str(path_obj)]
+                elif platform.system() == "Linux":
+                    open_command = _get_linux_open_command(path_obj)
+                else:
+                    open_command = ["xdg-open", str(path_obj)]
+                logger.info("Opening file %s with command: %s", path_obj, open_command)
+                subprocess.Popen(open_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             file_name = path_obj.name
             file_name_without_ext, _ = os.path.splitext(file_name)
         else:
@@ -1369,8 +1395,11 @@ def open_file():
                     if not result.stdout.strip():
                         pass  # No windows, just continue waiting
                     else:
+                        linux_window_markers = [file_name, file_name_without_ext]
+                        if is_file_path and _is_office_document(path_obj):
+                            linux_window_markers.extend(["LibreOffice", "soffice"])
                         for window in window_list:
-                            if file_name in window or file_name_without_ext in window:
+                            if any(marker in window for marker in linux_window_markers):
                                 # a window is found, now activate it
                                 window_id = window.split()[0]
                                 subprocess.run(['wmctrl', '-i', '-a', window_id], check=True)

@@ -23,14 +23,14 @@ class PortAllocationError(Exception):
 
 
 class DockerProvider(Provider):
-    def __init__(self, region: str):
+    def __init__(self, region: str, vm_ram: str = "4G"):
         self.client = docker.from_env()
         self.server_port = None
         self.vnc_port = None
         self.chromium_port = None
         self.vlc_port = None
         self.container = None
-        self.environment = {"DISK_SIZE": "32G", "RAM_SIZE": "4G", "CPU_CORES": "4"}  # Modify if needed
+        self.environment = {"DISK_SIZE": "32G", "RAM_SIZE": vm_ram, "CPU_CORES": "4"}  # Modify if needed
 
         temp_dir = Path(os.getenv('TEMP') if platform.system() == 'Windows' else '/tmp')
         self.lock_file = temp_dir / "docker_port_allocation.lck"

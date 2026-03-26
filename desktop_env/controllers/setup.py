@@ -36,7 +36,7 @@ FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 
 init_proxy_pool(PROXY_CONFIG_FILE)  # initialize the global proxy pool
 
-MAX_RETRIES = 20
+MAX_RETRIES = 5
 HTTP_TIMEOUT = (10, 120)
 HTTP_UPLOAD_TIMEOUT = (10, 600)
 

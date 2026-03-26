@@ -1,12 +1,7 @@
-# python run_autoglm_v.py --provider_name vmware --path_to_vm D:\projects\OSWorld\vmware_vm_data\Ubuntu0\Ubuntu0.vmx --headless --max_steps 15 --test_all_meta_path ./evaluation_examples/test_one.json
-
 # 部署LLM
 git lfs install
 git clone https://www.modelscope.cn/shawliu9/computerrl-glm4_1v-9b.git
 git clone https://huggingface.co/Qwen/Qwen3.5-9B.git
-
-export ENABLE_JIT_DEEPGEMM=0
-export SGLANG_DISABLE_CUDNN_CHECK=1
 
 conda activate uitars
 export CUDA_VISIBLE_DEVICES=0
@@ -48,9 +43,15 @@ git clone https://huggingface.co/datasets/xlangai/ubuntu_osworld
 cd ubuntu_osworld
 unzip Ubuntu.qcow2.zip
 
+配置/复制settings
+
 # 加入docker用户组
 sudo usermod -aG docker $USER
 newgrp docker
+
+# 更新server
+sudo apt install -y qemu-utils
+sudo ./update_server_main.sh
 
 # 运行
 # export OPENAI_BASE_URL="http://localhost:30000/v1"
@@ -127,11 +128,12 @@ python run_hisa.py \
 nohup \
 python run_hisa.py \
   --provider_name docker \
+  --vm_ram 8G \
   --path_to_vm ~/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa_qwen3.5-9b_wo_pattern_thinking \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_all.json \
   --wo_pattern \
   --enable_thinking \
   > nohup3.out 2>&1 &
@@ -144,20 +146,7 @@ ps -fp 2011314
 tr '\0' ' ' < /proc/2010759/cmdline ; echo
 fuser -k 8001/tcp
 
-
 # debug
-"\n\n".join(
-      f"[{i}][{'AI' if i % 2 == 0 else 'User'}] " + (
-          "\n".join(
-              item.get("text", "") if isinstance(item, dict) else str(item)
-              for item in (m.get("content") if isinstance(m.get("content"), list) else [m.get("content",
-  "")])
-              if item is not None
-          )
-      )
-      for i, m in enumerate(messages)
-  )
-
 Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
 
 帮我分析一下~/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking下面的任务的
@@ -167,8 +156,9 @@ ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern_think
 execution_log.json来看任务描述和每一步操作
 通过改prompt(~/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
 
-npm install -g @openai/codex@latest
+sudo npm install -g @openai/codex@latest
 
+# openclaw
 # 本地启动qwen3.5-9b
 ssh -fN -L 30000:0.0.0.0:30000 CSE_T4
 curl -v http://0.0.0.0:30000/v1/models

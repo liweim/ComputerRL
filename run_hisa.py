@@ -113,6 +113,8 @@ def config() -> argparse.Namespace:
                        help="VM client password")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     parser.add_argument("--record", action="store_true", help="Record the execution process")
+    parser.add_argument("--vm_ram", type=str, default="4G",
+                       help="VM RAM size for docker provider (default: 4G)")
 
     # Agent config
     parser.add_argument("--global_planner_model", type=str, default="qwen3.5-9b",
@@ -175,7 +177,8 @@ def config() -> argparse.Namespace:
         snapshot_name=args.snapshot_name,
         screen_size=(args.screen_width, args.screen_height),
         headless=args.headless,
-        require_a11y_tree=False
+        require_a11y_tree=False,
+        vm_ram=args.vm_ram,
     )
     _attach_resolution_guard(
         args.env,

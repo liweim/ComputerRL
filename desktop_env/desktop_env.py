@@ -8,6 +8,7 @@ from typing import Callable, Any, Optional, Tuple
 from typing import List, Dict, Union
 
 import gymnasium as gym
+import requests
 
 from desktop_env.controllers.python import PythonController
 from desktop_env.controllers.setup import SetupController
@@ -19,7 +20,7 @@ logger = logging.getLogger("desktopenv.env")
 Metric = Callable[[Any, Any], float]
 Getter = Callable[[gym.Env, Dict[str, Any]], Any]
 
-MAX_RETRIES = 5 # Maximum retries for environment setup
+MAX_RETRIES = 2 # Maximum retries for environment setup
             
 
 
@@ -111,6 +112,7 @@ class DesktopEnv(gym.Env):
             os_type: str = "Ubuntu",
             enable_proxy: bool = False,
             client_password: str = "",
+            vm_ram: str = "4G",
     ):
         """
         Args:
@@ -127,6 +129,7 @@ class DesktopEnv(gym.Env):
             require_terminal (bool): whether to require terminal output
             os_type (str): operating system type, default to "Ubuntu"
             enable_proxy (bool): whether to enable proxy support, default to False
+            vm_ram (str): VM memory size for docker provider, default to "4G"
         """
         # Initialize VM manager and vitualization provider
         self.region = region
@@ -142,6 +145,7 @@ class DesktopEnv(gym.Env):
 
         self.screen_width = screen_size[0]
         self.screen_height = screen_size[1]
+        self.vm_ram = vm_ram
 
         # Default 
         self.server_port = 5000
@@ -151,7 +155,12 @@ class DesktopEnv(gym.Env):
         
         # Initialize with default (no proxy) provider
         self.current_use_proxy = False
-        self.manager, self.provider = create_vm_manager_and_provider(provider_name, region, use_proxy=False)
+        self.manager, self.provider = create_vm_manager_and_provider(
+            provider_name,
+            region,
+            use_proxy=False,
+            vm_ram=vm_ram,
+        )
 
         self.os_type = os_type
 
@@ -239,6 +248,16 @@ class DesktopEnv(gym.Env):
         # Close (release) the virtual machine
         self.provider.stop_emulator(self.path_to_vm)
 
+    def _is_server_alive(self, timeout: int = 5) -> bool:
+        try:
+            response = requests.get(
+                f"http://{self.vm_ip}:{self.server_port}/terminal",
+                timeout=(timeout, timeout),
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
     def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
         
         # Reset to certain task in OSWorld
@@ -249,6 +268,7 @@ class DesktopEnv(gym.Env):
         self._step_no = 0
         self.action_history.clear()
 
+        success = task_config is None
         for attempt in range(MAX_RETRIES):
             # Only revert to snapshot if environment has been used (step/setup)
             # This optimization is especially important for cloud providers like AWS
@@ -274,6 +294,15 @@ class DesktopEnv(gym.Env):
                 self.is_environment_used = False
             else:
                 logger.info("Environment is clean, skipping snapshot revert (provider: {}).".format(self.provider_name))
+                if not self._is_server_alive():
+                    logger.warning(
+                        "Environment server is not reachable at http://%s:%s, restarting emulator.",
+                        self.vm_ip,
+                        self.server_port,
+                    )
+                    self.provider.stop_emulator(self.path_to_vm)
+                    self._start_emulator()
+                    logger.info("Emulator restarted.")
 
             if task_config is not None:
                 if task_config.get("proxy", False) and self.enable_proxy:
@@ -297,7 +326,13 @@ class DesktopEnv(gym.Env):
                     time.sleep(5)
             else:
                 break
-            
+
+        if not success:
+            raise RuntimeError(
+                f"Environment setup failed after {MAX_RETRIES} attempts; "
+                f"server {self.vm_ip}:{self.server_port} is unreachable or setup steps are failing."
+            )
+
         logger.info("Environment setup complete.")
 
         observation = self._get_obs()
