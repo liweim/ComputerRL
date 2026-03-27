@@ -1531,7 +1531,18 @@ class HiSA:
 
         return normalized.strip()
 
+    def _normalize_pyautogui_code(self, code: str) -> str:
+        """Normalize planner-produced gui_action code before parsing/execution."""
+        if not isinstance(code, str) or not code.strip():
+            return code
+
+        # Some planner outputs emit named coordinates like click(x=123, y=456).
+        # Downstream executors expect plain positional coordinates, so strip only
+        # the redundant x=/y= markers and preserve all other kwargs.
+        return re.sub(r"(?<=\(|,)\s*([xy])\s*=\s*", "", code)
+
     def _parse_pyautogui_code(self, code: str) -> List[Dict]:
+        code = self._normalize_pyautogui_code(code)
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
@@ -1723,6 +1734,7 @@ class HiSA:
 
     def _gui_action(self, code: str, description: str = "") -> str:
         """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
+        code = self._normalize_pyautogui_code(code)
         requested_action_fingerprint = self._hash_text(code)
         if description:
             self.logger.info(f"[gui_action] {description}")
