@@ -15,7 +15,7 @@ computerRL_baseline,40.54,40.54,0.00,83.33,81.75,1.58,14.25,203.47,14.98
 computerRL_gta1-7b_restart,29.73,29.73,0.00,58.02,56.51,1.50,11.08,228.58,
 computerRL_gta1-7b_restart_ori_res,40.54,40.54,0.00,63.84,62.21,1.63,12.62,244.37,
 computerRL_qwen3.5-9b_gta1-7b_restart,27.06,27.06,0.00,108.14,103.71,4.43,22.89,337.74,
-hisa_qwen3.5-9b_wo_step_refinement_pattern_think,43.08,39.48,0.00,373.00,360.36,12.64,32.19,588.46,
+hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking,40.59,39.69,0.00,178.37,172.68,5.69,17.62,315.25,
 hisa_qwen3.5-9b_wo_step_refinement_pattern,19.40,19.40,0.00,486.15,477.92,8.23,40.66,633.20,
 hisa_qwen3.5-9b_wo_refinement_pattern_thinking_old,41.23,41.23,0.00,164.90,126.40,38.50,20.36,1009.92,
 hisa_qwen3.5-9b_wo_pattern_thinking_tool,29.49,26.92,0.00,255.22,185.83,69.39,30.13,1737.87,
@@ -26,4 +26,3 @@ Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Co
 computerRL_baseline,40.826,38.387,0.000,114.787,112.738,2.049,18.349,239.470,14.98
 computerRL_gta1-7b_restart,32.967,32.967,0.000,74.119,72.385,1.734,12.929,249.948,
 computerRL_gta1-7b_restart_ori_res,41.37,40.83,0.00,75.63,73.88,1.74,13.02,258.52,
-hisa_qwen3.5-9b_wo_step_refinement_pattern_think,42.03,39.35,0.00,376.42,363.88,12.54,33.27,610.67,
