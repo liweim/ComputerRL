@@ -1,0 +1,12 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Always use GUI operations for pivot table"
+  },
+  {
+    "id": 2,
+    "type": "require",
+    "lesson": "If no new sheet name is required, use Sheet2 as the new sheet name"
+  }
+]

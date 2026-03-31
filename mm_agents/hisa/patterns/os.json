@@ -1,0 +1,28 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Virtual machine environments typically lack physical Bluetooth hardware. Check if Bluetooth adapters are available before attempting Bluetooth operations in VMs."
+  },
+  {
+    "id": 2,
+    "type": "require",
+    "lesson": "Desktop workstations and virtual machines do not have battery hardware. Battery status indicators and power management features are only available on laptop/mobile systems."
+  },
+  {
+    "id": 3,
+    "type": "require",
+    "lesson": "Software version numbers follow semantic versioning. Before configuring a specific version, verify that version exists (e.g., Python 3.x exists, but Python 4.x does not exist yet)."
+  },
+  {
+    "id": 4,
+    "type": "require",
+    "lesson": "Shell variables must be defined before use. Commands referencing undefined variables (like $sourceDir, $targetDir) will fail. Check variable definitions with 'echo $VAR' or 'printenv'."
+  },
+  {
+    "id": 5,
+    "type": "require",
+    "lesson": "Switching users in Linux requires ending the current session ('su' terminates the original session, GUI user switching logs out). Maintaining an active session while switching users is architecturally incompatible."
+  }
+]
+

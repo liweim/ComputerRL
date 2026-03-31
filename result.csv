@@ -17,12 +17,14 @@ computerRL_gta1-7b_restart_ori_res,40.54,40.54,0.00,63.84,62.21,1.63,12.62,244.3
 computerRL_qwen3.5-9b_gta1-7b_restart,27.06,27.06,0.00,108.14,103.71,4.43,22.89,337.74,
 hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking,40.59,39.69,0.00,178.37,172.68,5.69,17.62,315.25,
 hisa_qwen3.5-9b_wo_step_refinement_pattern,19.40,19.40,0.00,486.15,477.92,8.23,40.66,633.20,
-hisa_qwen3.5-9b_wo_refinement_pattern_thinking_old,41.23,41.23,0.00,164.90,126.40,38.50,20.36,1009.92,
+hisa_qwen3.5-9b_wo_refinement_pattern_thinking,44.65,44.65,0.00,134.26,124.87,9.38,20.06,399.56,
 hisa_qwen3.5-9b_wo_pattern_thinking_tool,29.49,26.92,0.00,255.22,185.83,69.39,30.13,1737.87,
-hisa_qwen3.5-9b_wo_pattern_thinking,45.71,44.81,0.00,154.73,143.47,11.26,23.71,454.00,
+hisa_qwen3.5-9b_wo_pattern_thinking,48.42,47.52,0.00,142.86,132.73,10.12,21.92,422.6,
+hisa_qwen3.5-9b_thinking,42.36,41.45,0.00,163.47,150.60,12.87,23.89,509.37,
 ,,,,,,,,,
 OSWorld/all (369),,,,,,,,,
 Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step
 computerRL_baseline,40.826,38.387,0.000,114.787,112.738,2.049,18.349,239.470,14.98
 computerRL_gta1-7b_restart,32.967,32.967,0.000,74.119,72.385,1.734,12.929,249.948,
 computerRL_gta1-7b_restart_ori_res,41.37,40.83,0.00,75.63,73.88,1.74,13.02,258.52,
+hisa_qwen3.5-9b_wo_pattern_thinking,47.41,46.60,0.00,140.23,130.51,9.72,21.27,409.25,

@@ -211,3 +211,4 @@ evaluation_examples/settings
 tmp*
 docs
 configs
+qdrant_storage

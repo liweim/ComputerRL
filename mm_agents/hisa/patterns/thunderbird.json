@@ -1,0 +1,8 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Thunderbird's account setup requires both incoming mail server (IMAP/POP3) and outgoing mail server (SMTP) to be configured together. The architecture does not support outgoing-only mail accounts without an associated inbox."
+  }
+]
+

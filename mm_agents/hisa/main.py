@@ -317,10 +317,10 @@ class PatternManager:
         self,
         llm: Optional[AbstractLLM] = None,
         enable_thinking: bool = True,
-        qdrant_path: str = "D:/projects/qdrant/qdrant_storage",
-        embedding_service_url: str = "http://localhost:8000",
+        qdrant_path: str = "./qdrant_storage",
+        embedding_service_url: str = "http://localhost:8888",
         similarity_threshold: float = 0.7,
-        use_qdrant_server: bool = False,  # Default to server mode for multi-process
+        use_qdrant_server: bool = True,  # Default to server mode for multi-process
         qdrant_server_url: str = "http://localhost:6333"
     ):
         self.llm = llm
@@ -328,7 +328,7 @@ class PatternManager:
         self.similarity_threshold = similarity_threshold
         self.logger = logging.getLogger("desktopenv.pattern")
         if not os.path.exists(qdrant_path):
-            for json_file in glob.glob("../GUIAgent/patterns/*.json"):
+            for json_file in glob.glob("mm_agents/hisa/patterns/*.json"):
                 collection_name = os.path.basename(json_file).split(".")[0]
                 add_lessons_to_existing(
                     json_file=json_file,

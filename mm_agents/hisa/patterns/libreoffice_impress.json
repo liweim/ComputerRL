@@ -1,0 +1,22 @@
+[
+    {
+      "id": 1,
+      "type": "require",
+      "lesson": "CRITICAL: CLOSE the presentation in the GUI before using scripts (python-pptx) to modify slides."
+    },
+    {
+      "id": 2,
+      "type": "require",
+      "lesson": "When specifying colors, always use exact RGB or Hex values to ensure precision, rather than relying on visual approximations."
+    },
+    {
+      "id": 3,
+      "type": "require",
+      "lesson": "Use scripts for bulk text modifications or slide creation, but always confirm the visual layout matches expectations."
+    },
+    {
+      "id": 4,
+      "type": "require",
+      "lesson": "LibreOffice Impress does not have built-in video export functionality. Converting presentations to video requires external tools like screen recording software or third-party converters."
+    }
+  ]

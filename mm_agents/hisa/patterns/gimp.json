@@ -1,0 +1,52 @@
+[
+    {
+      "id": 1,
+      "type": "require",
+      "lesson": "GIMP is strictly for raster image manipulation. Tasks involving Video editing, Audio, or Vector (SVG) conversion are outside its capabilities."
+    },
+    {
+      "id": 2,
+      "type": "require",
+      "lesson": "For precise bulk operations (e.g., batch resizing), scripting (Python/Pillow) is preferred over repetitive GUI actions."
+    },
+    {
+      "id": 3,
+      "type": "require",
+      "lesson": "Complex visual effects (filters, specific selection tools) should be performed via GUI to ensure the algorithm matches the tool's specific behavior."
+    },
+    {
+      "id": 4,
+      "type": "require",
+      "lesson": "GIMP only supports RGB, Grayscale, and Indexed color modes. CMYK color space is not supported in GIMP."
+    },
+    {
+      "id": 5,
+      "type": "require",
+      "lesson": "GIMP can import SVG files and rasterize them, but cannot export to SVG or other vector formats. All GIMP output is raster-based."
+    },
+    {
+      "id": 6,
+      "type": "require",
+      "lesson": "GIMP has no built-in web browser or network download functionality. Opening remote images requires downloading them externally first."
+    },
+    {
+      "id": 7,
+      "type": "require",
+      "lesson": "GIMP has limited RAW format support and may not open all RAW files. Consider using dedicated RAW converters or check if specific plugins are available."
+    },
+    {
+      "id": 8,
+      "type": "require",
+      "lesson": "Image resolution and file size are fundamentally linked - higher resolution requires more pixel data. Enhancing resolution while maintaining or reducing file size is physically constrained by information theory."
+    },
+    {
+      "id": 9,
+      "type": "require",
+      "lesson": "GIMP has no built-in GUI for batch processing multiple files. For batch operations, use command-line tools or Python scripts with image libraries like Pillow."
+    },
+    {
+      "id": 10,
+      "type": "require",
+      "lesson": "GIMP provides limited UI theme options (Dark/Light/System). Custom color themes or specific color schemes are not available through settings."
+    }
+  ]

@@ -98,7 +98,7 @@ def config() -> argparse.Namespace:
     parser.add_argument("--get_score", action="store_true", help="Get scores")
 
     # pattern config
-    parser.add_argument("--pattern_dir", type=str, default="D:/projects/qdrant/qdrant_storage", help="Qdrant storage directory")
+    parser.add_argument("--pattern_dir", type=str, default="./qdrant_storage", help="Qdrant storage directory")
     parser.add_argument("--use_qdrant_server", action="store_true", help="Use Qdrant server, otherwise use local file storage")
     parser.add_argument("--qdrant_server_url", type=str, default="http://localhost:6333", help="Qdrant server URL")
 

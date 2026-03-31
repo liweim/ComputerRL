@@ -20,7 +20,7 @@ class QdrantManager:
     Supports CRUD operations on collections and points.
     """
     
-    def __init__(self, path: str = "../qdrant_storage", use_memory: bool = False,
+    def __init__(self, path: str = "./qdrant_storage", use_memory: bool = False,
                  use_server: bool = False, server_url: str = "http://localhost:6333"):
         """
         Initialize Qdrant client.
@@ -698,7 +698,7 @@ class QdrantManager:
         return imported_count
 
 
-def rebuild_collections(dir_path: str = "../qdrant_storage", use_server=True, server_url="http://localhost:6333"):
+def rebuild_collections(dir_path: str = "./qdrant_storage", use_server=True, server_url="http://localhost:6333"):
     """Rebuild all collections from JSON files.
 
     Args:
@@ -706,7 +706,7 @@ def rebuild_collections(dir_path: str = "../qdrant_storage", use_server=True, se
         server_url: Qdrant server URL
     """
     # Initialize embedding client
-    embedding_client = EmbeddingClient("http://localhost:8000")
+    embedding_client = EmbeddingClient("http://localhost:8888")
 
     if use_server:
         # Server mode: delete collections via API (don't delete storage folder)
@@ -742,7 +742,7 @@ def rebuild_collections(dir_path: str = "../qdrant_storage", use_server=True, se
 def add_lessons_to_existing(
     json_file: str,
     collection_name: str,
-    path: str = "../qdrant_storage",
+    path: str = "./qdrant_storage",
     use_server: bool = False,
     server_url: str = "http://localhost:6333",
     batch_size: int = 32
@@ -762,7 +762,7 @@ def add_lessons_to_existing(
         Dictionary containing import statistics
     """
     # Initialize
-    embedding_client = EmbeddingClient("http://localhost:8000")
+    embedding_client = EmbeddingClient("http://localhost:8888")
     if use_server:
         manager = QdrantManager(use_server=True, server_url=server_url)
     else:
@@ -897,18 +897,18 @@ def add_lessons_to_existing(
 
 if __name__ == "__main__":
     # ===== Method 1: Rebuild all collections (from scratch) =====
-    # rebuild_collections(use_server=True, server_url="http://localhost:6333")
+    rebuild_collections(use_server=True, server_url="http://localhost:6333")
     # rebuild_collections(dir_path="D:/projects/qdrant/hsa_gpt5_gta1_50_roi_pattern", use_server=False)
     
     # # ===== Method 2: Add new data to existing collection =====
-    for json_file in glob.glob("patterns/*.json"):
-        collection_name = os.path.basename(json_file).split(".")[0]
-        add_lessons_to_existing(
-            json_file=json_file,
-            collection_name=collection_name,
-            use_server=True,
-            # path="D:/projects/qdrant/hsa_gpt5mini_gta1_50_roi_pattern"
-        )
+    # for json_file in glob.glob("patterns/*.json"):
+    #     collection_name = os.path.basename(json_file).split(".")[0]
+    #     add_lessons_to_existing(
+    #         json_file=json_file,
+    #         collection_name=collection_name,
+    #         use_server=True,
+    #         # path="D:/projects/qdrant/hsa_gpt5mini_gta1_50_roi_pattern"
+    #     )
     # add_lessons_to_existing(
     #     json_file="patterns/servicenow.json",
     #     collection_name="servicenow",

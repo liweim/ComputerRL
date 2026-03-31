@@ -32,8 +32,8 @@ class PatternManager:
     def __init__(
         self,
         llm=None,
-        qdrant_path: str = "D:/projects/qdrant/qdrant_storage",
-        embedding_service_url: str = "http://localhost:8000",
+        qdrant_path: str = "./qdrant_storage",
+        embedding_service_url: str = "http://localhost:8888",
         similarity_threshold: float = 0.7,
         use_qdrant_server: bool = False,  # Default to server mode for multi-process
         qdrant_server_url: str = "http://localhost:6333"
@@ -381,7 +381,7 @@ class HiSA:
         record: bool = False,
         max_parse_retries: int = 3,
         wo_pattern: bool = False,  # If True, disable pattern induction (default: False means pattern induction is enabled)
-        pattern_dir: str = "D:/projects/qdrant/qdrant_storage",
+        pattern_dir: str = "./qdrant_storage",
         use_qdrant_server: bool = False,  # Use server mode by default for multi-process
         qdrant_server_url: str = "http://localhost:6333",
         wo_roi: bool = False,  # If True, disable ROI cropping (default: False means ROI cropping is enabled)

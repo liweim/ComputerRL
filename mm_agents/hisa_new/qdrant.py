@@ -706,7 +706,7 @@ def rebuild_collections(dir_path: str = "../qdrant_storage", use_server=True, se
         server_url: Qdrant server URL
     """
     # Initialize embedding client
-    embedding_client = EmbeddingClient("http://localhost:8000")
+    embedding_client = EmbeddingClient("http://localhost:8888")
 
     if use_server:
         # Server mode: delete collections via API (don't delete storage folder)
@@ -762,7 +762,7 @@ def add_lessons_to_existing(
         Dictionary containing import statistics
     """
     # Initialize
-    embedding_client = EmbeddingClient("http://localhost:8000")
+    embedding_client = EmbeddingClient("http://localhost:8888")
     if use_server:
         manager = QdrantManager(use_server=True, server_url=server_url)
     else:

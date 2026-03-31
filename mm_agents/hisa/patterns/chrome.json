@@ -1,0 +1,32 @@
+[
+    {
+      "id": 1,
+      "type": "require",
+      "lesson": "System-level browser changes (e.g., Flags, Languages) usually require a restart (Relaunch) to take effect."
+    },
+    {
+      "id": 2,
+      "type": "require",
+      "lesson": "Execute a mandatory 'wait' action after triggering page loads, downloads, or form submissions to ensure the DOM is ready."
+    },
+    {
+      "id": 3,
+      "type": "require",
+      "lesson": "When filtering or searching, ensure the final state is visually verified (e.g., checking URL parameters or result counts)."
+    },
+    {
+      "id": 4,
+      "type": "require",
+      "lesson": "Chrome browser settings do not control search engine behavior (e.g., results per page). These settings are managed by the search engine website itself, not by the browser."
+    },
+    {
+      "id": 5,
+      "type": "require",
+      "lesson": "Changing Chrome's interface language requires language packs to be pre-installed in the system. If a language pack is not available, the language cannot be changed."
+    },
+    {
+      "id": 6,
+      "type": "require",
+      "lesson": "Chrome's dark mode is often tied to OS-level appearance settings on Linux systems. Browser-level dark mode settings may not override system-level theme preferences."
+    }
+  ]
