@@ -1,1 +1,0 @@
-# HiSA prompt package

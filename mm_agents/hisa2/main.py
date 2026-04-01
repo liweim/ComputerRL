@@ -13,12 +13,9 @@ from mm_agents.hisa.llm import AbstractLLM
 from utils import serialize_json, get_change_roi
 from json_repair import repair_json
 from utils import postprocess_action
-from mm_agents.hisa.qdrant import QdrantManager, add_lessons_to_existing
-from mm_agents.hisa.embedding import EmbeddingClient
 from PIL import Image
 import io
 import time
-import glob
 
 
 # ==================== PROMPTS ====================
@@ -192,6 +189,63 @@ When **task is objectively impossible** after verification:
 ```
 """
 
+PLANNER_CORE_PROMPT = """You are an expert GUI agent that can also use bash when it is more reliable than the GUI.
+
+Rules:
+1. Do only what the task asks.
+2. Use as few steps as possible, but include a final verification before termination.
+3. Review the task, summary, recent compact history, and retrieved patterns before deciding.
+4. Avoid repeating the same failed action or target.
+5. Read visible text directly from the screenshot when useful and record key evidence in `thought`.
+6. Immediate action feedback does not prove task completion."""
+
+GUI_SKILL_PROMPT = """GUI skill:
+- Use `gui_action` for clicks, double-clicks, right-clicks, drag, move, scroll, typing, hotkeys.
+- For mouse-position actions, `description` must clearly identify the target because the executor grounds coordinates from it.
+- Keep `thought`, `description`, and `input` consistent.
+- Exact APIs:
+  - `pyautogui.click(x, y)`
+  - `pyautogui.doubleClick(x, y)`
+  - `pyautogui.rightClick(x, y)`
+  - `pyautogui.moveTo(x, y)`
+  - `pyautogui.moveTo(x1, y1); pyautogui.dragTo(x2, y2, duration=0.5, button='left')`
+  - `pyautogui.write('text')`
+  - `pyautogui.press('enter')`
+  - `pyautogui.hotkey('ctrl', 'c')`
+  - `pyautogui.moveTo(x, y); pyautogui.scroll(amount)` with amount in `[-10, 10]`."""
+
+BASH_SKILL_PROMPT = """Bash skill:
+- Use `bash_execution` when inspection or file modification is more reliable in code than in GUI.
+- Prefer complete, standalone commands.
+- For spreadsheet or document edits, prefer Python libraries when reliable."""
+
+VERIFICATION_SKILL_PROMPT = """Verification skill:
+- The last step is usually verification, not termination.
+- Before terminating, verify each requested constraint one by one using the screenshot or a read-only command.
+- Do not terminate based only on a click succeeding, a popup appearing, or a filename being visible.
+- If verification is inconclusive, continue working or wait."""
+
+RECOVERY_SKILL_PROMPT = """Recovery skill:
+- If an action clearly failed, switch strategy: different target, different tool, or different command.
+- Do not repeat the same failed action sequence.
+- After async operations, use `wait` before judging the result.
+- Use `infeasible` only when the task is objectively impossible after verification."""
+
+COMPACT_HISTORY_PROMPT = """Summarize recent execution history into a compact planner state.
+
+Return JSON:
+{
+  "summary": "1-3 sentences covering progress and blockers",
+  "next_hint": "one concrete next-step hint",
+  "completed": ["short completed item"],
+  "open": ["short remaining need or blocker"]
+}
+
+Rules:
+- Focus on what matters for the next planning step.
+- Prefer concrete UI state, command result, and remaining constraints.
+- Do not repeat full logs."""
+
 FIX_RESPONSE_PROMPT = """Error: Failed to parse your response.
 Error message: {error_message}
 
@@ -282,12 +336,14 @@ IMPORTANT Guidelines:
 
 Format as a JSON list of objects with type and lesson (maximum 3 items):
 [
-  {{"type": "success", "lesson": "Method X worked: ..."}},
+  {{"type": "domain", "lesson": "For this task family, method X worked: ..."}},
+  {{"type": "env", "lesson": "In this environment, UI Y needed wait or special handling"}},
   {{"type": "failure", "lesson": "DON'T use method Y: tried 3 times, doesn't work"}}
 ]
 
-Type values (ONLY these two):
-- "success": A method/strategy that clearly worked during execution
+Type values (ONLY these three):
+- "domain": A reusable strategy for similar GUI tasks
+- "env": An environment-specific quirk or UI behavior that clearly mattered
 - "failure": A method/strategy that clearly failed after multiple attempts"""
 
 PATTERN_SYNTHESIS_PROMPT = """Given the current task and past lessons from the same domain, provide a concise, refined summary of actionable advice.
@@ -303,15 +359,34 @@ Your task:
 1. **Filter** - Select ONLY the most relevant lessons for this specific task
 2. **Synthesize** - Combine similar lessons into unified advice
 3. **Refine** - Express advice concisely and actionably (5 bullet points maximum)
-4. **Prioritize** - Focus on: mandatory requirements first, then critical pitfalls, then helpful strategies
-5. **Conflict Resolution** - If success/fail lessons conflict with required lessons, prioritize and follow the required lessons.
+4. **Prioritize** - Focus on: mandatory requirements first, then environment quirks, then critical pitfalls, then helpful strategies
+5. **Conflict Resolution** - If domain/env/failure lessons conflict with required lessons, prioritize and follow the required lessons.
 
 Return empty string if no relevant lessons exist."""
+
+MEMORY_SELECTION_PROMPT = """You are selecting local memory files that will clearly help with the current GUI task.
+
+You will receive:
+- the current task
+- the current task signature and tags
+- a list of candidate memory entries with filename, type, and short description
+
+Return a JSON object:
+{
+  "selected": ["filename1.md", "filename2.md"]
+}
+
+Rules:
+- Select at most 5 files.
+- Be selective. Only choose memories that are clearly useful for this specific task.
+- Prefer environment quirks, workflow tactics, and failure warnings over generic notes.
+- Prefer memories whose task tags align with the current task tags.
+- Do not include require entries; those are injected separately."""
 
 # ==================== PATTERN MANAGER ====================
 
 class PatternManager:
-    """Manage task execution pattern by domain."""
+    """Manage file-based task memories by software/domain."""
 
     def __init__(
         self,
@@ -323,144 +398,262 @@ class PatternManager:
         qdrant_server_url: str = "http://localhost:6333"
     ):
         self.llm = llm
-        self.similarity_threshold = similarity_threshold
         self.logger = logging.getLogger("desktopenv.pattern")
-        if not os.path.exists(qdrant_path):
-            for json_file in glob.glob("mm_agents/hisa/patterns/*.json"):
-                collection_name = os.path.basename(json_file).split(".")[0]
-                add_lessons_to_existing(
-                    json_file=json_file,
-                    collection_name=collection_name,
-                    use_server=False,
-                    path=qdrant_path
-                )
-        self.qdrant = QdrantManager(
-            path=qdrant_path,
-            use_server=use_qdrant_server,
-            server_url=qdrant_server_url
+        base_memory_root = qdrant_path or os.path.join(os.path.dirname(__file__), "memories")
+        self.memory_root = os.path.abspath(base_memory_root)
+        os.makedirs(self.memory_root, exist_ok=True)
+        self.logger.info(
+            f"File memory initialized. memory_root={self.memory_root}"
         )
-        self.embedding_client = EmbeddingClient(service_url=embedding_service_url)
-        mode = "server" if use_qdrant_server else "local"
-        self.logger.info(f"Vector database ({mode} mode) and embedding service initialized")
 
-    def _ensure_collection(self, collection_name: str):
-        """Ensure Qdrant collection exists for a domain."""
+    def _normalize_domain(self, domain: str) -> str:
+        domain = (domain or "general").strip().lower()
+        domain = re.sub(r"[^a-z0-9_]+", "_", domain)
+        domain = re.sub(r"_+", "_", domain).strip("_")
+        return domain or "general"
+
+    def _get_memory_dir(self, domain: str) -> str:
+        return os.path.join(self.memory_root, self._normalize_domain(domain))
+
+    def _ensure_memory_dir(self, domain: str) -> str:
+        memory_dir = self._get_memory_dir(domain)
+        os.makedirs(memory_dir, exist_ok=True)
+        return memory_dir
+
+    def _load_seed_requirements(self, domain: str) -> List[Dict]:
+        return []
+
+    def _parse_memory_file(self, file_path: str) -> Optional[Dict]:
         try:
-            collections = self.qdrant.list_collections()
-            if collection_name not in collections:
-                self.qdrant.create_collection(
-                    collection_name=collection_name,
-                    vector_size=1024,
-                    distance="Cosine"
-                )
-                self.logger.info(f"Created Qdrant collection: {collection_name}")
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
         except Exception as e:
-            self.logger.error(f"Failed to ensure collection {collection_name}: {e}")
+            self.logger.warning(f"Failed to read memory file {file_path}: {e}")
+            return None
 
-    def save_pattern(self, domain: str, lessons: List[Dict]):
-        """Save lessons using Qdrant vector database with deduplication.
+        if not raw:
+            return None
 
-        Args:
-            domain: The domain to save lessons to
-            lessons: List of lesson dicts, each with 'type' and 'lesson' fields
-                    type must be: 'success' or 'failure' (determined by LLM from execution)
+        metadata = {}
+        body = raw
+        if raw.startswith("---\n"):
+            parts = raw.split("\n---\n", 1)
+            if len(parts) == 2:
+                header, body = parts
+                for line in header.splitlines()[1:]:
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    metadata[key.strip()] = value.strip()
 
-        Note:
-            - Each lesson is vectorized and stored in Qdrant
-            - Similar lessons (cosine similarity > threshold) are detected and removed
-            - New lessons replace similar old ones
-            - Different domains use different Qdrant collections
-        """
+        lesson = body.strip()
+        if not lesson:
+            return None
+
+        return {
+            "filename": os.path.basename(file_path),
+            "path": file_path,
+            "type": metadata.get("type", "domain"),
+            "description": metadata.get("description", lesson[:160]),
+            "confidence": metadata.get("confidence", ""),
+            "task_signature": metadata.get("task_signature", ""),
+            "task_tags": [tag.strip() for tag in metadata.get("task_tags", "").split(",") if tag.strip()],
+            "source_task_id": metadata.get("source_task_id", ""),
+            "lesson": lesson,
+            "source": "memory",
+            "mtime": os.path.getmtime(file_path),
+        }
+
+    def _load_memory_entries(self, domain: str) -> List[Dict]:
+        memory_dir = self._ensure_memory_dir(domain)
+        entries = []
+        for file_name in sorted(os.listdir(memory_dir)):
+            if not file_name.endswith(".md") or file_name == "MEMORY.md":
+                continue
+            entry = self._parse_memory_file(os.path.join(memory_dir, file_name))
+            if entry:
+                entries.append(entry)
+        entries.sort(key=lambda item: item.get("mtime", 0), reverse=True)
+        return entries
+
+    def _write_memory_index(self, domain: str, entries: List[Dict]) -> None:
+        memory_dir = self._ensure_memory_dir(domain)
+        index_path = os.path.join(memory_dir, "MEMORY.md")
+        lines = [f"# Memory Index: {self._normalize_domain(domain)}", ""]
+        for entry in entries:
+            lines.append(
+                f"- [{entry['filename']}]({entry['filename']}) [{entry.get('type', 'domain')}] - {entry.get('description', '')}"
+            )
+        with open(index_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines).strip() + "\n")
+
+    def _score_memory_entry(
+        self,
+        entry: Dict,
+        task_signature: str = "",
+        task_tags: Optional[List[str]] = None,
+    ) -> float:
+        score = 0.0
+        entry_tags = set(entry.get("task_tags", []))
+        current_tags = set(task_tags or [])
+        overlap = len(entry_tags & current_tags)
+        score += overlap * 10.0
+
+        if task_signature and entry.get("task_signature") == task_signature:
+            score += 12.0
+
+        confidence = (entry.get("confidence") or "").lower()
+        if confidence == "high":
+            score += 3.0
+        elif confidence == "medium":
+            score += 1.5
+
+        entry_type = (entry.get("type") or "").lower()
+        if entry_type == "env":
+            score += 2.0
+        elif entry_type == "failure":
+            score += 1.0
+
+        mtime = float(entry.get("mtime") or 0.0)
+        if mtime > 0:
+            age_days = max(0.0, (time.time() - mtime) / 86400.0)
+            score -= min(age_days * 0.05, 3.0)
+
+        return score
+
+    def _prefilter_memory_entries(
+        self,
+        entries: List[Dict],
+        task_signature: str = "",
+        task_tags: Optional[List[str]] = None,
+        limit: int = 12,
+    ) -> List[Dict]:
+        if not entries:
+            return []
+
+        enriched = []
+        for entry in entries:
+            scored = dict(entry)
+            scored["_score"] = self._score_memory_entry(
+                scored,
+                task_signature=task_signature,
+                task_tags=task_tags,
+            )
+            enriched.append(scored)
+
+        enriched.sort(
+            key=lambda item: (
+                item.get("_score", 0.0),
+                item.get("mtime", 0.0),
+            ),
+            reverse=True,
+        )
+
+        strong_matches = [item for item in enriched if item.get("_score", 0.0) > 0][:limit]
+        if len(strong_matches) >= min(5, limit):
+            return strong_matches
+        return enriched[:limit]
+
+    def save_pattern(
+        self,
+        domain: str,
+        lessons: List[Dict],
+        task_instruction: str = "",
+        task_id: str = "",
+        task_signature: str = "",
+        task_tags: Optional[List[str]] = None,
+    ):
+        """Save learned lessons as local markdown files under the software/domain directory."""
         try:
-            self._ensure_collection(domain)
-
-            # Get current max ID from Qdrant
-            try:
-                count = self.qdrant.count_points(domain)
-                all_points = self.qdrant.scroll_all(domain, limit=1000, with_vectors=False)
-                max_id = max([p["id"] for p in all_points], default=0) if all_points else 0
-                next_id = max_id + 1
-            except:
-                next_id = 1
+            normalized_domain = self._normalize_domain(domain)
+            memory_dir = self._ensure_memory_dir(normalized_domain)
+            existing_entries = self._load_memory_entries(normalized_domain)
+            existing_keys = {
+                (entry.get("type", "domain"), re.sub(r"\s+", " ", entry.get("lesson", "").strip().lower()))
+                for entry in existing_entries
+            }
+            existing_by_type = {}
+            for entry in existing_entries:
+                existing_by_type.setdefault(entry.get("type", "domain"), []).append(entry)
 
             added_count = 0
-            replaced_count = 0
-
+            removed_count = 0
             for lesson_obj in lessons:
-                lesson_text = lesson_obj.get("lesson", "")
-                lesson_type = lesson_obj.get("type", "failure")
-
-                if not lesson_text:
+                lesson_text = (lesson_obj.get("lesson") or "").strip()
+                lesson_type = (lesson_obj.get("type") or "domain").strip().lower()
+                if not lesson_text or lesson_type == "require":
                     continue
 
-                # Generate embedding for the lesson
-                try:
-                    lesson_vector = self.embedding_client(lesson_text)
-                except Exception as e:
-                    self.logger.error(f"Failed to generate embedding: {e}")
+                dedup_key = (lesson_type, re.sub(r"\s+", " ", lesson_text.lower()))
+                if dedup_key in existing_keys:
                     continue
 
-                # Search for similar lessons
-                try:
-                    similar_results = self.qdrant.search(
-                        collection_name=domain,
-                        query_vector=lesson_vector,
-                        limit=5,
-                        score_threshold=self.similarity_threshold
-                    )
-                except Exception as e:
-                    self.logger.warning(f"Search failed: {e}, assuming no similar lessons")
-                    similar_results = []
+                file_stub = hashlib.sha256(f"{lesson_type}:{lesson_text}".encode("utf-8")).hexdigest()[:10]
+                file_name = f"{lesson_type}_{int(time.time())}_{file_stub}.md"
+                file_path = os.path.join(memory_dir, file_name)
+                description = lesson_text[:160]
+                typed_signature = task_signature or self._normalize_domain(domain)
+                tag_list = ",".join(task_tags or [])
+                confidence = "high" if lesson_type in ["env", "failure"] else "medium"
+                content = (
+                    "---\n"
+                    f"type: {lesson_type}\n"
+                    f"software: {normalized_domain}\n"
+                    f"description: {description}\n"
+                    f"confidence: {confidence}\n"
+                    f"task_signature: {typed_signature}\n"
+                    f"task_tags: {tag_list}\n"
+                    f"source_task_id: {task_id or 'unknown'}\n"
+                    f"created_at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    "---\n\n"
+                    f"{lesson_text}\n"
+                )
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                existing_keys.add(dedup_key)
+                added_count += 1
+                existing_by_type.setdefault(lesson_type, []).append({
+                    "filename": file_name,
+                    "path": file_path,
+                    "type": lesson_type,
+                    "description": description,
+                    "lesson": lesson_text,
+                    "confidence": confidence,
+                    "task_signature": typed_signature,
+                    "task_tags": task_tags or [],
+                    "source_task_id": task_id or "unknown",
+                    "mtime": os.path.getmtime(file_path),
+                })
 
-                # Filter out lessons with type="require" from deletion candidates
-                # IMPORTANT: Never delete or modify lessons with type="require"
-                deletable_similar = []
-                for r in similar_results:
-                    similar_type = r.get("payload", {}).get("type", "")
-                    if similar_type != "require":
-                        deletable_similar.append(r)
-                    else:
-                        self.logger.info(f"Skipping deletion of require-type lesson (id={r['id']}) - these are protected")
+            # Keep each software/type bucket bounded so memories do not grow without limit.
+            for lesson_type, type_entries in existing_by_type.items():
+                type_entries.sort(
+                    key=lambda item: (
+                        self._score_memory_entry(
+                            item,
+                            task_signature=task_signature,
+                            task_tags=task_tags,
+                        ),
+                        item.get("mtime", 0.0),
+                    ),
+                    reverse=True,
+                )
+                for stale_entry in type_entries[20:]:
+                    stale_path = stale_entry.get("path")
+                    if stale_path and os.path.exists(stale_path):
+                        try:
+                            os.remove(stale_path)
+                            removed_count += 1
+                        except Exception as e:
+                            self.logger.warning(f"Failed to prune stale memory file {stale_path}: {e}")
 
-                # Delete similar old lessons (excluding require type)
-                if deletable_similar:
-                    deletable_ids = [r["id"] for r in deletable_similar]
-                    self.logger.info(
-                        f"Found {len(deletable_similar)} similar lesson(s) with similarity > {self.similarity_threshold}, "
-                        f"replacing them with new lesson"
-                    )
-                    try:
-                        self.qdrant.delete_by_ids(domain, deletable_ids)
-                        replaced_count += len(deletable_ids)
-                    except Exception as e:
-                        self.logger.error(f"Failed to delete similar lessons: {e}")
-
-                # Add new lesson
-                try:
-                    self.qdrant.insert_points(
-                        collection_name=domain,
-                        points=[{
-                            "id": next_id,
-                            "vector": lesson_vector,
-                            "payload": {
-                                "lesson": lesson_text,
-                                "type": lesson_type,
-                                "domain": domain
-                            }
-                        }]
-                    )
-                    added_count += 1
-                    next_id += 1
-                except Exception as e:
-                    self.logger.error(f"Failed to insert lesson: {e}")
-
+            updated_entries = self._load_memory_entries(normalized_domain)
+            self._write_memory_index(normalized_domain, updated_entries)
             self.logger.info(
-                f"Vector DB update for domain {domain}: "
-                f"added {added_count} new lesson(s), replaced {replaced_count} similar lesson(s)"
+                f"File memory update for domain {normalized_domain}: added {added_count} new lesson(s), pruned {removed_count} old lesson(s)"
             )
-
         except Exception as e:
-            self.logger.error(f"Failed to save pattern with vector DB: {e}")
+            self.logger.error(f"Failed to save file-based memory: {e}")
             raise
 
     def pattern_induction(self, task_instruction: str, action_logs: List[Dict]) -> List[str]:
@@ -509,8 +702,9 @@ class PatternManager:
                 validated_lessons = []
                 for item in lessons[:3]:  # Max 3 lessons
                     if isinstance(item, dict) and "type" in item and "lesson" in item:
-                        # Validate type is success or failure
-                        if item["type"] in ["success", "failure"]:
+                        if item["type"] in ["domain", "env", "failure", "require", "success"]:
+                            if item["type"] == "success":
+                                item = {"type": "domain", "lesson": item["lesson"]}
                             validated_lessons.append(item)
                         else:
                             self.logger.warning(f"Invalid lesson type '{item['type']}', skipping")
@@ -535,122 +729,120 @@ class PatternManager:
             self.logger.error(f"Failed to extract lessons: {e}")
             return []
 
-    def get_relevant_pattern(self, domain: str, current_task: str) -> str:
-        """Retrieve relevant patterns using vector similarity search.
-
-        Returns:
-            Actionable advice string based on relevant patterns
-        """
+    def get_relevant_pattern(
+        self,
+        domain: str,
+        current_task: str,
+        task_signature: str = "",
+        task_tags: Optional[List[str]] = None,
+    ) -> str:
+        """Retrieve relevant memories from learned markdown memories."""
         try:
-            self._ensure_collection(domain)
+            normalized_domain = self._normalize_domain(domain)
+            require_patterns = self._load_seed_requirements(normalized_domain)
+            learned_entries = self._load_memory_entries(normalized_domain)
+            learned_entries = self._prefilter_memory_entries(
+                learned_entries,
+                task_signature=task_signature,
+                task_tags=task_tags,
+                limit=12,
+            )
 
-            # Check if collection has any points
-            try:
-                count = self.qdrant.count_points(domain)
-                if count == 0:
-                    self.logger.info(f"No pattern found in collection {domain}")
-                    return ""
-            except Exception as e:
-                self.logger.warning(f"Failed to check collection count: {e}")
-                return ""
+            selected_entries = []
+            if learned_entries and self.llm:
+                manifest_lines = [
+                    f"- {entry['filename']} [{entry.get('type', 'domain')}, confidence={entry.get('confidence', '')}, signature={entry.get('task_signature', '')}, tags={','.join(entry.get('task_tags', []))}, source_task_id={entry.get('source_task_id', '')}]: {entry.get('description', '')}"
+                    for entry in learned_entries
+                ]
+                messages = [
+                    {"role": "system", "content": MEMORY_SELECTION_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Task: {current_task}\n\n"
+                            f"Task signature: {task_signature}\n"
+                            f"Task tags: {', '.join(task_tags or [])}\n\n"
+                            "Candidate memory entries:\n" + "\n".join(manifest_lines)
+                        )
+                    }
+                ]
+                try:
+                    response = self.llm(messages, enable_thinking=False)
+                    json_str = response.strip()
+                    if "```json" in response:
+                        json_start = response.find("```json") + 7
+                        json_end = response.find("```", json_start)
+                        json_str = response[json_start:json_end].strip()
+                    elif "```" in response:
+                        json_start = response.find("```") + 3
+                        json_end = response.find("```", json_start)
+                        json_str = response[json_start:json_end].strip()
+                    parsed = json.loads(repair_json(json_str))
+                    selected_names = set(parsed.get("selected", [])) if isinstance(parsed, dict) else set()
+                    selected_entries = [
+                        entry for entry in learned_entries if entry["filename"] in selected_names
+                    ][:5]
+                except Exception as e:
+                    self.logger.warning(f"Local memory selection failed, falling back to recency: {e}")
+                    selected_entries = learned_entries[:5]
+            elif learned_entries:
+                selected_entries = learned_entries[:5]
 
-            # First, retrieve ALL lessons with type="require" (mandatory requirements)
-            require_patterns = []
-            try:
-                all_require_results = self.qdrant.search_by_filter(
-                    collection_name=domain,
-                    filter_conditions={"type": "require"},
-                    limit=100  # Get all require type lessons
-                )
-                for result in all_require_results:
-                    payload = result["payload"]
-                    lesson_text = payload.get("lesson", "")
-                    entry = {"id": result["id"], "lesson": lesson_text, "score": result["score"]}
-                    require_patterns.append(entry)
-                
-            except Exception as e:
-                self.logger.warning(f"Failed to retrieve require type lessons: {e}")
-
-            # Vectorize current task
-            try:
-                task_vector = self.embedding_client(current_task)
-            except Exception as e:
-                self.logger.error(f"Failed to generate task embedding: {e}")
-                raise
-
-            # Search for similar lessons (top 5, threshold 0.75 for high quality matching)
-            try:
-                search_results = self.qdrant.search(
-                    collection_name=domain,
-                    query_vector=task_vector,
-                    limit=5,
-                    score_threshold=0.5
-                )
-            except Exception as e:
-                self.logger.error(f"Vector search failed: {e}")
-                raise
-
-            # Group by type (excluding require since we already have them all)
-            success_patterns = []
-            failure_patterns = []
-
-            for result in search_results:
-                payload = result["payload"]
-                lesson_type = payload.get("type", "failure")
-                lesson_text = payload.get("lesson", "")
-                score = result["score"]
-
-                entry = {"id": result["id"], "lesson": lesson_text, "score": score}
-
-                # Skip require type here as we already retrieved all of them above
-                if lesson_type == "require":
-                    continue
-                elif lesson_type == "success":
-                    success_patterns.append(entry)
-                else:
-                    failure_patterns.append(entry)
-
-            # Build summary
             pattern_summary = []
             if require_patterns:
                 pattern_summary.append("\n--- REQUIREMENTS (MUST FOLLOW) ---")
                 for pattern in require_patterns:
-                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+                    pattern_summary.append(pattern["lesson"])
 
-            if success_patterns:
-                pattern_summary.append("\n--- SUCCESS Patterns ---")
-                for pattern in success_patterns:
-                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+            grouped = {
+                "env": [],
+                "domain": [],
+                "failure": [],
+            }
+            for entry in selected_entries:
+                grouped.setdefault(entry.get("type", "domain"), []).append(entry)
 
-            if failure_patterns:
+            if grouped.get("env"):
+                pattern_summary.append("\n--- ENVIRONMENT QUIRKS ---")
+                for pattern in grouped["env"]:
+                    pattern_summary.append(pattern["lesson"])
+
+            if grouped.get("domain"):
+                pattern_summary.append("\n--- DOMAIN STRATEGIES ---")
+                for pattern in grouped["domain"]:
+                    pattern_summary.append(pattern["lesson"])
+
+            if grouped.get("failure"):
                 pattern_summary.append("\n--- FAILURE Patterns ---")
-                for pattern in failure_patterns:
-                    pattern_summary.append(f"[{pattern['id']}] {pattern['lesson']} (similarity: {pattern['score']:.2f})")
+                for pattern in grouped["failure"]:
+                    pattern_summary.append(pattern["lesson"])
 
             if not pattern_summary:
                 return ""
 
             prompt = PATTERN_SYNTHESIS_PROMPT.format(
                 current_task=current_task,
-                pattern_summary='\n'.join(pattern_summary)
+                pattern_summary="\n".join(pattern_summary)
             )
+            if not self.llm:
+                return "\n".join(pattern_summary)
 
             try:
                 messages = [
                     {"role": "system", "content": "You are an expert at analyzing past lessons and providing actionable advice for new tasks."},
                     {"role": "user", "content": prompt}
                 ]
-
-                response = self.llm(messages)
-                self.logger.info(f"Retrieved {len(pattern_summary)} relevant lesson(s) using vector search")
+                response = self.llm(messages, enable_thinking=False)
+                self.logger.info(
+                    f"Retrieved file memories for domain {normalized_domain}: "
+                    f"require={len(require_patterns)}, learned_selected={len(selected_entries)}"
+                )
                 return response.strip()
-
             except Exception as e:
-                self.logger.error(f"Failed to summarize patterns: {e}")
-                return '\n'.join(pattern_summary)
-
+                self.logger.error(f"Failed to summarize file memories: {e}")
+                return "\n".join(pattern_summary)
         except Exception as e:
-            self.logger.error(f"Failed to get relevant patterns with vector DB: {e}")
+            self.logger.error(f"Failed to get relevant file memories: {e}")
             raise
 
 # ==================== AGENT FRAMEWORK ====================
@@ -674,7 +866,7 @@ class HiSA:
         record: bool = False,
         max_parse_retries: int = 3,
         wo_pattern: bool = False,  # If True, disable pattern induction (default: False means pattern induction is enabled)
-        pattern_dir: str = "../qdrant/qdrant_storage",
+        pattern_dir: str = "",
         use_qdrant_server: bool = False,  # Use server mode by default for multi-process
         qdrant_server_url: str = "http://localhost:6333",
         wo_roi: bool = False,  # If True, disable ROI cropping (default: False means ROI cropping is enabled)
@@ -710,6 +902,7 @@ class HiSA:
         self.sliding_window_size = sliding_window_size  # Sliding window size for conversation history
 
         self.logger = logging.getLogger("desktopenv")
+        self.skills_dir = os.path.join(os.path.dirname(__file__), "skills")
 
         # Initialize LLM clients
         self.global_planner_llm = AbstractLLM(global_planner_model, logger=self.logger)
@@ -717,6 +910,9 @@ class HiSA:
         self.state_manager_llm = AbstractLLM(state_manager_model, logger=self.logger)
 
         # Initialize pattern manager
+        if not pattern_dir:
+            pattern_dir = os.path.join(os.path.dirname(__file__), "memories")
+
         if not self.wo_pattern:
             self.pattern_manager = PatternManager(
                 llm=self.global_planner_llm,
@@ -737,6 +933,216 @@ class HiSA:
         self.step_token_usage = {}  # Store token usage for current step
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
+        self.last_compact_state = None  # Compact planner-visible state derived from history
+
+    def _load_skill_text(self, name: str) -> str:
+        path = os.path.join(self.skills_dir, name)
+        if not os.path.exists(path):
+            self.logger.warning(f"Skill file missing: {path}")
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except Exception as e:
+            self.logger.warning(f"Failed to load skill file {path}: {e}")
+            return ""
+
+        metadata = {}
+        body = raw
+        if raw.startswith("---\n"):
+            parts = raw.split("\n---\n", 1)
+            if len(parts) == 2:
+                header, body = parts
+                for line in header.splitlines()[1:]:
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    metadata[key.strip().lower()] = value.strip()
+
+        skill_domain = metadata.get("domain", "").lower()
+        current_domain = (getattr(self, "current_domain", "") or "").lower()
+        if skill_domain and skill_domain not in ["all", current_domain]:
+            return ""
+
+        when_to_use = metadata.get("when_to_use", "")
+        priority = metadata.get("priority", "")
+        prefix = []
+        if priority:
+            prefix.append(f"Priority: {priority}")
+        if when_to_use:
+            prefix.append(f"When to use: {when_to_use}")
+        if prefix:
+            return "\n".join(prefix) + "\n\n" + body.strip()
+        return body.strip()
+
+    def _get_domain_skill_name(self) -> str:
+        domain = getattr(self, "current_domain", "") or getattr(self, "task_domain", "") or ""
+        domain = re.sub(r"[^a-z0-9_]+", "_", domain.strip().lower())
+        domain = re.sub(r"_+", "_", domain).strip("_")
+        return f"{domain}.md" if domain else ""
+
+    def _task_requires_bash_skill(self) -> bool:
+        task_text = getattr(self, "task_instruction", "").lower()
+        bash_hints = [
+            "file", "code", "python", "bash", "terminal", "script",
+            "excel", "calc", "spreadsheet", "csv", "json", "yaml",
+            "docx", "modify", "edit"
+        ]
+        return any(token in task_text for token in bash_hints)
+
+    def _extract_task_tags(self, task_instruction: str, domain: str = "") -> List[str]:
+        text = f"{domain} {task_instruction}".lower()
+        tag_rules = {
+            "browser": ["chrome", "browser", "tab", "page", "website", "search"],
+            "email": ["email", "mail", "smtp", "inbox", "thunderbird"],
+            "settings": ["setting", "preferences", "language", "theme", "config"],
+            "edit": ["edit", "modify", "replace", "update", "change"],
+            "verify": ["verify", "confirm", "check", "ensure", "validate"],
+            "search_filter": ["search", "filter", "sort", "find", "lookup"],
+            "sheet": ["sheet", "spreadsheet", "cell", "column", "row", "calc", "excel"],
+            "slide": ["slide", "presentation", "impress", "ppt"],
+            "document": ["document", "writer", "docx", "paragraph", "heading"],
+            "image": ["image", "photo", "gimp", "resize", "crop", "color"],
+            "code": ["code", "script", "python", "notebook", "jupyter", "vs code", "vscode"],
+            "file_io": ["file", "save", "export", "import", "download", "upload"],
+        }
+        tags = []
+        for tag, keywords in tag_rules.items():
+            if any(keyword in text for keyword in keywords):
+                tags.append(tag)
+        if domain:
+            tags.append(re.sub(r"[^a-z0-9_]+", "_", domain.strip().lower()))
+        deduped = []
+        seen = set()
+        for tag in tags:
+            if tag and tag not in seen:
+                seen.add(tag)
+                deduped.append(tag)
+        return deduped
+
+    def _build_task_signature(self, task_instruction: str, domain: str = "") -> str:
+        tags = self._extract_task_tags(task_instruction, domain)
+        return "|".join(tags) if tags else (domain or "general")
+
+    def _should_use_recovery_skill(self) -> bool:
+        if self.last_error_feedback:
+            return True
+        recent_logs = self.action_logs[-2:]
+        return any(not log.get("execution_success", True) for log in recent_logs)
+
+    def _build_planner_system_prompt(self) -> str:
+        sections = [
+            self._load_skill_text("core.md"),
+            self._load_skill_text("gui.md"),
+            self._load_skill_text("verification.md"),
+        ]
+        domain_skill_name = self._get_domain_skill_name()
+        if domain_skill_name:
+            sections.append(self._load_skill_text(domain_skill_name))
+        if self._task_requires_bash_skill() or any(
+            log.get("type") == "bash_execution" for log in self.action_logs
+        ):
+            sections.append(self._load_skill_text("bash.md"))
+        if self._should_use_recovery_skill():
+            sections.append(self._load_skill_text("recovery.md"))
+        sections.append(
+            """Return valid JSON only:
+{
+  "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
+  "tool": "gui_action|bash_execution|wait|termination|infeasible",
+  "input": "tool input here",
+  "description": "required for mouse-position gui_action"
+}"""
+        )
+        return "\n\n".join(section.strip() for section in sections if section)
+
+    def _build_compact_log_entry(
+        self,
+        step: int,
+        tool_type: str,
+        success: bool,
+        detail: str,
+        verification: str = "",
+        next_hint: str = "",
+    ) -> Dict:
+        detail = re.sub(r"\s+", " ", (detail or "").strip())
+        verification = re.sub(r"\s+", " ", (verification or "").strip())
+        next_hint = re.sub(r"\s+", " ", (next_hint or "").strip())
+        if len(detail) > 220:
+            detail = detail[:217] + "..."
+        if len(verification) > 160:
+            verification = verification[:157] + "..."
+        if len(next_hint) > 160:
+            next_hint = next_hint[:157] + "..."
+        return {
+            "step": step,
+            "intent": self.current_thought[:180] if self.current_thought else "",
+            "tool": tool_type,
+            "result": "success" if success else "failure",
+            "detail": detail,
+            "verified": verification,
+            "next_hint": next_hint,
+        }
+
+    def _render_compact_log(self, compact: Dict) -> str:
+        parts = [
+            f"Step {compact.get('step', '?')}",
+            f"tool={compact.get('tool', '')}",
+            f"result={compact.get('result', '')}",
+        ]
+        if compact.get("detail"):
+            parts.append(f"detail={compact['detail']}")
+        if compact.get("verified"):
+            parts.append(f"verified={compact['verified']}")
+        if compact.get("next_hint"):
+            parts.append(f"next_hint={compact['next_hint']}")
+        return " | ".join(parts)
+
+    def _get_recent_compact_history(self, limit: int = 5) -> List[str]:
+        compact_lines = []
+        for log in self.action_logs[-limit:]:
+            compact = log.get("compact")
+            if compact:
+                compact_lines.append(self._render_compact_log(compact))
+            elif log.get("step_abstract"):
+                compact_lines.append(re.sub(r"\s+", " ", log["step_abstract"]).strip()[:260])
+        return compact_lines
+
+    def _refresh_compact_state(self) -> Optional[Dict]:
+        recent_lines = self._get_recent_compact_history(limit=min(5, self.sliding_window_size or 5))
+        if not recent_lines:
+            self.last_compact_state = None
+            return None
+
+        messages = [
+            {"role": "system", "content": COMPACT_HISTORY_PROMPT},
+            {"role": "user", "content": "\n".join(recent_lines)},
+        ]
+        try:
+            response = self.state_manager_llm(messages, enable_thinking=False)
+            json_str = response.strip()
+            if "```json" in response:
+                json_start = response.find("```json") + 7
+                json_end = response.find("```", json_start)
+                json_str = response[json_start:json_end].strip()
+            elif "```" in response:
+                json_start = response.find("```") + 3
+                json_end = response.find("```", json_start)
+                json_str = response[json_start:json_end].strip()
+            compact_state = json.loads(repair_json(json_str))
+            if isinstance(compact_state, dict):
+                self.last_compact_state = compact_state
+                return compact_state
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh compact planner state: {e}")
+
+        self.last_compact_state = {
+            "summary": " ".join(recent_lines[-2:])[:400],
+            "next_hint": "",
+            "completed": [],
+            "open": [],
+        }
+        return self.last_compact_state
 
     def _get_usage_snapshot(self) -> Dict:
         """Get current token usage snapshot from all LLMs."""
@@ -910,7 +1316,9 @@ class HiSA:
             # Original step_abstract approach
             history_lines = []
             for log in logs:
-                if "step_abstract" in log:
+                if log.get("compact"):
+                    history_lines.append(self._render_compact_log(log["compact"]))
+                elif "step_abstract" in log:
                     history_lines.append(log["step_abstract"])
 
         if not previous_summary and not history_lines:
@@ -969,6 +1377,7 @@ class HiSA:
         self.last_summary_log_index = 0
         self.conversation_messages = []  # Store full conversation history when wo_step=True
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
+        self.last_compact_state = None
 
         if self.record:
             self.env.controller.start_recording()
@@ -990,13 +1399,25 @@ class HiSA:
 
         # Save task instruction as instance variable for later use
         self.task_instruction = task_instruction
+        self.current_domain = task_config.get("domain", "general")
+        self.current_task_id = str(
+            task_config.get("id")
+            or task_config.get("task_id")
+            or os.path.basename(self.save_dir)
+            or "unknown"
+        )
+        self.current_task_tags = self._extract_task_tags(task_instruction, self.current_domain)
+        self.current_task_signature = self._build_task_signature(task_instruction, self.current_domain)
 
         # Load relevant pattern
-        domain = task_config.get("domain", "general")
+        domain = self.current_domain
         past_pattern_text = ""
         if not self.wo_pattern:
             past_pattern_text = self.pattern_manager.get_relevant_pattern(
-                domain, task_instruction
+                domain,
+                task_instruction,
+                task_signature=self.current_task_signature,
+                task_tags=self.current_task_tags,
             )
             if past_pattern_text:
                 self.logger.info(f"Found relevant past pattern for domain: {domain}\n{past_pattern_text}")
@@ -1055,6 +1476,13 @@ class HiSA:
                         "execution_success": True,
                         "screenshot": screenshot_file,
                         "step_abstract": step_abstract,
+                        "compact": self._build_compact_log_entry(
+                            step=step,
+                            tool_type="termination",
+                            success=True,
+                            detail=decision.get("input", "Task completed."),
+                            verification="Task marked complete after explicit verification."
+                        ),
                         "step_time": 0.0,
                         "token_usage": {
                             "global_planner": global_planner_usage["global_planner"],
@@ -1244,15 +1672,15 @@ class HiSA:
                         self.conversation_messages = []
                         self.last_tool_output = None  # Clear observation as it's now in summary
 
+                compact_state = self._refresh_compact_state() if total_logs > 0 else None
+                planner_system_prompt = self._build_planner_system_prompt()
+
                 # ========== Build Messages ==========
                 if self.wo_step:
-                    # Use full conversation history approach
                     messages = [
-                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
+                        {"role": "system", "content": planner_system_prompt},
                     ]
 
-                    # ========== Sliding Window Logic (for wo_step mode) ==========
-                    # If context refinement is disabled, apply sliding window
                     conversation_to_append = self.conversation_messages
                     max_messages = self.sliding_window_size * 2
                     if self.wo_refinement and len(self.conversation_messages) > max_messages:
@@ -1265,8 +1693,7 @@ class HiSA:
                             and "text" in first_content[0]
                         ):
                             first_content[0]["text"] = f'Task: {self.task_instruction}\n\n{first_content[0]["text"]}'
-                    
-                    # Add task / summary context when starting a fresh conversation window
+
                     if len(conversation_to_append) == 0:
                         messages.append({"role": "user", "content": f"Task: {self.task_instruction}"})
                         if self.past_pattern_text:
@@ -1279,18 +1706,27 @@ class HiSA:
                                 "role": "user",
                                 "content": f"Summary of previous steps:\n{self.last_full_summary}"
                             })
+                        if compact_state:
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "Compact planner state:\n"
+                                    f"Summary: {compact_state.get('summary', '')}\n"
+                                    f"Completed: {compact_state.get('completed', [])}\n"
+                                    f"Open: {compact_state.get('open', [])}\n"
+                                    f"Next hint: {compact_state.get('next_hint', '')}"
+                                )
+                            })
 
                     messages.extend(conversation_to_append)
-                    
-                    # Add observation from previous action to maintain dialogue structure
+
                     if self.last_tool_output:
                         messages.append({
                             "role": "user",
                             "content": f"Observation from previous action:\n{self.last_tool_output}"
                         })
-                        self.last_tool_output = None  # Clear after use to prevent duplicate appending
+                        self.last_tool_output = None
 
-                    # Add error feedback or standard prompt
                     if self.last_error_feedback:
                         messages.append({
                             "role": "user",
@@ -1301,13 +1737,12 @@ class HiSA:
                         })
                     else:
                         prompt_text = (
-                            "Based on the execution history and current screenshot, what's the next action?"
+                            "Based on the execution history and current screenshot, what is the next action?"
                             if len(conversation_to_append) == 0
-                            else "Based on the conversation history and current screenshot, what's the next action?"
+                            else "Based on the conversation history and current screenshot, what is the next action?"
                         )
                         messages.append({"role": "user", "content": prompt_text})
 
-                    # Add current user message with screenshot
                     current_user_message = {
                         "role": "user",
                         "content": [
@@ -1317,31 +1752,27 @@ class HiSA:
                     }
                     messages.append(current_user_message)
                 else:
-                    # Original approach with step_abstract
-                    
-                    # ========== Sliding Window Logic (for step mode) ==========
-                    # When wo_refinement=True, apply sliding window to action_logs
                     logs_to_use = self.action_logs
                     if self.wo_refinement and len(self.action_logs) > self.sliding_window_size:
                         logs_to_use = self.action_logs[-self.sliding_window_size:]
-                    
-                    # Build condensed_history: summary + recent step summaries
+
                     condensed_history = []
                     if not self.wo_refinement and self.last_full_summary:
-                        # Context refinement enabled: use summary + recent logs
                         condensed_history = [self.last_full_summary]
                         for log in self.action_logs[self.last_summary_log_index:]:
-                            if "step_abstract" in log:
+                            if log.get("compact"):
+                                condensed_history.append(self._render_compact_log(log["compact"]))
+                            elif "step_abstract" in log:
                                 condensed_history.append(log["step_abstract"])
                     else:
-                        # wo_refinement=True or no summary yet: use logs (with sliding window applied)
                         for log in logs_to_use:
-                            if "step_abstract" in log:
+                            if log.get("compact"):
+                                condensed_history.append(self._render_compact_log(log["compact"]))
+                            elif "step_abstract" in log:
                                 condensed_history.append(log["step_abstract"])
-                    
-                    # Build messages array
+
                     messages = [
-                        {"role": "system", "content": GLOBAL_PLANNER_PROMPT},
+                        {"role": "system", "content": planner_system_prompt},
                         {"role": "user", "content": f"Task: {self.task_instruction}"}
                     ]
 
@@ -1350,24 +1781,27 @@ class HiSA:
                             "role": "user",
                             "content": f"Relevant past patterns:\n{self.past_pattern_text}"
                         })
-
                     if not self.wo_refinement and self.last_full_summary:
                         messages.append({
                             "role": "user",
                             "content": f"Summary of previous steps:\n{self.last_full_summary}"
                         })
-                        for log in self.action_logs[self.last_summary_log_index:]:
-                            if "step_abstract" in log:
-                                messages.append({
-                                    "role": "user",
-                                    "content": log["step_abstract"]
-                                })
-                    else:
-                        for history_item in condensed_history:
-                            messages.append({
-                                "role": "user",
-                                "content": history_item
-                            })
+                    if compact_state:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Compact planner state:\n"
+                                f"Summary: {compact_state.get('summary', '')}\n"
+                                f"Completed: {compact_state.get('completed', [])}\n"
+                                f"Open: {compact_state.get('open', [])}\n"
+                                f"Next hint: {compact_state.get('next_hint', '')}"
+                            )
+                        })
+                    for history_item in condensed_history:
+                        messages.append({
+                            "role": "user",
+                            "content": history_item
+                        })
 
                     if self.last_error_feedback:
                         messages.append({
@@ -1380,15 +1814,7 @@ class HiSA:
                     else:
                         messages.append({
                             "role": "user",
-                            "content": """Based on the execution history and current screenshot, decide the next action. Avoid repeating failed actions. You should strictly follow the JSON format below:
-```json
-{
-    "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
-    "tool": "gui_action|bash_execution|wait|termination|infeasible",
-    "input": "String - tool-specific content (see examples below)",
-    "description": "Optional for non-mouse actions; required for mouse-position gui_action so the executor can ground coordinates"
-}
-```"""
+                            "content": "Based on the execution history and current screenshot, decide the next action. Prefer the shortest reliable path and avoid repeating failed actions."
                         })
 
                     messages.append({
@@ -1805,6 +2231,14 @@ class HiSA:
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="gui_action",
+                    success=True,
+                    detail=description or final_code,
+                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else "",
+                    next_hint="Verify the exact requested outcome before terminating."
+                ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": requested_action_fingerprint,
@@ -1850,6 +2284,14 @@ class HiSA:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="gui_action",
+                    success=False,
+                    detail=description or code,
+                    verification=f"Error: {str(e)}",
+                    next_hint="Switch target or tool instead of repeating the same GUI action."
+                ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": requested_action_fingerprint,
@@ -2088,6 +2530,14 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": exitcode == 0 and status == "success",
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="bash_execution",
+                    success=(exitcode == 0 and status == "success"),
+                    detail=code,
+                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else f"exitcode={exitcode}",
+                    next_hint="Use the command output to decide whether GUI verification is still needed."
+                ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": action_fingerprint,
@@ -2125,6 +2575,14 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="bash_execution",
+                    success=False,
+                    detail=code,
+                    verification=f"Error: {str(e)}",
+                    next_hint="Try a different command or switch back to GUI if the shell path is brittle."
+                ),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": action_fingerprint,
                 "loop_result_fingerprint": result_fingerprint
@@ -2196,6 +2654,14 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="wait",
+                    success=True,
+                    detail=f"waited {wait_seconds} seconds",
+                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else "",
+                    next_hint="Check whether the requested UI state is now visible."
+                ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage
             })
@@ -2226,6 +2692,14 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
                 "step_abstract": step_abstract,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="wait",
+                    success=False,
+                    detail=f"waited {wait_seconds} seconds",
+                    verification=f"Error: {str(e)}",
+                    next_hint="Re-check the app state directly instead of relying on the failed wait."
+                ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage
             })
@@ -2256,7 +2730,14 @@ except subprocess.TimeoutExpired as e:
             )
 
             if key_lessons:
-                self.pattern_manager.save_pattern(domain, key_lessons)
+                self.pattern_manager.save_pattern(
+                    domain,
+                    key_lessons,
+                    task_instruction=task_instruction,
+                    task_id=getattr(self, "current_task_id", ""),
+                    task_signature=getattr(self, "current_task_signature", ""),
+                    task_tags=getattr(self, "current_task_tags", []),
+                )
                 # Format lessons as numbered list for logging
                 formatted_lessons = "\n".join(f"  {i+1}. [{lesson['type']}] {lesson['lesson']}" for i, lesson in enumerate(key_lessons))
                 self.logger.info(f"Saved {len(key_lessons)} lesson(s):\n{formatted_lessons}")

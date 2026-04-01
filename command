@@ -102,27 +102,25 @@ nohup \
 python run_hisa.py \
   --provider_name docker \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern_thinking \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern \
   --headless \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_medium.json \
   --wo_step \
   --wo_refinement \
   --wo_pattern \
-  --enable_thinking \
   > nohup.out 2>&1 &
 
 nohup \
 python run_hisa.py \
   --provider_name docker \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_wo_refinement_pattern_thinking \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_refinement_pattern \
   --headless \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_medium.json \
   --wo_refinement \
   --wo_pattern \
-  --enable_thinking \
   > nohup2.out 2>&1 &
 
 nohup \
@@ -130,12 +128,11 @@ python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern_thinking \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern \
   --headless \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_all.json \
   --wo_pattern \
-  --enable_thinking \
   > nohup3.out 2>&1 &
 
 nohup \
@@ -143,12 +140,22 @@ python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_thinking \
+  --result_dir ./results/hisa_qwen3.5-9b \
   --headless \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_medium.json \
-  --enable_thinking \
   > nohup4.out 2>&1 &
+
+nohup \
+python run_hisa2.py \
+  --provider_name docker \
+  --vm_ram 8G \
+  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa2_qwen3.5-9b \
+  --headless \
+  --max_steps 100 \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
+  > nohup5.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py
@@ -161,10 +168,10 @@ fuser -k 8001/tcp
 # debug
 Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
 
-帮我分析一下/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking下面的任务的
+帮我分析一下/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern下面的任务的
 主要失败原因，只需要每个domain找两三个失败的例子分析一下，失败的例子汇总在/data1/lwm/projects/
-ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern_thinking这一列为0的样
-本，可以通过/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern_thinking/*/*/
+ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern这一列为0的样
+本，可以通过/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern/*/*/
 execution_log.json来看任务描述和每一步操作
 通过改prompt(/data1/lwm/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
 

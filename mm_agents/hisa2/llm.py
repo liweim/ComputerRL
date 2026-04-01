@@ -9,10 +9,7 @@ import base64
 import io
 from dataclasses import dataclass
 from typing import Any, Tuple, Optional, List, Dict
-try:
-    from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY
-except:
-    pass
+from configs.config import OPENAI_API_KEY, ROAD2ALL_API_KEY, OPENROUTER_API_KEY, LOCAL_API_KEY, LOCAL_API_URL
 from openai import OpenAI
 import logging
 import sys
@@ -116,6 +113,7 @@ MODEL_CONFIGS = {
     "gemini-2.5-flash": ModelConfig("OpenRouterAPI", "google/gemini-2.5-flash", 0.3, 2.5),
     "uitars-1.5-7b": ModelConfig("LocalLLM", "uitars-1.5-7b", 0, 0),
     "gta1-7b": ModelConfig("LocalLLM", "gta1-7b", 0, 0),
+    "qwen3.5-9b": ModelConfig("LocalLLM", "qwen3.5-9b", 0, 0),
 }
 
 
@@ -350,10 +348,9 @@ class Road2allMessageFormatter(MessageFormatter):
 class BaseLLMClient:
     """Base class for LLM clients, defining unified interface"""
     
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
+    def __init__(self, model_name: str, temperature: float = 0):
         self.model_name = model_name
         self.temperature = temperature
-        self.max_tokens = max_tokens
         self.usage_stats = UsageStats()
         self.logger = None
         # Set default formatter, will be overridden by subclasses
@@ -366,7 +363,7 @@ class BaseLLMClient:
         """
         return self.message_formatter.format_for_api(messages)
     
-    def __call__(self, messages: list) -> str:
+    def __call__(self, messages: list, enable_thinking: bool = False) -> str:
         """Send messages and return response"""
         raise NotImplementedError
     
@@ -498,13 +495,13 @@ class BaseLLMClient:
 class OpenAIAPI(BaseLLMClient):
     """OpenAI API client"""
 
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
-        super().__init__(model_name, temperature, max_tokens)
+    def __init__(self, model_name: str, temperature: float = 0):
+        super().__init__(model_name, temperature)
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         # Store if this is computer-use-preview model
         self.model_name = model_name
     
-    def __call__(self, messages: list) -> str:
+    def __call__(self, messages: list, enable_thinking: bool = False) -> str:
         response = self.client.responses.create(
             model=self.model_name,
             input=messages,
@@ -740,12 +737,12 @@ Analyze the screenshot carefully and return the code."""
 class Road2allAPI(BaseLLMClient):
     """Road2all API client"""
     
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
-        super().__init__(model_name, temperature, max_tokens)
+    def __init__(self, model_name: str, temperature: float = 0):
+        super().__init__(model_name, temperature)
         self.url = "https://api2.road2all.com/v1/chat/completions"
         self.message_formatter = Road2allMessageFormatter()
     
-    def __call__(self, messages: list) -> str:
+    def __call__(self, messages: list, enable_thinking: bool = False) -> str:
         headers = {
             "Authorization": f"Bearer {ROAD2ALL_API_KEY}",
             "Content-Type": "application/json",
@@ -756,7 +753,6 @@ class Road2allAPI(BaseLLMClient):
         
         data = {
             "model": self.model_name,
-            "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "messages": formatted_messages,
         }
@@ -781,8 +777,8 @@ class Road2allAPI(BaseLLMClient):
 class OpenRouterAPI(BaseLLMClient):
     """OpenRouter API client"""
     
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
-        super().__init__(model_name, temperature, max_tokens)
+    def __init__(self, model_name: str, temperature: float = 0):
+        super().__init__(model_name, temperature)
         self.url = "https://openrouter.ai/api/v1/chat/completions"
         self.headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -790,14 +786,13 @@ class OpenRouterAPI(BaseLLMClient):
         }
         self.message_formatter = OpenRouterMessageFormatter()
     
-    def __call__(self, messages: list) -> str:
+    def __call__(self, messages: list, enable_thinking: bool = False) -> str:
         # Format messages for OpenRouter API
         formatted_messages = self.format_messages(messages)
         
         data = json.dumps({
             "model": self.model_name,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
             "messages": formatted_messages,
         })
         
@@ -825,16 +820,18 @@ class OpenRouterAPI(BaseLLMClient):
 class LocalLLM(BaseLLMClient):
     """Local LLM client for models like uitars-1.5-7b"""
 
-    def __init__(self, model_name: str, temperature: float = 0, max_tokens: int = 4096):
-        super().__init__(model_name, temperature, max_tokens)
-        if model_name == "gta1-7b":
-            base_url = 'http://localhost:1234/v1'
-        elif model_name == "uitars-1.5-7b":
-            base_url = 'http://localhost:1235/v1'
+    def __init__(self, model_name: str, temperature: float = 0):
+        super().__init__(model_name, temperature)
+        normalized_model_name = model_name.lower()
+        if normalized_model_name == "gta1-7b":
+            base_url = LOCAL_API_URL + ':1234/v1'
+        elif normalized_model_name == "uitars-1.5-7b":
+            base_url = LOCAL_API_URL + ':1235/v1'
+        elif normalized_model_name == "qwen3.5-9b":
+            base_url = LOCAL_API_URL + ':30000/v1'
         else:
             raise Exception("model not support")
-        api_key = os.getenv('UITARS_API_KEY', 'empty')
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = OpenAI(base_url=base_url, api_key=LOCAL_API_KEY)
 
         # For uitars-1.5-7b, use OpenAI-compatible local server
         if "uitars" in model_name.lower():
@@ -852,15 +849,28 @@ class LocalLLM(BaseLLMClient):
             self.model_type = "gta1"
 
             # GTA1 specific settings (same as UITars for qwen2.5 image encoder)
-            self.max_new_tokens = 32
             self.max_pixels = 16384 * 28 * 28
             self.min_pixels = 100 * 28 * 28
             self.image_factor = 28  # patch_size * merge_size = 14 * 2
             self.max_ratio = 200
+        elif "qwen3.5" in model_name.lower():
+            self.model_type = "qwen3.5"
         else:
             raise ValueError(f"Local model {model_name} not supported yet")
 
-    def __call__(self, messages: list) -> str:
+    @staticmethod
+    def _strip_thinking_content(text: str, enable_thinking: bool = True) -> str:
+        """Drop the reasoning block only when thinking mode is enabled."""
+        if not text:
+            return text
+        if not enable_thinking:
+            return text.strip()
+        think_end = text.rfind("</think>")
+        if think_end == -1:
+            return text.strip()
+        return text[think_end + len("</think>"):].strip()
+
+    def __call__(self, messages: list, enable_thinking: bool = False) -> str:
         """
         Call local model with messages
         For uitars and gta1, this returns the raw model response
@@ -873,7 +883,6 @@ class LocalLLM(BaseLLMClient):
                 model=self.model_name,
                 messages=formatted_messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
                 frequency_penalty=1,
             )
 
@@ -892,7 +901,6 @@ class LocalLLM(BaseLLMClient):
                 model=self.model_name,
                 messages=formatted_messages,
                 temperature=self.temperature,
-                max_tokens=self.max_new_tokens,
             )
 
             # Update statistics from response
@@ -902,6 +910,31 @@ class LocalLLM(BaseLLMClient):
             self.usage_stats.image_count += count_images_in_messages(messages)
 
             return response.choices[0].message.content.strip()
+        elif self.model_type == "qwen3.5":
+            formatted_messages = self._format_messages_for_uitars(messages)
+
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=formatted_messages,
+                temperature=self.temperature,
+                top_p=0.95,
+                presence_penalty=1.5,
+                extra_body={
+                    "top_k": 20,
+                    "chat_template_kwargs": {"enable_thinking": enable_thinking},
+                },
+            )
+
+            # Update statistics from response
+            if hasattr(response, 'usage') and response.usage:
+                self.usage_stats.prompt_tokens += getattr(response.usage, 'prompt_tokens', 0)
+                self.usage_stats.completion_tokens += getattr(response.usage, 'completion_tokens', 0)
+            self.usage_stats.image_count += count_images_in_messages(messages)
+
+            return self._strip_thinking_content(
+                response.choices[0].message.content,
+                enable_thinking=enable_thinking,
+            )
         else:
             raise NotImplementedError(f"Model type {self.model_type} not implemented")
 
@@ -1536,7 +1569,6 @@ class LocalLLM(BaseLLMClient):
             # Scale coordinates back to original image space
             scaled_x = int(pred_x * scale_x)
             scaled_y = int(pred_y * scale_y)
-
             py_cmd = (scaled_x, scaled_y)
 
             return py_cmd, ''
@@ -1554,14 +1586,13 @@ class AbstractLLM:
     Automatically handles format adaptation for different API platforms
     """
     
-    def __init__(self, model_name: str, temperature: float = 0.1, max_tokens: int = 4096, logger: logging.Logger = None):
+    def __init__(self, model_name: str, temperature: float = 0.1, logger: logging.Logger = None):
         """
         Initialize LLM instance
         
         Args:
             model_name: Model name
             temperature: Sampling temperature
-            max_tokens: Maximum number of tokens
             logger: Logger instance
         """
         if logger is None:
@@ -1583,11 +1614,11 @@ class AbstractLLM:
         
         # Create client instance - each client has its own message formatter
         client_class = globals()[self.model_config.client_class]
-        self.client = client_class(self.model_config.real_model_name, temperature, max_tokens)
+        self.client = client_class(self.model_config.real_model_name, temperature)
         self.logger = logger
         self.client.logger = logger
     
-    def __call__(self, messages: list, max_retries: int = 1) -> Optional[str]:
+    def __call__(self, messages: list, max_retries: int = 1, enable_thinking: bool = False) -> Optional[str]:
         """
         Call LLM with timeout and retry mechanism
         Messages are automatically formatted for the specific API platform
@@ -1604,7 +1635,7 @@ class AbstractLLM:
                 @with_timeout(self.timeout_seconds)
                 def call_llm():
                     # The client will automatically format messages using its formatter
-                    return self.client(messages)
+                    return self.client(messages, enable_thinking=enable_thinking)
                 
                 response = call_llm()
                 return response
@@ -1702,7 +1733,7 @@ def calculate_image_tokens():
 if __name__ == "__main__":
     # calculate_image_tokens()
 
-    client = AbstractLLM('gpt-5-mini')
+    client = AbstractLLM('qwen3.5-9b')
     messages = [
         {
             "role": "user",
@@ -1711,18 +1742,32 @@ if __name__ == "__main__":
             ]
         }
     ]
+    # image = Image.open("data/screenshot.png")
+    # messages = [
+    #     {
+    #         "role": "user",
+    #         "content": [
+    #             {"type": "input_text", "text": "where is the coordinate of the chrome browser?"},
+    #             {"type": "input_image", "image_url": encode_image(image)},
+    #         ]
+    #     }
+    # ]
     response = client(messages)
     print(response)
+
+    # draw = ImageDraw.Draw(image)
+    # draw.ellipse((0, 35, 40, 106), fill="red")
+    # image.save('tmp/tmp.jpg')
     exit()
 
 
     run = 1
-    x, y = 29.814, 70.22
-    model_name = "gpt-5" #"gta1-7b" #"uitars-1.5-7b"
+    x, y = 137, 548
+    model_name = "gta1-7b" #"gta1-7b" #"uitars-1.5-7b"
     
     # instruction = "Click the funnel (filter) icon in the top menu bar — the middle icon directly under the page title 'servicenow' above the Incidents list."
-    instruction = "click chrome"
-    path = "data/screenshot.png"
+    instruction = "CClick on the 'Discussion' link under the COMMUNITY section"
+    path = "/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_step_refinement_pattern/chrome/a96b564e-dbe9-42c3-9ccf-b4498073438a/operations/step_35_gui_action.png"
     image = Image.open(path)
     screen_width, screen_height = 1280, 720
     image = image.resize((screen_width, screen_height))
@@ -1738,4 +1783,4 @@ if __name__ == "__main__":
     else:
         draw = ImageDraw.Draw(image)
         draw.ellipse((x, y, x+10, y+10), fill="red")
-        image.show()
+        image.save('tmp/tmp.jpg')
