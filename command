@@ -28,7 +28,6 @@ nohup python -m vllm.entrypoints.openai.api_server \
   --max-model-len 65536 \
   --host 0.0.0.0 \
   --port 30000 \
-  \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder > qwen.log 2>&1 &
@@ -154,7 +153,7 @@ python run_hisa2.py \
   --result_dir ./results/hisa2_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_.json \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
   > nohup5.out 2>&1 &
 
 # 杀进程

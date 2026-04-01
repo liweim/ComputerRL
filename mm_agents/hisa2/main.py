@@ -94,21 +94,6 @@ When **task is objectively impossible** after verification:
 ```
 """
 
-COMPACT_HISTORY_PROMPT = """Summarize recent execution history into a compact planner state.
-
-Return JSON:
-{
-  "summary": "1-3 sentences covering progress and blockers",
-  "next_hint": "one concrete next-step hint",
-  "completed": ["short completed item"],
-  "open": ["short remaining need or blocker"]
-}
-
-Rules:
-- Focus on what matters for the next planning step.
-- Prefer concrete UI state, command result, and remaining constraints.
-- Do not repeat full logs."""
-
 FIX_RESPONSE_PROMPT = """Error: Failed to parse your response.
 Error message: {error_message}
 
@@ -856,7 +841,6 @@ class HiSA:
         self.step_token_usage = {}  # Store token usage for current step
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
-        self.last_compact_state = None  # Compact planner-visible state derived from history
         self.prompt_dump_path = ""
         self.prompt_dump_counter = 0
 
@@ -1081,65 +1065,6 @@ class HiSA:
         if compact.get("next_hint"):
             parts.append(f"next_hint={compact['next_hint']}")
         return " | ".join(parts)
-
-    def _get_recent_compact_history(self, limit: int = 5) -> List[str]:
-        compact_lines = []
-        for log in self.action_logs[-limit:]:
-            compact = log.get("compact")
-            if compact:
-                compact_lines.append(self._render_compact_log(log))
-            elif log.get("detail"):
-                detail_text = re.sub(r"\s+", " ", str(log.get("detail", "")).strip())[:220]
-                compact_lines.append(
-                    f"Step {log.get('step', '?')} | tool={log.get('type', '')} | "
-                    f"result={'success' if log.get('execution_success', False) else 'failure'} | "
-                    f"detail={detail_text}"
-                )
-        return compact_lines
-
-    def _refresh_compact_state(self) -> Optional[Dict]:
-        recent_lines = self._get_recent_compact_history(limit=min(5, self.sliding_window_size or 5))
-        if not recent_lines:
-            self.last_compact_state = None
-            return None
-
-        messages = [
-            {"role": "system", "content": COMPACT_HISTORY_PROMPT},
-            {"role": "user", "content": "\n".join(recent_lines)},
-        ]
-        try:
-            self._dump_prompt_entry(
-                stage="compact_history",
-                payload={"messages": messages},
-            )
-            response = self.state_manager_llm(messages, enable_thinking=False)
-            self._dump_prompt_entry(
-                stage="compact_history_response",
-                payload=response,
-            )
-            json_str = response.strip()
-            if "```json" in response:
-                json_start = response.find("```json") + 7
-                json_end = response.find("```", json_start)
-                json_str = response[json_start:json_end].strip()
-            elif "```" in response:
-                json_start = response.find("```") + 3
-                json_end = response.find("```", json_start)
-                json_str = response[json_start:json_end].strip()
-            compact_state = json.loads(repair_json(json_str))
-            if isinstance(compact_state, dict):
-                self.last_compact_state = compact_state
-                return compact_state
-        except Exception as e:
-            self.logger.warning(f"Failed to refresh compact planner state: {e}")
-
-        self.last_compact_state = {
-            "summary": " ".join(recent_lines[-2:])[:400],
-            "next_hint": "",
-            "completed": [],
-            "open": [],
-        }
-        return self.last_compact_state
 
     def _get_usage_snapshot(self) -> Dict:
         """Get current token usage snapshot from all LLMs."""
@@ -1396,7 +1321,6 @@ class HiSA:
         self.last_summary_log_index = 0
         self.conversation_messages = []  # Store full conversation history when wo_step=True
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
-        self.last_compact_state = None
 
         if self.record:
             self.env.controller.start_recording()
@@ -1692,7 +1616,6 @@ class HiSA:
                         self.conversation_messages = []
                         self.last_tool_output = None  # Clear observation as it's now in summary
 
-                compact_state = self._refresh_compact_state() if total_logs > 0 else None
                 planner_system_prompt = self._build_planner_system_prompt()
 
                 # ========== Build Messages ==========
@@ -1726,18 +1649,6 @@ class HiSA:
                                 "role": "user",
                                 "content": f"Summary of previous steps:\n{self.last_full_summary}"
                             })
-                        if compact_state:
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "Compact planner state:\n"
-                                    f"Summary: {compact_state.get('summary', '')}\n"
-                                    f"Completed: {compact_state.get('completed', [])}\n"
-                                    f"Open: {compact_state.get('open', [])}\n"
-                                    f"Next hint: {compact_state.get('next_hint', '')}"
-                                )
-                            })
-
                     messages.extend(conversation_to_append)
 
                     if self.last_tool_output:
@@ -1781,15 +1692,15 @@ class HiSA:
                         condensed_history = [self.last_full_summary]
                         for log in self.action_logs[self.last_summary_log_index:]:
                             if log.get("compact"):
-                                condensed_history.append(self._render_compact_log(log["compact"]))
-                            elif "step_abstract" in log:
-                                condensed_history.append(log["step_abstract"])
+                                condensed_history.append(self._render_compact_log(log))
+                            elif log.get("detail"):
+                                condensed_history.append(self._render_compact_log(log))
                     else:
                         for log in logs_to_use:
                             if log.get("compact"):
-                                condensed_history.append(self._render_compact_log(log["compact"]))
-                            elif "step_abstract" in log:
-                                condensed_history.append(log["step_abstract"])
+                                condensed_history.append(self._render_compact_log(log))
+                            elif log.get("detail"):
+                                condensed_history.append(self._render_compact_log(log))
 
                     messages = [
                         {"role": "system", "content": planner_system_prompt},
@@ -1805,17 +1716,6 @@ class HiSA:
                         messages.append({
                             "role": "user",
                             "content": f"Summary of previous steps:\n{self.last_full_summary}"
-                        })
-                    if compact_state:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "Compact planner state:\n"
-                                f"Summary: {compact_state.get('summary', '')}\n"
-                                f"Completed: {compact_state.get('completed', [])}\n"
-                                f"Open: {compact_state.get('open', [])}\n"
-                                f"Next hint: {compact_state.get('next_hint', '')}"
-                            )
                         })
                     for history_item in condensed_history:
                         messages.append({
