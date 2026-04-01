@@ -6,7 +6,7 @@ import os
 import shutil
 import textwrap
 from typing import Dict, List, Tuple
-from mm_agents.hisa.main import HiSA
+from mm_agents.hisa2.main import HiSA
 import traceback
 from utils import summary, save_args_to_settings, setup_logger, get_unfinished
 from tqdm import tqdm
