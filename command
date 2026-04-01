@@ -6,11 +6,11 @@ git clone https://huggingface.co/Qwen/Qwen3.5-9B.git
 conda activate uitars
 export CUDA_VISIBLE_DEVICES=0
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name computerRL --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > uitars.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 > uitars.log 2>&1 &
 
 # 启动LLM
 conda activate uitars
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 0.0.0.0 --port 1234 --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > gta1.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 0.0.0.0 --port 1234 > gta1.log 2>&1 &
 nohup python -m vllm.entrypoints.openai.api_server \
   --served-model-name qwen3.5-9b \
   --model /data1/lwm/models/Qwen3.5-9B \
@@ -18,7 +18,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
   --max-model-len 65536 \
   --host 0.0.0.0 \
   --port 30000 \
-  --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg > qwen.log 2>&1 &
+  > qwen.log 2>&1 &
 
 # 启动qwen3.5-9b with reasoning and tool choice
 nohup python -m vllm.entrypoints.openai.api_server \
@@ -28,7 +28,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
   --max-model-len 65536 \
   --host 0.0.0.0 \
   --port 30000 \
-  --api-key xZj2JAV7rwdy5bgBia998eJXC5HiTWPiFxoQQ5tDDyg \
+  \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder > qwen.log 2>&1 &
@@ -154,7 +154,7 @@ python run_hisa2.py \
   --result_dir ./results/hisa2_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_one.json \
+  --test_all_meta_path ./evaluation_examples/test_.json \
   > nohup5.out 2>&1 &
 
 # 杀进程

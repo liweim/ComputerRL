@@ -245,7 +245,7 @@ def process_single_task(
             roi_margin=args.roi_margin,
             refine_period=args.refine_period,
             bash_timeout=args.bash_timeout,
-            pattern_dir=args.pattern_dir,
+            pattern_dir=os.path.join(result_dir, "memories"),
             use_qdrant_server=args.use_qdrant_server,
             qdrant_server_url=args.qdrant_server_url,
             wo_step=args.wo_step,
@@ -331,6 +331,11 @@ def run(args, logger=None, tasks=None):
     """
     # Setup logging configuration
     result_name = os.path.basename(args.result_dir)
+
+    if args.rerun and not args.get_score:
+        if os.path.exists(args.result_dir):
+            shutil.rmtree(args.result_dir)
+        os.makedirs(args.result_dir, exist_ok=True)
     
     # Build tasks if not provided
     if tasks is None:

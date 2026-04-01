@@ -8,7 +8,7 @@ import logging
 import traceback
 import re
 import hashlib
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable, Any
 from mm_agents.hisa.llm import AbstractLLM
 from utils import serialize_json, get_change_roi
 from json_repair import repair_json
@@ -21,152 +21,57 @@ import time
 # ==================== PROMPTS ====================
 GLOBAL_PLANNER_PROMPT = """You are an expert in GUIs and bash code executing tasks step-by-step. Always keep the task instruction in mind.
 
-# General Instructions
-1. **CRITICAL: Do ONLY what the task asks - nothing more, nothing less**
-2. **CRITICAL: Use as FEW steps as possible, but include a final verification before termination**
-3. **CRITICAL: NEVER terminate immediately after the last edit/click/command**
-4. **CRITICAL: ALWAYS review the prior messages, summaries, and recent steps before deciding next action:**
-   - Check what actions have been done and their results
-   - Avoid repeating the same action more than 3 times
-   - Count completed steps to judge task completion
-5. You receive: screenshot, prior messages, summaries of previous steps, recent steps, and past patterns
-6. Never modify user requirements (file names, paths, etc.)
-7. Each action gets automatic evaluation, but that only checks the immediate response, not task completion
-8. **You can read text directly from screenshots** - no need for GUI copy/paste operations. When you read text, record it in your `thought` field so it appears in later summaries and recent-step history
-
-# Learning from Past Patterns
-When provided:
-1. **Review lessons carefully** - Pay attention to common pitfalls and successful strategies
-2. **Apply relevant advice** - Use domain-specific tips that match the current task
-3. **Avoid repeated mistakes** - If past attempts failed for specific reasons, use different approaches
-4. **Adapt strategies** - Don't blindly copy past approaches; adapt them to the current task
-
 # Tools
 ## gui_action
-Execute pyautogui code. Mouse-position actions are visually grounded by the executor using your description.
-Input: PyAutoGUI code string
-
-Use cases:
-- For click / double-click / right-click / move / drag / scroll on a specific region, describe the target element clearly in `description`
-- For drag actions, describe the intended drag naturally in `description`; the executor will ground the start and end points automatically
-
-**CRITICAL**: For text input operations, combine click and type in ONE action.
-
-**Note**: Don't use pyperclip. For any mouse-position action, provide a clear `description` so the executor can ground coordinates.
-
-### Action Schema (MUST follow exactly)
-Use these exact pyautogui APIs in `input`:
-- Single click: `pyautogui.click(x, y)`
-- Double click: `pyautogui.doubleClick(x, y)`
-- Right click: `pyautogui.rightClick(x, y)`
-- Hover/move: `pyautogui.moveTo(x, y)`
-- Drag (two coordinate points): `pyautogui.moveTo(x1, y1); pyautogui.dragTo(x2, y2, duration=0.5, button='left')`
-- Type text: `pyautogui.write('text')`
-- Press key: `pyautogui.press('enter')`
-- Hotkey: `pyautogui.hotkey('ctrl', 'c')`
-- Scroll: `pyautogui.moveTo(x, y); pyautogui.scroll(amount)` (`amount < 0` for down, `amount > 0` for up, keep `amount` within `[-10, 10]`)
-
-### Consistency Rules (HARD constraints)
-- If thought/description says "double-click", `input` MUST use `pyautogui.doubleClick(...)`.
-- If thought/description says "right-click", `input` MUST use `pyautogui.rightClick(...)`.
-- If thought/description says "drag", `input` MUST include a drag action, not click.
-- If thought/description says "type and submit", `input` MUST include both typing and Enter submission.
-- Keep thought, description, and input action type strictly consistent. Never describe one action and output another.
+Execute a structured GUI action. The executor converts it into pyautogui code and uses visual grounding when coordinates are omitted.
+Fields: top-level fields on the decision object
 
 ## wait
 Wait for async operations to complete and observe UI changes.
-Input: Number of seconds to wait (5-30 recommended)
-
-**When to use**: After triggering async operations, use wait before verification/termination.
+Field: top-level `seconds` (5-30 recommended)
 
 ## bash_execution
 Execute bash commands and Python scripts.
-Input: Code string (bash or Python)
-
-### Available Commands
-- **Python**: `python3 -c "code"` or `pip install package && python3 -c "import package"`
-- **Ignore "sudo: /etc/sudoers.d is world writable" errors**
+Field: top-level `command`
 
 ## infeasible
 Declare that the task is objectively impossible to complete.
-Input: Explanation of why the task is infeasible
+Field: top-level `message`
 
-**When to use**: After verifying that:
-- Software doesn't support the required feature
-- Required files don't exist and can't be created
-- The environment has fundamental limitations preventing task completion
-
-**IMPORTANT**: Try alternative approaches first - only use this if the task is truly impossible
-
-# Core Strategy & Workflow
-## Incremental Steps
-  - Break into small, self-contained steps (one snippet per step)
-  - Code doesn't persist - write complete, standalone snippets
-  - Standard workflow:
-    1. Install necessary packages if needed
-    2. Locate/find target file
-    3. THOROUGHLY inspect file contents (values, data types, formats)
-    4. Modify the file based on findings
-    5. Verify changes
-
-## File Modification
-  - Modify existing open files IN PLACE (no new files unless required)
-  - Use appropriate libraries (python-docx, openpyxl, pandas)
-  - COMPLETE OVERWRITES, not appends (replace all content/sheets/paragraphs)
-  - Check screenshot for the currently open file
-  - **CRITICAL FOR EXCEL AND LIBREOFFICE CALC**: Prefer bash_execution with Python libraries (openpyxl, pandas, xlrd, xlwt) for Excel and LibreOffice Calc operations, but use gui_action if necessary
-
-## Preserve Structure
-  - Never modify headers, titles, sheet names, or structural elements unless requested
-  - Maintain fonts, colors, borders, formatting, styles, and table positioning
-  - Only change content/data, not visual presentation
-
-# Action Evaluation
-After **EVERY** action, you automatically receive an evaluation comparing before/after screenshots:
-  - Evaluation reports immediate UI response to your action
-  - Use to detect errors (wrong element clicked, unexpected dialogs)
-
-## How to Use Evaluation
-  - **CRITICAL**: Evaluation result does not mean Task completion
-  - Use evaluation to detect obvious errors, not to judge task completion
-  - Only retry if evaluation shows clear errors (error messages, wrong dialogs)
-  - **DO NOT** retry just because evaluation says "Failed" - may be slow async operations
-
-## When to termination
-  - Track which steps the task requires and which are done
-  - The final step is usually **verify**, not **terminate**
-  - Before termination, verify the exact task outcome with concrete evidence from the screenshot or a read-only command
-  - **CRITICAL**: Before termination, check every requested constraint one-by-one in your thought: exact target, exact name/location/page, and whether the task requires full coverage
-  - **CRITICAL**: Do not substitute a nearby/related result for the exact target
-  - **CRITICAL**: "Looks close", "relevant page is open", or "partially done" are not sufficient for termination
-  - Do not verify the action itself. Do not terminate based only on a click succeeding, a popup/toast appearing, or a file name appearing
-  - If verification fails, do not terminate. Change approach, or use `wait` if the result may still be processing
-  - If verification is inconclusive, continue working instead of terminating
-
-## Error Recovery Strategy
-When operations fail:
-1. **Analyze error** - Understand root cause
-2. **Retry different approach** - Or fix underlying issue
-3. **Use `hint` field** - If the visual grounder failed, provide specific instructions to avoid repeating
+# Hard Constraints
+1. Do only what the task asks.
+2. Use as few steps as possible, but include a final verification before termination.
+3. Never terminate immediately after the last edit, click, or command.
+4. Always review the task, summaries, recent steps, and retrieved memories before deciding.
+5. Never modify user requirements such as exact names, files, paths, targets, or values.
+6. Immediate action feedback does not prove task completion.
+7. Read visible text directly from screenshots when useful, and record key evidence in `thought`.
+8. Prefer the shortest reliable path and avoid repeating the same failed action or target.
 
 # Response Format
 ## Standard Response
 ```json
 {
     "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
-    "tool": "gui_action|bash_execution|wait|termination|infeasible",
-    "input": "String - tool-specific content (see examples below)",
-    "description": "Optional for non-mouse actions; required for mouse-position gui_action so the executor can ground coordinates"
+    "tool": "one of gui_action|bash_execution|wait|termination|infeasible",
+    "...": "include only the fields for that tool, and do not include unrelated fields"
 }
 ```
 
+Tool-specific rules:
+- `gui_action`: use `action` and related GUI fields only. Do not include `seconds` or `command`.
+- `bash_execution`: use `command` only. Do not include `action` or `seconds`.
+- `wait`: use `seconds` only. Do not include `action` or `command`.
+- `termination` and `infeasible`: use `message` only. Do not include `action`, `command`, or `seconds`.
+
 Examples:
-- gui_action with grounding: `{"tool": "gui_action", "input": "pyautogui.click(0, 0)", "description": "Click the Submit button"}`
-- gui_action without grounding: `{"tool": "gui_action", "input": "pyautogui.write('hello')"}`
-- wait: `{"tool": "wait", "input": "15"}`
-- bash_execution: `{"tool": "bash_execution", "input": "ls -la"}`
-- termination: `{"tool": "termination", "input": "Task completed. [summary]"}`
-- infeasible: `{"tool": "infeasible", "input": "Chrome doesn't support changing search results per page - this is a search engine setting, not a browser feature"}`
+- gui_action with grounding: `{"tool": "gui_action", "action": "click", "description": "Click the Submit button"}`
+- gui_action with explicit coordinates: `{"tool": "gui_action", "action": "click", "x": 120, "y": 340}`
+- gui_action typing: `{"tool": "gui_action", "action": "type", "text": "hello"}`
+- wait: `{"tool": "wait", "seconds": 15}`
+- bash_execution: `{"tool": "bash_execution", "command": "ls -la"}`
+- termination: `{"tool": "termination", "message": "Task completed. [summary]"}`
+- infeasible: `{"tool": "infeasible", "message": "Chrome doesn't support changing search results per page - this is a search engine setting, not a browser feature"}`
 
 ## Termination (Task Complete)
 When **all required actions are done and the final state is verified**:
@@ -174,7 +79,7 @@ When **all required actions are done and the final state is verified**:
 {
     "thought": "All task requirements completed successfully. I checked each requested constraint one-by-one and verified the exact final state with concrete evidence.",
     "tool": "termination",
-    "input": "Task completed. [brief summary of what was done and what was verified]"
+    "message": "Task completed. [brief summary of what was done and what was verified]"
 }
 ```
 
@@ -184,52 +89,10 @@ When **task is objectively impossible** after verification:
 {
     "thought": "Verified that [feature/file/capability] doesn't exist and cannot be created.",
     "tool": "infeasible",
-    "input": "Detailed explanation of why the task cannot be completed."
+    "message": "Detailed explanation of why the task cannot be completed."
 }
 ```
 """
-
-PLANNER_CORE_PROMPT = """You are an expert GUI agent that can also use bash when it is more reliable than the GUI.
-
-Rules:
-1. Do only what the task asks.
-2. Use as few steps as possible, but include a final verification before termination.
-3. Review the task, summary, recent compact history, and retrieved patterns before deciding.
-4. Avoid repeating the same failed action or target.
-5. Read visible text directly from the screenshot when useful and record key evidence in `thought`.
-6. Immediate action feedback does not prove task completion."""
-
-GUI_SKILL_PROMPT = """GUI skill:
-- Use `gui_action` for clicks, double-clicks, right-clicks, drag, move, scroll, typing, hotkeys.
-- For mouse-position actions, `description` must clearly identify the target because the executor grounds coordinates from it.
-- Keep `thought`, `description`, and `input` consistent.
-- Exact APIs:
-  - `pyautogui.click(x, y)`
-  - `pyautogui.doubleClick(x, y)`
-  - `pyautogui.rightClick(x, y)`
-  - `pyautogui.moveTo(x, y)`
-  - `pyautogui.moveTo(x1, y1); pyautogui.dragTo(x2, y2, duration=0.5, button='left')`
-  - `pyautogui.write('text')`
-  - `pyautogui.press('enter')`
-  - `pyautogui.hotkey('ctrl', 'c')`
-  - `pyautogui.moveTo(x, y); pyautogui.scroll(amount)` with amount in `[-10, 10]`."""
-
-BASH_SKILL_PROMPT = """Bash skill:
-- Use `bash_execution` when inspection or file modification is more reliable in code than in GUI.
-- Prefer complete, standalone commands.
-- For spreadsheet or document edits, prefer Python libraries when reliable."""
-
-VERIFICATION_SKILL_PROMPT = """Verification skill:
-- The last step is usually verification, not termination.
-- Before terminating, verify each requested constraint one by one using the screenshot or a read-only command.
-- Do not terminate based only on a click succeeding, a popup appearing, or a filename being visible.
-- If verification is inconclusive, continue working or wait."""
-
-RECOVERY_SKILL_PROMPT = """Recovery skill:
-- If an action clearly failed, switch strategy: different target, different tool, or different command.
-- Do not repeat the same failed action sequence.
-- After async operations, use `wait` before judging the result.
-- Use `infeasible` only when the task is objectively impossible after verification."""
 
 COMPACT_HISTORY_PROMPT = """Summarize recent execution history into a compact planner state.
 
@@ -256,10 +119,14 @@ Please provide a valid JSON response in the exact format:
 ```json
 {{
     "thought": "Brief reasoning (check prerequisites, count operations)",
-    "tool": "gui_action|bash_execution|wait|termination|infeasible",
-    "input": "tool input here"
+    "tool": "one of gui_action|bash_execution|wait|termination|infeasible"
 }}
-```"""
+```
+
+Important:
+- Include only the fields for the chosen tool.
+- Do not mix fields from different tools.
+- Example: `gui_action` must not include `seconds`; `wait` must not include `action` or `command`."""
 
 STEP_ABSTRACTION_PROMPT = """Compare before/after screenshots and describe the UI response in 1-2 sentences:
 
@@ -369,11 +236,11 @@ MEMORY_SELECTION_PROMPT = """You are selecting local memory files that will clea
 You will receive:
 - the current task
 - the current task signature and tags
-- a list of candidate memory entries with filename, type, and short description
+- a list of candidate memory entries with zero-based list indices, type, and short description
 
 Return a JSON object:
 {
-  "selected": ["filename1.md", "filename2.md"]
+  "selected": [0, 2]
 }
 
 Rules:
@@ -391,6 +258,7 @@ class PatternManager:
     def __init__(
         self,
         llm: Optional[AbstractLLM] = None,
+        prompt_dump_callback: Optional[Callable[..., None]] = None,
         qdrant_path: str = "./qdrant_storage",
         embedding_service_url: str = "http://localhost:8888",
         similarity_threshold: float = 0.7,
@@ -398,6 +266,7 @@ class PatternManager:
         qdrant_server_url: str = "http://localhost:6333"
     ):
         self.llm = llm
+        self.prompt_dump_callback = prompt_dump_callback
         self.logger = logging.getLogger("desktopenv.pattern")
         base_memory_root = qdrant_path or os.path.join(os.path.dirname(__file__), "memories")
         self.memory_root = os.path.abspath(base_memory_root)
@@ -405,6 +274,13 @@ class PatternManager:
         self.logger.info(
             f"File memory initialized. memory_root={self.memory_root}"
         )
+
+    def _dump_prompt(self, stage: str, payload: Any, **metadata) -> None:
+        if self.prompt_dump_callback:
+            try:
+                self.prompt_dump_callback(stage=stage, payload=payload, **metadata)
+            except Exception as e:
+                self.logger.warning(f"Failed to dump prompt for stage {stage}: {e}")
 
     def _normalize_domain(self, domain: str) -> str:
         domain = (domain or "general").strip().lower()
@@ -665,11 +541,27 @@ class PatternManager:
         if not self.llm:
             return []
 
-        # Use step_abstract directly (already contains step, action, result)
         step_abstracts = []
         for log in action_logs:
-            if "step_abstract" in log:
-                step_abstracts.append(log["step_abstract"])
+            compact = log.get("compact") or {}
+            step = log.get("step", "?")
+            tool_type = log.get("type", "")
+            result = "success" if log.get("execution_success", False) else "failure"
+            detail = (log.get("detail") or "").strip()
+            intent = (compact.get("intent") or "").strip()
+            verified = (compact.get("verified") or "").strip()
+            next_hint = (compact.get("next_hint") or "").strip()
+
+            parts = [f"Step {step}: tool={tool_type}; result={result}"]
+            if detail:
+                parts.append(f"detail={detail}")
+            if intent:
+                parts.append(f"intent={intent}")
+            if verified:
+                parts.append(f"verified={verified}")
+            if next_hint:
+                parts.append(f"next_hint={next_hint}")
+            step_abstracts.append(" | ".join(parts))
 
         prompt = PATTERN_INDUCTION_PROMPT.format(
             task_instruction=task_instruction,
@@ -681,8 +573,16 @@ class PatternManager:
                 {"role": "system", "content": "You are an expert at analyzing task execution patterns and extracting the most critical, reusable lessons. Be highly selective - only extract truly valuable insights. CRITICAL: focus only on the execution process."},
                 {"role": "user", "content": prompt}
             ]
+            self._dump_prompt(
+                stage="pattern_induction",
+                payload={"messages": messages},
+            )
 
             response = self.llm(messages, enable_thinking=True)
+            self._dump_prompt(
+                stage="pattern_induction_response",
+                payload=response,
+            )
 
             # Try to parse as JSON
             if "```json" in response:
@@ -711,12 +611,8 @@ class PatternManager:
                     else:
                         self.logger.warning(f"Invalid lesson format: {item}, skipping")
                 if validated_lessons:
-                    formatted_lessons = "\n".join(
-                        f"  {i+1}. [{lesson['type']}] {lesson['lesson']}"
-                        for i, lesson in enumerate(validated_lessons)
-                    )
                     self.logger.info(
-                        f"Pattern induction extracted {len(validated_lessons)} lesson(s):\n{formatted_lessons}"
+                        f"Pattern induction extracted {len(validated_lessons)} lesson(s)"
                     )
                 else:
                     self.logger.info("Pattern induction extracted no valid lessons")
@@ -751,8 +647,12 @@ class PatternManager:
             selected_entries = []
             if learned_entries and self.llm:
                 manifest_lines = [
-                    f"- {entry['filename']} [{entry.get('type', 'domain')}, confidence={entry.get('confidence', '')}, signature={entry.get('task_signature', '')}, tags={','.join(entry.get('task_tags', []))}, source_task_id={entry.get('source_task_id', '')}]: {entry.get('description', '')}"
-                    for entry in learned_entries
+                    (
+                        f"- {idx} [{entry.get('type', 'domain')}, confidence={entry.get('confidence', '')}, "
+                        f"signature={entry.get('task_signature', '')}, tags={','.join(entry.get('task_tags', []))}]: "
+                        f"{entry.get('description', '')}"
+                    )
+                    for idx, entry in enumerate(learned_entries)
                 ]
                 messages = [
                     {"role": "system", "content": MEMORY_SELECTION_PROMPT},
@@ -767,7 +667,15 @@ class PatternManager:
                     }
                 ]
                 try:
+                    self._dump_prompt(
+                        stage="memory_selection",
+                        payload={"messages": messages},
+                    )
                     response = self.llm(messages, enable_thinking=False)
+                    self._dump_prompt(
+                        stage="memory_selection_response",
+                        payload=response,
+                    )
                     json_str = response.strip()
                     if "```json" in response:
                         json_start = response.find("```json") + 7
@@ -778,10 +686,16 @@ class PatternManager:
                         json_end = response.find("```", json_start)
                         json_str = response[json_start:json_end].strip()
                     parsed = json.loads(repair_json(json_str))
-                    selected_names = set(parsed.get("selected", [])) if isinstance(parsed, dict) else set()
-                    selected_entries = [
-                        entry for entry in learned_entries if entry["filename"] in selected_names
-                    ][:5]
+                    selected_indices = parsed.get("selected", []) if isinstance(parsed, dict) else []
+                    normalized_indices = []
+                    for item in selected_indices:
+                        try:
+                            idx = int(item)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= idx < len(learned_entries) and idx not in normalized_indices:
+                            normalized_indices.append(idx)
+                    selected_entries = [learned_entries[idx] for idx in normalized_indices[:5]]
                 except Exception as e:
                     self.logger.warning(f"Local memory selection failed, falling back to recency: {e}")
                     selected_entries = learned_entries[:5]
@@ -832,7 +746,15 @@ class PatternManager:
                     {"role": "system", "content": "You are an expert at analyzing past lessons and providing actionable advice for new tasks."},
                     {"role": "user", "content": prompt}
                 ]
+                self._dump_prompt(
+                    stage="pattern_synthesis",
+                    payload={"messages": messages},
+                )
                 response = self.llm(messages, enable_thinking=False)
+                self._dump_prompt(
+                    stage="pattern_synthesis_response",
+                    payload=response,
+                )
                 self.logger.info(
                     f"Retrieved file memories for domain {normalized_domain}: "
                     f"require={len(require_patterns)}, learned_selected={len(selected_entries)}"
@@ -916,6 +838,7 @@ class HiSA:
         if not self.wo_pattern:
             self.pattern_manager = PatternManager(
                 llm=self.global_planner_llm,
+                prompt_dump_callback=self._dump_prompt_entry,
                 qdrant_path=pattern_dir,
                 similarity_threshold=0.7,
                 use_qdrant_server=use_qdrant_server,
@@ -934,6 +857,65 @@ class HiSA:
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
         self.last_compact_state = None  # Compact planner-visible state derived from history
+        self.prompt_dump_path = ""
+        self.prompt_dump_counter = 0
+
+    def _sanitize_prompt_payload(self, value: Any):
+        if isinstance(value, dict):
+            sanitized = {}
+            for key, item in value.items():
+                if key == "image_url" and isinstance(item, str) and item.startswith("data:image/"):
+                    sanitized[key] = f"<omitted data image url, chars={len(item)}>"
+                else:
+                    sanitized[key] = self._sanitize_prompt_payload(item)
+            return sanitized
+        if isinstance(value, list):
+            return [self._sanitize_prompt_payload(item) for item in value]
+        if isinstance(value, bytes):
+            return f"<omitted bytes, len={len(value)}>"
+        return value
+
+    def _init_prompt_dump_file(self) -> None:
+        self.prompt_dump_counter = 0
+        base_dir = self.save_dir or "."
+        self.prompt_dump_path = os.path.join(base_dir, "model_trace.txt")
+        os.makedirs(base_dir, exist_ok=True)
+        header = [
+            "# Model Log",
+            f"task_id: {getattr(self, 'current_task_id', '')}",
+            f"domain: {getattr(self, 'current_domain', '')}",
+            f"signature: {getattr(self, 'current_task_signature', '')}",
+            f"created_at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+        ]
+        with open(self.prompt_dump_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(header))
+
+    def _dump_prompt_entry(self, stage: str, payload: Any, step: Optional[int] = None, attempt: Optional[int] = None, **metadata) -> None:
+        if not self.prompt_dump_path:
+            return
+        self.prompt_dump_counter += 1
+        block_meta = {
+            "index": self.prompt_dump_counter,
+            "stage": stage,
+            "step": step if step is not None else self.operation_count + 1,
+            "attempt": attempt,
+        }
+        for key, value in metadata.items():
+            if value is not None:
+                block_meta[key] = value
+
+        sanitized_payload = self._sanitize_prompt_payload(payload)
+        with open(self.prompt_dump_path, "a", encoding="utf-8") as f:
+            f.write(f"\n## Prompt {self.prompt_dump_counter:04d}\n")
+            for key, value in block_meta.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\n")
+            if isinstance(sanitized_payload, str):
+                f.write(sanitized_payload.rstrip() + "\n")
+            else:
+                f.write(json.dumps(serialize_json(sanitized_payload), indent=2, ensure_ascii=False))
+                f.write("\n")
 
     def _load_skill_text(self, name: str) -> str:
         path = os.path.join(self.skills_dir, name)
@@ -963,16 +945,6 @@ class HiSA:
         current_domain = (getattr(self, "current_domain", "") or "").lower()
         if skill_domain and skill_domain not in ["all", current_domain]:
             return ""
-
-        when_to_use = metadata.get("when_to_use", "")
-        priority = metadata.get("priority", "")
-        prefix = []
-        if priority:
-            prefix.append(f"Priority: {priority}")
-        if when_to_use:
-            prefix.append(f"When to use: {when_to_use}")
-        if prefix:
-            return "\n".join(prefix) + "\n\n" + body.strip()
         return body.strip()
 
     def _get_domain_skill_name(self) -> str:
@@ -981,12 +953,31 @@ class HiSA:
         domain = re.sub(r"_+", "_", domain).strip("_")
         return f"{domain}.md" if domain else ""
 
+    def _task_prefers_gui_skill(self) -> bool:
+        task_text = getattr(self, "task_instruction", "").lower()
+        domain = (getattr(self, "current_domain", "") or "").lower()
+
+        strong_gui_hints = [
+            "browser", "chrome", "tab", "menu", "button", "dropdown", "dialog",
+            "window", "settings", "preferences", "address bar", "toolbar",
+            "click", "double-click", "right-click", "drag", "scroll", "hover",
+            "open the app", "navigate to", "select from the menu", "toggle",
+            "pivot table", "pivot chart",
+        ]
+        gui_domains = {
+            "chrome", "thunderbird", "vlc", "gimp",
+        }
+        return any(token in task_text for token in strong_gui_hints) or domain in gui_domains
+
     def _task_requires_bash_skill(self) -> bool:
         task_text = getattr(self, "task_instruction", "").lower()
+        if "pivot table" in task_text or "pivot chart" in task_text:
+            return False
         bash_hints = [
             "file", "code", "python", "bash", "terminal", "script",
             "excel", "calc", "spreadsheet", "csv", "json", "yaml",
-            "docx", "modify", "edit"
+            "docx", "xlsx", "tsv", "modify", "edit", "replace", "update",
+            "writer", "document", "paragraph", "cell", "column", "row",
         ]
         return any(token in task_text for token in bash_hints)
 
@@ -1032,28 +1023,21 @@ class HiSA:
 
     def _build_planner_system_prompt(self) -> str:
         sections = [
-            self._load_skill_text("core.md"),
-            self._load_skill_text("gui.md"),
-            self._load_skill_text("verification.md"),
+            GLOBAL_PLANNER_PROMPT,
         ]
         domain_skill_name = self._get_domain_skill_name()
         if domain_skill_name:
             sections.append(self._load_skill_text(domain_skill_name))
+        if self._task_prefers_gui_skill() or any(
+            log.get("type") == "gui_action" for log in self.action_logs
+        ):
+            sections.append(self._load_skill_text("gui.md"))
         if self._task_requires_bash_skill() or any(
             log.get("type") == "bash_execution" for log in self.action_logs
         ):
             sections.append(self._load_skill_text("bash.md"))
         if self._should_use_recovery_skill():
             sections.append(self._load_skill_text("recovery.md"))
-        sections.append(
-            """Return valid JSON only:
-{
-  "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
-  "tool": "gui_action|bash_execution|wait|termination|infeasible",
-  "input": "tool input here",
-  "description": "required for mouse-position gui_action"
-}"""
-        )
         return "\n\n".join(section.strip() for section in sections if section)
 
     def _build_compact_log_entry(
@@ -1065,9 +1049,9 @@ class HiSA:
         verification: str = "",
         next_hint: str = "",
     ) -> Dict:
-        detail = re.sub(r"\s+", " ", (detail or "").strip())
-        verification = re.sub(r"\s+", " ", (verification or "").strip())
-        next_hint = re.sub(r"\s+", " ", (next_hint or "").strip())
+        detail = re.sub(r"\s+", " ", str(detail or "").strip())
+        verification = re.sub(r"\s+", " ", str(verification or "").strip())
+        next_hint = re.sub(r"\s+", " ", str(next_hint or "").strip())
         if len(detail) > 220:
             detail = detail[:217] + "..."
         if len(verification) > 160:
@@ -1075,23 +1059,23 @@ class HiSA:
         if len(next_hint) > 160:
             next_hint = next_hint[:157] + "..."
         return {
-            "step": step,
             "intent": self.current_thought[:180] if self.current_thought else "",
-            "tool": tool_type,
-            "result": "success" if success else "failure",
-            "detail": detail,
             "verified": verification,
             "next_hint": next_hint,
         }
 
-    def _render_compact_log(self, compact: Dict) -> str:
+    def _render_compact_log(self, log: Dict) -> str:
+        compact = log.get("compact") or {}
         parts = [
-            f"Step {compact.get('step', '?')}",
-            f"tool={compact.get('tool', '')}",
-            f"result={compact.get('result', '')}",
+            f"Step {log.get('step', '?')}",
+            f"tool={log.get('type', '')}",
+            f"result={'success' if log.get('execution_success', False) else 'failure'}",
         ]
-        if compact.get("detail"):
-            parts.append(f"detail={compact['detail']}")
+        detail = log.get("detail") or compact.get("detail") or ""
+        if detail:
+            parts.append(f"detail={detail}")
+        if compact.get("intent"):
+            parts.append(f"intent={compact['intent']}")
         if compact.get("verified"):
             parts.append(f"verified={compact['verified']}")
         if compact.get("next_hint"):
@@ -1103,9 +1087,14 @@ class HiSA:
         for log in self.action_logs[-limit:]:
             compact = log.get("compact")
             if compact:
-                compact_lines.append(self._render_compact_log(compact))
-            elif log.get("step_abstract"):
-                compact_lines.append(re.sub(r"\s+", " ", log["step_abstract"]).strip()[:260])
+                compact_lines.append(self._render_compact_log(log))
+            elif log.get("detail"):
+                detail_text = re.sub(r"\s+", " ", str(log.get("detail", "")).strip())[:220]
+                compact_lines.append(
+                    f"Step {log.get('step', '?')} | tool={log.get('type', '')} | "
+                    f"result={'success' if log.get('execution_success', False) else 'failure'} | "
+                    f"detail={detail_text}"
+                )
         return compact_lines
 
     def _refresh_compact_state(self) -> Optional[Dict]:
@@ -1119,7 +1108,15 @@ class HiSA:
             {"role": "user", "content": "\n".join(recent_lines)},
         ]
         try:
+            self._dump_prompt_entry(
+                stage="compact_history",
+                payload={"messages": messages},
+            )
             response = self.state_manager_llm(messages, enable_thinking=False)
+            self._dump_prompt_entry(
+                stage="compact_history_response",
+                payload=response,
+            )
             json_str = response.strip()
             if "```json" in response:
                 json_start = response.find("```json") + 7
@@ -1199,9 +1196,21 @@ class HiSA:
         tool_input = decision.get("input", "")
 
         if tool == "bash_execution":
-            return self._hash_text(self._normalize_bash_command(tool_input))
+            command = decision.get("command", tool_input)
+            return self._hash_text(self._normalize_bash_command(command))
         if tool == "gui_action":
-            return self._hash_text(tool_input)
+            gui_input = {}
+            if isinstance(tool_input, dict):
+                gui_input.update(tool_input)
+            for key in [
+                "action", "x", "y", "x1", "y1", "x2", "y2",
+                "start_x", "start_y", "end_x", "end_y",
+                "text", "value", "key", "keys", "amount",
+                "command", "action_type",
+            ]:
+                if key in decision:
+                    gui_input[key] = decision[key]
+            return self._hash_text(gui_input)
         return ""
 
     def _normalize_gui_description(self, description: str) -> str:
@@ -1347,9 +1356,19 @@ class HiSA:
                     )
                 },
             ]
+            self._dump_prompt_entry(
+                stage="context_refinement",
+                payload={"messages": messages},
+                step=end_step,
+            )
             summary_with_context_refinement = self.state_manager_llm(
                 messages,
                 enable_thinking=False,
+            )
+            self._dump_prompt_entry(
+                stage="context_refinement_response",
+                payload=summary_with_context_refinement,
+                step=end_step,
             )
             return summary_with_context_refinement.strip()
         except Exception as e:
@@ -1408,6 +1427,7 @@ class HiSA:
         )
         self.current_task_tags = self._extract_task_tags(task_instruction, self.current_domain)
         self.current_task_signature = self._build_task_signature(task_instruction, self.current_domain)
+        self._init_prompt_dump_file()
 
         # Load relevant pattern
         domain = self.current_domain
@@ -1475,12 +1495,12 @@ class HiSA:
                         "type": "termination",
                         "execution_success": True,
                         "screenshot": screenshot_file,
-                        "step_abstract": step_abstract,
+                        "detail": decision.get("message", decision.get("input", "Task completed.")),
                         "compact": self._build_compact_log_entry(
                             step=step,
                             tool_type="termination",
                             success=True,
-                            detail=decision.get("input", "Task completed."),
+                            detail=decision.get("message", decision.get("input", "Task completed.")),
                             verification="Task marked complete after explicit verification."
                         ),
                         "step_time": 0.0,
@@ -1829,9 +1849,19 @@ class HiSA:
                     self.logger.warning(f"Retry attempt {attempt}/{self.max_parse_retries}")
 
                 # Call global planner
+                self._dump_prompt_entry(
+                    stage="global_planner",
+                    payload={"messages": messages},
+                    attempt=attempt + 1,
+                )
                 response = self.global_planner_llm(
                     messages,
                     enable_thinking=True,
+                )
+                self._dump_prompt_entry(
+                    stage="global_planner_response",
+                    payload=response,
+                    attempt=attempt + 1,
                 )
                 
                 # Extract JSON
@@ -1853,6 +1883,17 @@ class HiSA:
                     raise ValueError("Missing 'tool' field in decision")
                 if decision["tool"] not in ["gui_action", "bash_execution", "wait", "termination", "infeasible"]:
                     raise ValueError(f"Invalid tool: {decision['tool']}")
+                if decision["tool"] == "gui_action":
+                    gui_input = decision.get("input") if isinstance(decision.get("input"), dict) else {}
+                    action_name = decision.get("action", gui_input.get("action"))
+                    allowed_actions = {
+                        "click", "left_click", "double_click", "doubleclick",
+                        "right_click", "rightclick", "move", "hover",
+                        "drag", "drag_to", "left_click_drag",
+                        "type", "write", "press", "hotkey", "scroll",
+                    }
+                    if not isinstance(action_name, str) or action_name.strip().lower() not in allowed_actions:
+                        raise ValueError(f"Invalid gui_action action: {action_name}")
 
                 try:
                     self.logger.info(f"[decision]: {json.dumps(decision, indent=4)}")
@@ -1896,6 +1937,11 @@ class HiSA:
                         error_message=str(e),
                         response=response
                     )
+                    self._dump_prompt_entry(
+                        stage="fix_response",
+                        payload=error_feedback,
+                        attempt=attempt + 1,
+                    )
 
                     # Store error feedback for next iteration
                     self.last_error_feedback = error_feedback
@@ -1914,21 +1960,32 @@ class HiSA:
     def _execute_tool(self, decision: Dict) -> str:
         """Execute tool based on decision and return execution result text."""
         tool = decision.get("tool", "")
-        tool_input = decision.get("input", "")
         description = decision.get("description", "")
 
         # Store thought for step_abstract
         self.current_thought = decision.get("thought", "")
 
         if tool == "gui_action":
-            # Input is pyautogui code string, description is optional for placeholder
-            return self._gui_action(tool_input, description)
+            gui_input = {}
+            if isinstance(decision.get("input"), dict):
+                gui_input.update(decision["input"])
+            for key in [
+                "action", "x", "y", "x1", "y1", "x2", "y2",
+                "start_x", "start_y", "end_x", "end_y",
+                "text", "value", "key", "keys", "amount",
+                "command", "action_type",
+            ]:
+                if key in decision:
+                    gui_input[key] = decision[key]
+            return self._gui_action(gui_input, description)
 
         elif tool == "bash_execution":
-            return self._bash_execution(tool_input)
+            command = decision.get("command", decision.get("input", ""))
+            return self._bash_execution(command)
 
         elif tool == "wait":
-            return self._wait(tool_input)
+            seconds = decision.get("seconds", decision.get("input", ""))
+            return self._wait(seconds)
 
         return ""
 
@@ -1961,6 +2018,103 @@ class HiSA:
         # Downstream executors expect plain positional coordinates, so strip only
         # the redundant x=/y= markers and preserve all other kwargs.
         return re.sub(r"(?<=\(|,)\s*([xy])\s*=\s*", "", code)
+
+    def _normalize_gui_action_input(self, code):
+        """Normalize gui_action input to the dict format expected by desktop_env.step."""
+        if isinstance(code, dict):
+            normalized = dict(code)
+            command = normalized.get("command")
+            action = normalized.get("action")
+            x = normalized.get("x")
+            y = normalized.get("y")
+            x1 = normalized.get("x1", normalized.get("start_x"))
+            y1 = normalized.get("y1", normalized.get("start_y"))
+            x2 = normalized.get("x2", normalized.get("end_x"))
+            y2 = normalized.get("y2", normalized.get("end_y"))
+            text = normalized.get("text", normalized.get("value"))
+            key = normalized.get("key")
+            keys = normalized.get("keys")
+            amount = normalized.get("amount")
+
+            # Support structured planner outputs like:
+            # {"action": "click", "description": "..."}
+            # {"action": "click", "x": 123, "y": 456}
+            if (not isinstance(command, str) or not command.strip()) and isinstance(action, str):
+                normalized_action = action.strip().lower()
+
+                def have_point(px, py):
+                    return isinstance(px, (int, float)) and isinstance(py, (int, float))
+
+                if normalized_action in ["click", "left_click"]:
+                    command = (
+                        f"pyautogui.click({int(x)}, {int(y)})"
+                        if have_point(x, y)
+                        else "pyautogui.click(X_COORD, Y_COORD)"
+                    )
+                elif normalized_action in ["double_click", "doubleclick"]:
+                    command = (
+                        f"pyautogui.doubleClick({int(x)}, {int(y)})"
+                        if have_point(x, y)
+                        else "pyautogui.doubleClick(X_COORD, Y_COORD)"
+                    )
+                elif normalized_action in ["right_click", "rightclick"]:
+                    command = (
+                        f"pyautogui.rightClick({int(x)}, {int(y)})"
+                        if have_point(x, y)
+                        else "pyautogui.rightClick(X_COORD, Y_COORD)"
+                    )
+                elif normalized_action in ["move", "hover"]:
+                    command = (
+                        f"pyautogui.moveTo({int(x)}, {int(y)})"
+                        if have_point(x, y)
+                        else "pyautogui.moveTo(X_COORD, Y_COORD)"
+                    )
+                elif normalized_action in ["drag", "drag_to", "left_click_drag"]:
+                    if have_point(x1, y1) and have_point(x2, y2):
+                        command = (
+                            f"pyautogui.moveTo({int(x1)}, {int(y1)}); "
+                            f"pyautogui.dragTo({int(x2)}, {int(y2)}, duration=0.5, button='left')"
+                        )
+                    else:
+                        command = (
+                            "pyautogui.moveTo(START_X_COORD, START_Y_COORD); "
+                            "pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')"
+                        )
+                elif normalized_action in ["type", "write"] and isinstance(text, str):
+                    command = f"pyautogui.write({text!r})"
+                elif normalized_action == "press" and isinstance(key, str):
+                    command = f"pyautogui.press({key!r})"
+                elif normalized_action == "hotkey":
+                    hotkey_keys = keys if isinstance(keys, list) else normalized.get("keys")
+                    if isinstance(hotkey_keys, list) and hotkey_keys:
+                        rendered = ", ".join(repr(str(k)) for k in hotkey_keys)
+                        command = f"pyautogui.hotkey({rendered})"
+                elif normalized_action == "scroll":
+                    if isinstance(amount, (int, float)):
+                        scroll_amount = int(amount)
+                    else:
+                        scroll_amount = -5
+                    if have_point(x, y):
+                        command = f"pyautogui.moveTo({int(x)}, {int(y)}); pyautogui.scroll({scroll_amount})"
+                    else:
+                        command = "pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll(" + str(scroll_amount) + ")"
+
+                if isinstance(command, str) and command.strip():
+                    normalized["command"] = command
+                    self.logger.info(f"[gui_action.normalize] action={normalized_action} -> command={command}")
+
+            if isinstance(command, str) and command.strip():
+                normalized["command"] = self._normalize_pyautogui_code(command)
+            normalized["action_type"] = normalized.get("action_type", "pyautogui")
+            return normalized
+
+        normalized_code = self._normalize_pyautogui_code(code)
+        if isinstance(normalized_code, str) and normalized_code.strip():
+            return {
+                "action_type": "pyautogui",
+                "command": normalized_code,
+            }
+        return normalized_code
 
     def _parse_pyautogui_code(self, code: str) -> List[Dict]:
         code = self._normalize_pyautogui_code(code)
@@ -2050,7 +2204,6 @@ class HiSA:
             return code
 
         grounded_code = code
-        statements = self._parse_pyautogui_code(grounded_code)
         has_placeholders = any(
             token in grounded_code
             for token in [
@@ -2062,6 +2215,7 @@ class HiSA:
             if not description:
                 raise ValueError("Description required when using placeholders")
             return self._call_visual_grounder(description, screenshot, grounded_code)
+        statements = self._parse_pyautogui_code(grounded_code)
 
         if "pyautogui.dragTo(" in grounded_code:
             if not description:
@@ -2132,6 +2286,18 @@ class HiSA:
 
         def call_grounder(target_desc: str):
             scale = self.visual_grounder_scale if self.visual_grounder_llm.model_name.startswith("gta1") else 1.0
+            self._dump_prompt_entry(
+                stage="visual_grounder",
+                payload={
+                    "target_description": target_desc,
+                    "code_template": code,
+                    "environment": "linux",
+                    "screen_width": self.screen_width,
+                    "screen_height": self.screen_height,
+                    "scale": scale,
+                    "screenshot": "<omitted image bytes>",
+                },
+            )
             py_cmd, reasoning = self.visual_grounder_llm.call_cua(
                 target_desc,
                 img,
@@ -2139,6 +2305,13 @@ class HiSA:
                 screen_width=self.screen_width,
                 screen_height=self.screen_height,
                 scale=scale
+            )
+            self._dump_prompt_entry(
+                stage="visual_grounder_response",
+                payload={
+                    "py_cmd": py_cmd,
+                    "reasoning": reasoning,
+                },
             )
             if not py_cmd:
                 raise ValueError(f"Visual Grounder failed to provide result. Reasoning: {reasoning}")
@@ -2155,7 +2328,7 @@ class HiSA:
 
     def _gui_action(self, code: str, description: str = "") -> str:
         """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
-        code = self._normalize_pyautogui_code(code)
+        code = self._normalize_gui_action_input(code)
         requested_action_fingerprint = self._hash_text(code)
         if description:
             self.logger.info(f"[gui_action] {description}")
@@ -2171,10 +2344,22 @@ class HiSA:
             # Get before screenshot
             before_screenshot = self.env.controller.get_screenshot()
             screenshot_file = f"step_{step}.png"
-            code = self._ground_gui_code(code, description, before_screenshot)
+            grounded_code = self._ground_gui_code(
+                code.get("command", "") if isinstance(code, dict) else code,
+                description,
+                before_screenshot,
+            )
+            if isinstance(code, dict):
+                code["command"] = grounded_code
+            else:
+                code = grounded_code
 
             # Execute code
-            final_code = postprocess_action(code)
+            if isinstance(code, dict):
+                final_code = dict(code)
+                final_code["command"] = postprocess_action(final_code.get("command", ""))
+            else:
+                final_code = postprocess_action(code)
             obs, *_ = self.env.step(final_code, self.sleep_after_execution)
 
             # Wait 10 seconds for action to take effect
@@ -2230,7 +2415,7 @@ class HiSA:
                 "description": description,
                 "execution_success": True,
                 "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
+                "detail": description or str(final_code),
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="gui_action",
@@ -2283,7 +2468,7 @@ class HiSA:
                 "description": description,
                 "execution_success": False,
                 "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
+                "detail": description or str(code),
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="gui_action",
@@ -2380,10 +2565,18 @@ class HiSA:
                     ]
                 }
             ]
+            self._dump_prompt_entry(
+                stage="step_abstraction",
+                payload={"messages": messages},
+            )
 
             step_abstraction = self.state_manager_llm(
                 messages,
                 enable_thinking=False,
+            )
+            self._dump_prompt_entry(
+                stage="step_abstraction_response",
+                payload=step_abstraction,
             )
             return step_abstraction.strip()
 
@@ -2406,9 +2599,17 @@ class HiSA:
                     ),
                 },
             ]
+            self._dump_prompt_entry(
+                stage="bash_output_abstraction",
+                payload={"messages": messages},
+            )
             step_abstraction = self.state_manager_llm(
                 messages,
                 enable_thinking=False,
+            )
+            self._dump_prompt_entry(
+                stage="bash_output_abstraction_response",
+                payload=step_abstraction,
             )
             return step_abstraction.strip()
         except Exception as e:
@@ -2529,7 +2730,7 @@ except subprocess.TimeoutExpired as e:
                 "type": "bash_execution",
                 "execution_success": exitcode == 0 and status == "success",
                 "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
+                "detail": code,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
@@ -2574,7 +2775,7 @@ except subprocess.TimeoutExpired as e:
                 "type": "bash_execution",
                 "execution_success": False,
                 "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
+                "detail": code,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
@@ -2653,7 +2854,7 @@ except subprocess.TimeoutExpired as e:
                 "type": "wait",
                 "execution_success": True,
                 "screenshot": screenshot_file,
-                "step_abstract": step_abstract,
+                "detail": f"waited {wait_seconds} seconds",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",
@@ -2691,7 +2892,7 @@ except subprocess.TimeoutExpired as e:
                 "type": "wait",
                 "execution_success": False,
                 "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
-                "step_abstract": step_abstract,
+                "detail": f"waited {wait_seconds} seconds",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",
@@ -2740,7 +2941,10 @@ except subprocess.TimeoutExpired as e:
                 )
                 # Format lessons as numbered list for logging
                 formatted_lessons = "\n".join(f"  {i+1}. [{lesson['type']}] {lesson['lesson']}" for i, lesson in enumerate(key_lessons))
-                self.logger.info(f"Saved {len(key_lessons)} lesson(s):\n{formatted_lessons}")
+                memory_dir = self.pattern_manager._get_memory_dir(domain)
+                self.logger.info(
+                    f"Saved {len(key_lessons)} lesson(s) to {memory_dir}:\n{formatted_lessons}"
+                )
             else:
                 self.logger.info("No significant lessons to save")
 
