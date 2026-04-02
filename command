@@ -153,7 +153,7 @@ python run_hisa2.py \
   --result_dir ./results/hisa2_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium1.json \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -184,6 +184,17 @@ ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern这一
 本，可以通过/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern/*/*/
 execution_log.json来看任务描述和每一步操作
 通过改prompt(/home/weimingli/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
+
+根据结果/home/weimingli/projects/
+  ComputerRL/results/hisa2_qwen3.5-9b来优
+  化/home/weimingli/projects/ComputerRL/
+  mm_agents/hisa2/main.py，任务是否成功
+  看/home/weimingli/projects/ComputerRL/
+  results/hisa2_qwen3.5-9b/*/*/result.txt
+  是否为0，如果eval(x)=0就是失败，然后看
+  同级的model_trace.txt看模型的具体输入输
+  出，定位具体错误原因，你先采样看10个错
+  误样本
 
 sudo npm install -g @openai/codex@latest
 

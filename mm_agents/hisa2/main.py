@@ -33,21 +33,17 @@ NON_GUI_TOOLS = {"bash_execution", "wait", "termination", "infeasible"}
 VALID_TOOLS = GUI_ACTION_TOOLS | NON_GUI_TOOLS
 
 
-def _coerce_scroll_input(value):
-    if isinstance(value, (int, float)):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise ValueError("Input for tool 'scroll' must be a number")
-        try:
-            parsed = float(text)
-        except ValueError as exc:
-            raise ValueError("Input for tool 'scroll' must be a number") from exc
-        if parsed.is_integer():
-            return int(parsed)
-        return parsed
-    raise ValueError("Input for tool 'scroll' must be a number")
+def _scroll_amount_from_instruction(value: str) -> int:
+    text = f" {str(value or '').strip().lower()} "
+    if not text:
+        raise ValueError("Input for tool 'scroll' cannot be empty")
+
+    # Use a fixed magnitude and infer direction from the instruction text.
+    if " up " in text:
+        return 10
+    if " down " in text:
+        return -10
+    raise ValueError("Input for tool 'scroll' must clearly specify direction, such as 'scroll up' or 'scroll down'")
 
 
 # ==================== PROMPTS ====================
@@ -77,7 +73,7 @@ Response format:
     "thought": "string",
     "subgoal": "string",
     "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
-    "input": "string|number"
+    "input": "string"
 }
 ```
 
@@ -85,15 +81,15 @@ Field guide:
 - `thought`: brief reasoning about the next action, including key evidence from the screenshot or recent history when useful.
 - `subgoal`: the current phase-level objective you are working on; it should describe a meaningful stage of work, not a single low-level action. Good `subgoal` examples: `Locate the target file`, `Edit the requested fields`, `Verify the final output`. Bad `subgoal` examples: `Click the button`, `Wait`, `Press Enter`. Keep the same `subgoal` across multiple actions when they belong to the same stage. Change `subgoal` only when you intentionally move to a new stage or strategy.
 - `tool`: the one tool to execute next.
-- `input`: the scalar payload for that tool, see 'Tool guide' below. 
+- `input`: the string payload for that tool, see 'Tool guide' below. 
 
 Tool guide:
 - Allowed tools: `click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible`
-- `click` / `double_click` / `right_click` / `move` / `drag`: grounding target description. Example: `{"tool": "click", "input": "Submit button"}`
+- `click` / `double_click` / `right_click` / `move` / `drag`: use a detailed, self-contained grounding instruction in `input`. Include the target element plus visible text, nearby anchors, panel/dialog location, relative position, or other screenshot-visible cues needed to disambiguate. Example: `{"tool": "click", "input": "Click the Submit button on the popup window"}`.
 - `type`: text to type. Example: `{"tool": "type", "input": "hello"}`
 - `press`: key to press. Example: `{"tool": "press", "input": "enter"}`
 - `hotkey`: shortcut. Example: `{"tool": "hotkey", "input": "ctrl+c"}`
-- `scroll`: scroll amount. Example: `{"tool": "scroll", "input": -300, "thought": "Scroll the destination dropdown"}`
+- `scroll`: use a detailed, self-contained grounding instruction in `input` that states both the target region and the direction to scroll. Must include "scroll up/down" in the `input`. Example: `{"tool": "scroll", "input": "Scroll down inside the destination dropdown on the left side panel"}`
 - `wait`: Example: `{"tool": "wait", "input": ""}`
 - `bash_execution`: command. Example: `{"tool": "bash_execution", "input": "ls -la"}`
 - `termination`: completion summary. Example: `{"tool": "termination", "input": "Task completed. [summary]"}`
@@ -112,16 +108,9 @@ Please provide a valid JSON response in the exact format:
     "thought": "string",
     "subgoal": "string",
     "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
-    "input": "string|number"
+    "input": "string"
 }}
-```
-
-Important:
-- Always include `subgoal`
-- For `wait`, omit `input`.
-- For all other tools, use scalar `input` only: string or number.
-- Do not use objects, lists, or nested payloads inside `input`.
-- Choose the concrete GUI tool directly."""
+```"""
 
 STEP_ABSTRACTION_PROMPT = """Judge the latest executed step using the provided observations.
 
@@ -1153,7 +1142,10 @@ class HiSA:
         if isinstance(tool_input, str) and action in GROUNDED_GUI_TOOLS:
             input_desc = re.sub(r"\s+", " ", tool_input.strip())
 
-        base_desc = input_desc or (f"{thought} [{action}]" if thought and action in GROUNDED_GUI_TOOLS else thought)
+        if input_desc:
+            return input_desc
+
+        base_desc = f"{thought} [{action}]" if thought and action in GROUNDED_GUI_TOOLS else thought
         if base_desc:
             if action == "scroll":
                 return f"Scroll target: {base_desc}"
@@ -2143,13 +2135,9 @@ class HiSA:
                 if self._is_gui_tool(decision["tool"]):
                     if "input" not in decision:
                         raise ValueError(f"Missing 'input' for GUI tool: {decision['tool']}")
-                    if decision["tool"] == "scroll":
-                        decision["input"] = _coerce_scroll_input(decision.get("input"))
-                    if decision["tool"] in {"type", "press", "hotkey"} and decision.get("input") in [None, ""]:
+                    if decision.get("input") in [None, ""]:
                         raise ValueError(f"Input for tool '{decision['tool']}' cannot be empty")
-                    if decision["tool"] == "scroll" and not isinstance(decision.get("input"), (int, float)):
-                        raise ValueError("Input for tool 'scroll' must be a number")
-                    if decision["tool"] in {"type", "press", "hotkey"} and not isinstance(decision.get("input"), str):
+                    if not isinstance(decision.get("input"), str):
                         raise ValueError(f"Input for tool '{decision['tool']}' must be a string")
                     if decision["tool"] in GROUNDED_GUI_TOOLS:
                         gui_input = decision.get("input")
@@ -2291,8 +2279,12 @@ class HiSA:
                 "action_type": "pyautogui",
                 "command": "pyautogui.moveTo(START_X_COORD, START_Y_COORD); pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')",
             }
-        if tool == "scroll" and isinstance(code, (int, float)):
-            return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll({int(code)})"}
+        if tool == "scroll" and isinstance(code, str):
+            return {
+                "tool": tool,
+                "action_type": "pyautogui",
+                "command": f"pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll({_scroll_amount_from_instruction(code)})",
+            }
         if tool == "type" and isinstance(code, str):
             return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.write({code!r})"}
         if tool == "press" and isinstance(code, str):
@@ -3179,6 +3171,8 @@ except subprocess.TimeoutExpired as e:
         gui_steps = len([log for log in self.action_logs if log["type"] in GUI_ACTION_TOOLS])
         bash_steps = len([log for log in self.action_logs if log["type"] == "bash_execution"])
         wait_steps = len([log for log in self.action_logs if log["type"] == "wait"])
+        termination_steps = len([log for log in self.action_logs if log["type"] == "termination"])
+        infeasible_steps = len([log for log in self.action_logs if log["type"] == "infeasible"])
 
         global_planner_cost, global_planner_prompt, global_planner_completion, global_planner_images = self.global_planner_llm.get_usage()
         visual_grounder_cost, visual_grounder_prompt, visual_grounder_completion, visual_grounder_images = self.visual_grounder_llm.get_usage()
@@ -3205,6 +3199,8 @@ except subprocess.TimeoutExpired as e:
                 "cua_steps": gui_steps,
                 "coding_steps": bash_steps,
                 "wait_steps": wait_steps,
+                "termination_steps": termination_steps,
+                "infeasible_steps": infeasible_steps,
                 "image_count": total_images,
                 "total_cost": total_cost,
                 "prompt_tokens": global_planner_prompt + visual_grounder_prompt + state_manager_prompt,
