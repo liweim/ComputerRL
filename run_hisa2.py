@@ -331,11 +331,6 @@ def run(args, logger=None, tasks=None):
     """
     # Setup logging configuration
     result_name = os.path.basename(args.result_dir)
-
-    if args.rerun and not args.get_score:
-        if os.path.exists(args.result_dir):
-            shutil.rmtree(args.result_dir)
-        os.makedirs(args.result_dir, exist_ok=True)
     
     # Build tasks if not provided
     if tasks is None:
@@ -349,6 +344,13 @@ def run(args, logger=None, tasks=None):
         if task_filter_logger is None and hasattr(args, "logger"):
             task_filter_logger = args.logger
         tasks = filter_tasks(args, test_all_meta, task_filter_logger)
+
+    if args.rerun and not args.get_score:
+        os.makedirs(args.result_dir, exist_ok=True)
+        for domain, task_id in tasks:
+            target_dir = os.path.join(args.result_dir, f"{domain}/{task_id}")
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
     
     try:
         if not args.get_score:

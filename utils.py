@@ -677,6 +677,7 @@ if __name__ == "__main__":
     # summary('results/hisa_qwen3.5-9b_wo_step_refinement_pattern', 'evaluation_examples/test_medium.json')
     # summary('results/hisa_qwen3.5-9b_wo_refinement_pattern', 'evaluation_examples/test_medium.json')
     # summary('results/hisa_qwen3.5-9b_wo_pattern', 'evaluation_examples/test_medium.json')
-    summary('results/hisa_qwen3.5-9b', 'evaluation_examples/test_medium.json')
+    # summary('results/hisa_qwen3.5-9b', 'evaluation_examples/test_medium.json')
+    summary('results/hisa2_qwen3.5-9b', 'evaluation_examples/test_medium.json')
     
     # compare_results(['hisa_qwen3.5-9b_wo_refinement_pattern', 'hisa_qwen3.5-9b_wo_pattern'])

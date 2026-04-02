@@ -17,81 +17,87 @@ from PIL import Image
 import io
 import time
 
+GUI_ACTION_TOOLS = {
+    "click",
+    "double_click",
+    "right_click",
+    "move",
+    "drag",
+    "type",
+    "press",
+    "hotkey",
+    "scroll",
+}
+GROUNDED_GUI_TOOLS = {"click", "double_click", "right_click", "move", "drag", "scroll"}
+NON_GUI_TOOLS = {"bash_execution", "wait", "termination", "infeasible"}
+VALID_TOOLS = GUI_ACTION_TOOLS | NON_GUI_TOOLS
+
+
+def _coerce_scroll_input(value):
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("Input for tool 'scroll' must be a number")
+        try:
+            parsed = float(text)
+        except ValueError as exc:
+            raise ValueError("Input for tool 'scroll' must be a number") from exc
+        if parsed.is_integer():
+            return int(parsed)
+        return parsed
+    raise ValueError("Input for tool 'scroll' must be a number")
+
 
 # ==================== PROMPTS ====================
-GLOBAL_PLANNER_PROMPT = """You are an expert in GUIs and bash code executing tasks step-by-step. Always keep the task instruction in mind.
+GLOBAL_PLANNER_PROMPT = """You are an expert GUI and bash task agent.
 
-# Tools
-## gui_action
-Execute a structured GUI action. The executor converts it into pyautogui code and uses visual grounding when coordinates are omitted.
-Fields: top-level fields on the decision object
+Core rules:
+- Do only what the task asks.
+- Use as few steps as possible, but verify before termination.
+- Review task, summaries, recent steps, and past patterns before deciding.
+- Never change the user's requested target, object, destination, or requirement to something nearby or easier.
+- Always review what the latest steps actually achieved before choosing the next action.
+- Use the latest screenshot as the source of truth for the current UI state.
+- If the current screenshot does not show the target yet, do not click it directly; reveal it first with scroll, wait, or another prerequisite action.
+- Avoid repeating the same action when the latest screenshot and step evaluation show no meaningful new progress.
+- If the previous step did not produce the expected UI change, correct the mistake instead of mechanically repeating the same action.
+- Read visible text directly from screenshots when useful and record key evidence in `thought`.
+- Step evaluation reports immediate UI response, not task completion. Use it to detect wrong clicks, wrong pages, or missing progress.
+- Do not treat a click itself as success for the subgoal; rely on the resulting UI state shown in the screenshot.
+- If the latest result is inconsistent with the intended action, analyze the likely mistake and choose a corrective action instead of repeating the same plan.
+- Before termination, verify the exact requested outcome with concrete evidence from the current screenshot or a read-only command.
+- Do not terminate based only on a click succeeding, a popup/toast appearing, or a page/dialog opening.
+- If verification is inconclusive, continue working instead of terminating.
 
-## wait
-Wait for async operations to complete and observe UI changes.
-Field: top-level `seconds` (5-30 recommended)
-
-## bash_execution
-Execute bash commands and Python scripts.
-Field: top-level `command`
-
-## infeasible
-Declare that the task is objectively impossible to complete.
-Field: top-level `message`
-
-# Hard Constraints
-1. Do only what the task asks.
-2. Use as few steps as possible, but include a final verification before termination.
-3. Never terminate immediately after the last edit, click, or command.
-4. Always review the task, summaries, recent steps, and retrieved memories before deciding.
-5. Never modify user requirements such as exact names, files, paths, targets, or values.
-6. Immediate action feedback does not prove task completion.
-7. Read visible text directly from screenshots when useful, and record key evidence in `thought`.
-8. Prefer the shortest reliable path and avoid repeating the same failed action or target.
-
-# Response Format
-## Standard Response
+Response format:
 ```json
 {
-    "thought": "Brief reasoning about the current action. Check prerequisites and verify previous result.",
-    "tool": "one of gui_action|bash_execution|wait|termination|infeasible",
-    "...": "include only the fields for that tool, and do not include unrelated fields"
+    "thought": "string",
+    "subgoal": "string",
+    "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
+    "input": "string|number"
 }
 ```
 
-Tool-specific rules:
-- `gui_action`: use `action` and related GUI fields only. Do not include `seconds` or `command`.
-- `bash_execution`: use `command` only. Do not include `action` or `seconds`.
-- `wait`: use `seconds` only. Do not include `action` or `command`.
-- `termination` and `infeasible`: use `message` only. Do not include `action`, `command`, or `seconds`.
+Field guide:
+- `thought`: brief reasoning about the next action, including key evidence from the screenshot or recent history when useful.
+- `subgoal`: the current phase-level objective you are working on; it should describe a meaningful stage of work, not a single low-level action. Good `subgoal` examples: `Locate the target file`, `Edit the requested fields`, `Verify the final output`. Bad `subgoal` examples: `Click the button`, `Wait`, `Press Enter`. Keep the same `subgoal` across multiple actions when they belong to the same stage. Change `subgoal` only when you intentionally move to a new stage or strategy.
+- `tool`: the one tool to execute next.
+- `input`: the scalar payload for that tool, see 'Tool guide' below. 
 
-Examples:
-- gui_action with grounding: `{"tool": "gui_action", "action": "click", "description": "Click the Submit button"}`
-- gui_action with explicit coordinates: `{"tool": "gui_action", "action": "click", "x": 120, "y": 340}`
-- gui_action typing: `{"tool": "gui_action", "action": "type", "text": "hello"}`
-- wait: `{"tool": "wait", "seconds": 15}`
-- bash_execution: `{"tool": "bash_execution", "command": "ls -la"}`
-- termination: `{"tool": "termination", "message": "Task completed. [summary]"}`
-- infeasible: `{"tool": "infeasible", "message": "Chrome doesn't support changing search results per page - this is a search engine setting, not a browser feature"}`
-
-## Termination (Task Complete)
-When **all required actions are done and the final state is verified**:
-```json
-{
-    "thought": "All task requirements completed successfully. I checked each requested constraint one-by-one and verified the exact final state with concrete evidence.",
-    "tool": "termination",
-    "message": "Task completed. [brief summary of what was done and what was verified]"
-}
-```
-
-## Infeasible (Task Impossible)
-When **task is objectively impossible** after verification:
-```json
-{
-    "thought": "Verified that [feature/file/capability] doesn't exist and cannot be created.",
-    "tool": "infeasible",
-    "message": "Detailed explanation of why the task cannot be completed."
-}
-```
+Tool guide:
+- Allowed tools: `click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible`
+- `click` / `double_click` / `right_click` / `move` / `drag`: grounding target description. Example: `{"tool": "click", "input": "Submit button"}`
+- `type`: text to type. Example: `{"tool": "type", "input": "hello"}`
+- `press`: key to press. Example: `{"tool": "press", "input": "enter"}`
+- `hotkey`: shortcut. Example: `{"tool": "hotkey", "input": "ctrl+c"}`
+- `scroll`: scroll amount. Example: `{"tool": "scroll", "input": -300, "thought": "Scroll the destination dropdown"}`
+- `wait`: Example: `{"tool": "wait", "input": ""}`
+- `bash_execution`: command. Example: `{"tool": "bash_execution", "input": "ls -la"}`
+- `termination`: completion summary. Example: `{"tool": "termination", "input": "Task completed. [summary]"}`
+- `infeasible`: reason. Example: `{"tool": "infeasible", "input": "Detailed reason"}`
 """
 
 FIX_RESPONSE_PROMPT = """Error: Failed to parse your response.
@@ -103,46 +109,65 @@ Your response was:
 Please provide a valid JSON response in the exact format:
 ```json
 {{
-    "thought": "Brief reasoning (check prerequisites, count operations)",
-    "tool": "one of gui_action|bash_execution|wait|termination|infeasible"
+    "thought": "string",
+    "subgoal": "string",
+    "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
+    "input": "string|number"
 }}
 ```
 
 Important:
-- Include only the fields for the chosen tool.
-- Do not mix fields from different tools.
-- Example: `gui_action` must not include `seconds`; `wait` must not include `action` or `command`."""
+- Always include `subgoal`
+- For `wait`, omit `input`.
+- For all other tools, use scalar `input` only: string or number.
+- Do not use objects, lists, or nested payloads inside `input`.
+- Choose the concrete GUI tool directly."""
 
-STEP_ABSTRACTION_PROMPT = """Compare before/after screenshots and describe the UI response in 1-2 sentences:
+STEP_ABSTRACTION_PROMPT = """Judge the latest executed step using the provided observations.
 
+Previous current subgoal: {previous_subgoal}
+Proposed subgoal for this step: {proposed_subgoal}
 Action: {action_description}
+Blocked hint: {blocked_hint}
 
-Be concise:
-- Loading/waiting states = action triggered successfully
-- Check cursor position for confirmation
-- Only report what changed
-
-Example: "Succeeded. Button clicked, loading state appeared."
-Example: "Succeeded. Cursor at target, no immediate change."
-Example: "Failed. Error dialog: [text]."
-"""
-
-BASH_OUTPUT_ABSTRACTION_PROMPT = """Summarize a bash execution result in 1-3 concise sentences for future planning.
-
-Focus on:
-- whether the command succeeded or failed
-- the most important outcome or error
-- any concrete next-step signal that matters
+Return JSON:
+{{
+  "summary": "1-2 sentence concise UI/result summary",
+  "subgoal_status": "continue|done|blocked"
+}}
 
 Rules:
-- Be concise
-- Do not repeat the full output
-- Prefer key files/results/errors over incidental logs
-- If output is long, compress it to the essential result only
+- The current step always belongs to the proposed subgoal.
+- If the proposed subgoal differs from the previous current subgoal, this step is already part of the new subgoal.
+- Judge the status from the actual result shown in the provided observations.
+- `continue`: the step made progress but the proposed subgoal still needs more work.
+- `done`: use only if the observations show that the proposed subgoal itself has been achieved.
+- `done` requires that all requirements stated in the proposed subgoal are satisfied, not just a partial or intermediate part of it.
+- `blocked`: the step failed to make reliable progress, timed out, or hit a blocking issue.
+- Do not use `done` just because the next target became visible, a prerequisite was prepared, or the UI moved closer to the goal.
+- If the step only revealed the next target or created a prerequisite state, use `continue`.
+- Keep `summary` concise and concrete.
+"""
 
-Example: "Succeeded. Listed the target directory and confirmed report.csv exists."
-Example: "Failed. Python raised ModuleNotFoundError for openpyxl."
-Example: "Succeeded. Script updated the spreadsheet and printed 12 matching rows."
+FINAL_VERIFICATION_PROMPT = """Decide whether the GUI task is fully completed.
+
+You will receive:
+- the original task
+- the current subgoal
+- the latest execution logs
+- the current screenshot
+
+Return JSON:
+{
+  "result": "pass|fail"
+}
+
+Rules:
+- Return only `pass` or `fail`.
+- Use `pass` only if the task requirements appear fully satisfied in the current screenshot and latest execution logs.
+- If there is uncertainty, return `fail`.
+- For multi-target tasks (`all`, `both`, `each`, `respectively`), fail unless every requested target is explicitly covered.
+- For relative-date tasks, fail unless the exact resolved absolute date is explicitly covered.
 """
 
 CONTEXT_REFINEMENT_PROMPT = """Analyze task execution progress and provide guidance.
@@ -315,7 +340,7 @@ class PatternManager:
             "filename": os.path.basename(file_path),
             "path": file_path,
             "type": metadata.get("type", "domain"),
-            "description": metadata.get("description", lesson[:160]),
+            "description": metadata.get("description", lesson),
             "confidence": metadata.get("confidence", ""),
             "task_signature": metadata.get("task_signature", ""),
             "task_tags": [tag.strip() for tag in metadata.get("task_tags", "").split(",") if tag.strip()],
@@ -452,7 +477,7 @@ class PatternManager:
                 file_stub = hashlib.sha256(f"{lesson_type}:{lesson_text}".encode("utf-8")).hexdigest()[:10]
                 file_name = f"{lesson_type}_{int(time.time())}_{file_stub}.md"
                 file_path = os.path.join(memory_dir, file_name)
-                description = lesson_text[:160]
+                description = lesson_text
                 typed_signature = task_signature or self._normalize_domain(domain)
                 tag_list = ",".join(task_tags or [])
                 confidence = "high" if lesson_type in ["env", "failure"] else "medium"
@@ -626,7 +651,7 @@ class PatternManager:
                 learned_entries,
                 task_signature=task_signature,
                 task_tags=task_tags,
-                limit=12,
+                limit=20,
             )
 
             selected_entries = []
@@ -778,7 +803,7 @@ class HiSA:
         qdrant_server_url: str = "http://localhost:6333",
         wo_roi: bool = False,  # If True, disable ROI cropping (default: False means ROI cropping is enabled)
         roi_margin: int = 50,  # Margin around ROI when cropping
-        refine_period: int = 5,
+        refine_period: int = 10,
         bash_timeout: int = 60,  # Timeout for bash script execution in seconds
         bash_working_dir: str = "~",  # Working directory for bash execution
         wo_step: bool = False,  # If True, skip step abstraction and use full conversation history
@@ -835,14 +860,30 @@ class HiSA:
         self.operation_count = 0
         self.operations_dir = ""
         self.action_logs = []
-        self.last_error_feedback = None  # Store error feedback for retry
+        self.last_error_feedback = None  # Backward-compatible alias; planner uses blocked feedback semantics
+        self.last_blocked_feedback = None
         self.last_full_summary = None  # Last complete history summary
         self.last_summary_log_index = 0  # Number of action logs already folded into last_full_summary
+        self.last_refinement_log_count = 0
         self.step_token_usage = {}  # Store token usage for current step
         self.current_thought = ""  # Store current step's thought for step_abstract
+        self.current_proposed_subgoal = ""
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
         self.prompt_dump_path = ""
         self.prompt_dump_counter = 0
+        self.current_subgoal = ""
+        self.consecutive_stuck_subgoals = 0
+        self.awaiting_final_verification = False
+        self.final_verification_observed = False
+        self.last_decision_subgoal_status = "continue"
+        self.last_blocked_feedback_event = None
+        self.last_blocked_feedback = None
+        self.last_error_feedback = None
+        self.post_action_wait_timeout = 10.0
+        self.explicit_wait_timeout = 20.0
+        self.wait_poll_interval = 1.0
+        self.screenshot_wait_timeout = 6.0
+        self.evaluation_wait_timeout = 25.0
 
     def _sanitize_prompt_payload(self, value: Any):
         if isinstance(value, dict):
@@ -999,11 +1040,14 @@ class HiSA:
         tags = self._extract_task_tags(task_instruction, domain)
         return "|".join(tags) if tags else (domain or "general")
 
-    def _should_use_recovery_skill(self) -> bool:
-        if self.last_error_feedback:
+    def _should_use_blocked_feedback_skill(self) -> bool:
+        if self._get_active_blocked_feedback():
             return True
         recent_logs = self.action_logs[-2:]
         return any(not log.get("execution_success", True) for log in recent_logs)
+
+    def _get_active_blocked_feedback(self) -> str:
+        return str(self.last_blocked_feedback or self.last_error_feedback or "").strip()
 
     def _build_planner_system_prompt(self) -> str:
         sections = [
@@ -1013,16 +1057,117 @@ class HiSA:
         if domain_skill_name:
             sections.append(self._load_skill_text(domain_skill_name))
         if self._task_prefers_gui_skill() or any(
-            log.get("type") == "gui_action" for log in self.action_logs
+            log.get("type") in GUI_ACTION_TOOLS for log in self.action_logs
         ):
             sections.append(self._load_skill_text("gui.md"))
         if self._task_requires_bash_skill() or any(
             log.get("type") == "bash_execution" for log in self.action_logs
         ):
             sections.append(self._load_skill_text("bash.md"))
-        if self._should_use_recovery_skill():
-            sections.append(self._load_skill_text("recovery.md"))
+        if self._should_use_blocked_feedback_skill():
+            sections.append(self._load_skill_text("blocked_feedback.md"))
         return "\n\n".join(section.strip() for section in sections if section)
+
+    def _normalize_subgoal(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            raise ValueError("Subgoal cannot be empty")
+        return text
+
+    def _normalize_subgoal_status(self, value: str) -> str:
+        status = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if status not in {"continue", "done", "blocked"}:
+            return "continue"
+        return status
+
+    def _parse_abstraction_payload(self, raw_text: str) -> Dict[str, str]:
+        parsed = json.loads(repair_json(raw_text))
+        summary = re.sub(r"\s+", " ", str(parsed.get("summary", "") or "").strip())
+        if not summary:
+            raise ValueError("Abstraction response missing non-empty 'summary'")
+        if "subgoal_status" not in parsed:
+            raise ValueError("Abstraction response missing 'subgoal_status'")
+        return {
+            "summary": summary,
+            "subgoal_status": self._normalize_subgoal_status(parsed["subgoal_status"]),
+        }
+
+    def _build_subgoal_context_lines(self) -> List[str]:
+        lines = []
+        if self.current_subgoal:
+            lines.append(f"Current subgoal: {self.current_subgoal}")
+        if self.awaiting_final_verification and not self.final_verification_observed:
+            lines.append("Final verification is still required before termination. Use one more action to verify the exact final state.")
+        return lines
+
+    def _append_context_section(self, sections: List[str], title: str, content: Optional[str]) -> None:
+        text = str(content or "").strip()
+        if text:
+            sections.append(f"{title}:\n{text}")
+
+    def _get_current_date_context(self) -> str:
+        return time.strftime("%Y-%m-%d (%A)")
+
+    def _build_planner_context_message(
+        self,
+        *,
+        include_task_header: bool,
+        history_items: Optional[List[str]] = None,
+        prompt_text: str = "",
+        observation_text: str = "",
+        blocked_feedback_text: str = "",
+    ) -> Optional[Dict]:
+        sections: List[str] = []
+
+        if include_task_header:
+            self._append_context_section(sections, "Task", self.task_instruction)
+            self._append_context_section(sections, "Current date", self._get_current_date_context())
+            self._append_context_section(sections, "Relevant past patterns", self.past_pattern_text)
+            if not self.wo_refinement and self.last_full_summary:
+                self._append_context_section(sections, "Summary of previous steps", self.last_full_summary)
+
+        subgoal_lines = self._build_subgoal_context_lines()
+        if subgoal_lines:
+            sections.append("\n\n".join(subgoal_lines))
+
+        if history_items:
+            history_text = "\n".join(str(item).strip() for item in history_items if str(item).strip())
+            self._append_context_section(sections, "Execution history", history_text)
+
+        self._append_context_section(sections, "Observation from previous action", observation_text)
+        self._append_context_section(sections, "Blocked feedback", blocked_feedback_text)
+
+        prompt_text = str(prompt_text or "").strip()
+        if prompt_text:
+            sections.append(prompt_text)
+
+        if not sections:
+            return None
+        return {"role": "user", "content": "\n\n".join(sections)}
+
+    def _build_action_description(self, decision: Dict) -> str:
+        action = str(decision.get("tool", "")).strip().lower()
+        thought = re.sub(r"\s+", " ", str(decision.get("thought", "") or "").strip())
+        tool_input = decision.get("input")
+        input_desc = ""
+        if isinstance(tool_input, str) and action in GROUNDED_GUI_TOOLS:
+            input_desc = re.sub(r"\s+", " ", tool_input.strip())
+
+        base_desc = input_desc or (f"{thought} [{action}]" if thought and action in GROUNDED_GUI_TOOLS else thought)
+        if base_desc:
+            if action == "scroll":
+                return f"Scroll target: {base_desc}"
+            if action in {"click", "double_click", "right_click"}:
+                return f"Click target: {base_desc}"
+            if action == "move":
+                return f"Hover target: {base_desc}"
+            if action == "drag":
+                return f"Drag target: {base_desc}"
+            return base_desc
+        return ""
+
+    def _is_gui_tool(self, tool: str) -> bool:
+        return str(tool or "").strip().lower() in GUI_ACTION_TOOLS
 
     def _build_compact_log_entry(
         self,
@@ -1036,14 +1181,8 @@ class HiSA:
         detail = re.sub(r"\s+", " ", str(detail or "").strip())
         verification = re.sub(r"\s+", " ", str(verification or "").strip())
         next_hint = re.sub(r"\s+", " ", str(next_hint or "").strip())
-        if len(detail) > 220:
-            detail = detail[:217] + "..."
-        if len(verification) > 160:
-            verification = verification[:157] + "..."
-        if len(next_hint) > 160:
-            next_hint = next_hint[:157] + "..."
         return {
-            "intent": self.current_thought[:180] if self.current_thought else "",
+            "intent": self.current_thought if self.current_thought else "",
             "verified": verification,
             "next_hint": next_hint,
         }
@@ -1055,6 +1194,10 @@ class HiSA:
             f"tool={log.get('type', '')}",
             f"result={'success' if log.get('execution_success', False) else 'failure'}",
         ]
+        if log.get("subgoal"):
+            parts.append(f"subgoal={log.get('subgoal')}")
+        if log.get("subgoal_status"):
+            parts.append(f"subgoal_status={log.get('subgoal_status')}")
         detail = log.get("detail") or compact.get("detail") or ""
         if detail:
             parts.append(f"detail={detail}")
@@ -1065,6 +1208,257 @@ class HiSA:
         if compact.get("next_hint"):
             parts.append(f"next_hint={compact['next_hint']}")
         return " | ".join(parts)
+
+    def _maybe_refine_context(self, reason: str = "") -> None:
+        total_logs = len(self.action_logs)
+        if self.wo_refinement or total_logs <= 0:
+            return
+
+        logs_since_last_refinement = total_logs - int(getattr(self, "last_refinement_log_count", 0) or 0)
+        should_refine = False
+        if reason in {"subgoal_done", "subgoal_blocked"} and logs_since_last_refinement > 3:
+            should_refine = True
+        elif total_logs % max(1, self.refine_period) == 0:
+            should_refine = True
+
+        if not should_refine:
+            return
+
+        if self.last_full_summary:
+            logs_to_summarize = self.action_logs[self.last_summary_log_index:]
+            start_step = self.action_logs[0]["step"]
+            end_step = self.action_logs[-1]["step"]
+            summary = self._context_refinement(
+                logs_to_summarize,
+                start_step,
+                end_step,
+                previous_summary=self.last_full_summary,
+            )
+        else:
+            logs_to_summarize = self.action_logs
+            start_step = logs_to_summarize[0]["step"]
+            end_step = logs_to_summarize[-1]["step"]
+            summary = self._context_refinement(logs_to_summarize, start_step, end_step)
+
+        self.last_full_summary = summary
+        self.last_summary_log_index = total_logs
+        self.last_refinement_log_count = total_logs
+        self.logger.info(f"[refinement:{reason or 'periodic'}] {summary}")
+
+        if self.wo_step:
+            self.conversation_messages = []
+            self.last_tool_output = None
+
+    def _record_subgoal_transition(self, decision: Dict) -> str:
+        proposed_subgoal = self._normalize_subgoal(decision.get("subgoal", ""))
+        previous_subgoal = self.current_subgoal
+        latest_log = self.action_logs[-1] if self.action_logs else {}
+        status = self._normalize_subgoal_status(latest_log.get("subgoal_status", "continue"))
+        decision["subgoal_status"] = status
+        self.logger.info(
+            "[subgoal_status] previous=%s | proposed=%s | derived=%s",
+            previous_subgoal if previous_subgoal else "None",
+            proposed_subgoal,
+            status,
+        )
+
+        if self.action_logs:
+            self.action_logs[-1]["subgoal"] = proposed_subgoal
+            self.action_logs[-1]["subgoal_status"] = status
+
+        self.last_decision_subgoal_status = status
+
+        if status == "blocked":
+            self.consecutive_stuck_subgoals += 1
+        else:
+            self.consecutive_stuck_subgoals = 0
+
+        if not previous_subgoal:
+            self.current_subgoal = proposed_subgoal
+        elif proposed_subgoal != previous_subgoal:
+            self.current_subgoal = proposed_subgoal
+
+        if status in {"done", "blocked"}:
+            self.last_refinement_log_count = len(self.action_logs)
+        return status
+
+    def _build_termination_guard_feedback(self) -> str:
+        if not self.awaiting_final_verification:
+            self.awaiting_final_verification = True
+            self.final_verification_observed = False
+            target = self.current_subgoal or "the requested final state"
+            return (
+                f"Termination blocked. You must verify the exact final state for subgoal '{target}' before terminating.\n"
+                "Do one more verification-focused action, then terminate only if the result clearly confirms task completion."
+            )
+        return (
+            "Termination blocked. Final verification has not been observed yet.\n"
+            "Use one more action to inspect the final UI or output and collect concrete evidence, then terminate only if verified."
+        )
+
+    def _build_blocked_feedback(self, event_type: str, detail: str = "") -> str:
+        detail = re.sub(r"\s+", " ", str(detail or "").strip())
+        if event_type == "loop_detected":
+            return (
+                "Blocked feedback: repeated the same action/result loop. Do not retry the same target.\n"
+                "Switch target, switch tool, or mark the current subgoal as blocked."
+            )
+        if event_type == "no_visible_change":
+            return (
+                "Blocked feedback: the last action produced no visible change before timeout.\n"
+                "Re-locate the target, try a different interaction, or switch tools."
+                + (f"\nContext: {detail}" if detail else "")
+            )
+        if event_type == "tool_execution_failed":
+            return (
+                "Blocked feedback: the last tool execution failed.\n"
+                "Fix the concrete failure instead of repeating the same action."
+                + (f"\nError: {detail}" if detail else "")
+            )
+        if event_type == "termination_verification_failed":
+            return (
+                "Blocked feedback: final verification did not confirm task completion.\n"
+                "Do one more targeted verification or finish the missing requirement."
+                + (f"\nMissing: {detail}" if detail else "")
+            )
+        return detail or "Blocked feedback: reassess the current subgoal and choose a different strategy."
+
+    def _run_final_verification(self) -> bool:
+        screenshot = self._wait_until_screenshot_available(timeout_seconds=2.0)
+        screenshot_b64 = base64.b64encode(screenshot).decode("utf-8") if screenshot else ""
+        recent_logs = self.action_logs[-4:]
+        history_lines = [self._render_compact_log(log) for log in recent_logs if log.get("compact") or log.get("detail")]
+        messages = [
+            {"role": "system", "content": FINAL_VERIFICATION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Task:\n{self.task_instruction}\n\n"
+                    f"Current subgoal:\n{self.current_subgoal or 'None'}\n\n"
+                    f"Latest execution logs:\n" + ("\n".join(history_lines) if history_lines else "None")
+                ),
+            },
+        ]
+        if screenshot_b64:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Current screenshot:"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"},
+                ],
+            })
+
+        self._dump_prompt_entry(
+            stage="final_verification",
+            payload={"messages": messages},
+        )
+        response = self.state_manager_llm(messages, enable_thinking=False)
+        self._dump_prompt_entry(
+            stage="final_verification_response",
+            payload=response,
+        )
+        parsed = json.loads(repair_json(response))
+        result = str(parsed.get("result", "") or "").strip().lower()
+        if result not in {"pass", "fail"}:
+            raise ValueError("Final verification response must contain result=pass|fail")
+        return result == "pass"
+
+    def _screenshots_meaningfully_different(self, before_screenshot: bytes, after_screenshot: bytes) -> bool:
+        if not before_screenshot or not after_screenshot:
+            return False
+        if before_screenshot == after_screenshot:
+            return False
+        try:
+            before_img = Image.open(io.BytesIO(before_screenshot))
+            after_img = Image.open(io.BytesIO(after_screenshot))
+            if before_img.size != after_img.size:
+                return True
+            cropped_before, cropped_after = get_change_roi(
+                before_img,
+                after_img,
+                margin=self.roi_margin,
+            )
+            return cropped_before is not None and cropped_after is not None
+        except Exception:
+            return self._hash_bytes(before_screenshot) != self._hash_bytes(after_screenshot)
+
+    def _wait_for_environment_change(
+        self,
+        before_screenshot: bytes,
+        timeout_seconds: Optional[float] = None,
+        initial_after_screenshot: Optional[bytes] = None,
+    ) -> Tuple[bytes, bool, float]:
+        timeout = self.explicit_wait_timeout if timeout_seconds is None else max(1.0, float(timeout_seconds))
+        poll_interval = max(0.2, float(self.wait_poll_interval))
+        start_time = time.time()
+        latest_screenshot = initial_after_screenshot or before_screenshot
+        changed_detected = False
+        stable_since = None
+
+        if initial_after_screenshot and self._screenshots_meaningfully_different(before_screenshot, initial_after_screenshot):
+            changed_detected = True
+            stable_since = start_time
+
+        while True:
+            now = time.time()
+            elapsed = now - start_time
+            if elapsed >= timeout:
+                break
+
+            if changed_detected and stable_since is not None and (now - stable_since) >= poll_interval:
+                return latest_screenshot, True, elapsed
+
+            time.sleep(min(poll_interval, max(0.0, timeout - elapsed)))
+            current_screenshot = self.env.controller.get_screenshot()
+            if current_screenshot is None:
+                continue
+            previous_screenshot = latest_screenshot
+            latest_screenshot = current_screenshot
+
+            if self._screenshots_meaningfully_different(before_screenshot, current_screenshot):
+                changed_detected = True
+                if self._screenshots_meaningfully_different(previous_screenshot, current_screenshot):
+                    stable_since = time.time()
+                elif stable_since is None:
+                    stable_since = time.time()
+
+        return latest_screenshot, changed_detected, time.time() - start_time
+
+    def _wait_until_screenshot_available(
+        self,
+        timeout_seconds: Optional[float] = None,
+    ) -> Optional[bytes]:
+        timeout = self.screenshot_wait_timeout if timeout_seconds is None else max(0.5, float(timeout_seconds))
+        start_time = time.time()
+        while True:
+            screenshot = self.env.controller.get_screenshot()
+            if screenshot is not None:
+                return screenshot
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                return None
+            time.sleep(min(self.wait_poll_interval, max(0.0, timeout - elapsed)))
+
+    def _evaluate_with_polling(self) -> float:
+        timeout = self.evaluation_wait_timeout
+        start_time = time.time()
+        attempt = 0
+        last_error = None
+        while True:
+            attempt += 1
+            try:
+                return self.env.evaluate()
+            except Exception as eval_error:
+                last_error = eval_error
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    raise last_error
+                remaining = timeout - elapsed
+                wait_time = min(self.wait_poll_interval * max(1, min(attempt, 4)), remaining)
+                self.logger.warning(
+                    f"Evaluation attempt {attempt} failed: {eval_error}. Retrying in {wait_time:.1f} seconds..."
+                )
+                time.sleep(wait_time)
 
     def _get_usage_snapshot(self) -> Dict:
         """Get current token usage snapshot from all LLMs."""
@@ -1123,30 +1517,23 @@ class HiSA:
         if tool == "bash_execution":
             command = decision.get("command", tool_input)
             return self._hash_text(self._normalize_bash_command(command))
-        if tool == "gui_action":
+        if self._is_gui_tool(tool):
             gui_input = {}
             if isinstance(tool_input, dict):
                 gui_input.update(tool_input)
-            for key in [
-                "action", "x", "y", "x1", "y1", "x2", "y2",
-                "start_x", "start_y", "end_x", "end_y",
-                "text", "value", "key", "keys", "amount",
-                "command", "action_type",
-            ]:
-                if key in decision:
-                    gui_input[key] = decision[key]
+            gui_input["tool"] = tool
             return self._hash_text(gui_input)
         return ""
 
     def _normalize_gui_description(self, description: str) -> str:
-        """Normalize gui_action description for repeat detection."""
+        """Normalize GUI target description for repeat detection."""
         if not description:
             return ""
         return re.sub(r"\s+", " ", str(description).strip()).lower()
 
     def _detect_repeated_gui_description(self, decision: Dict) -> Optional[str]:
-        """Fail fast if the same gui_action description is planned 3 consecutive times."""
-        if decision.get("tool") != "gui_action":
+        """Fail fast if the same GUI tool description is planned 3 consecutive times."""
+        if not self._is_gui_tool(decision.get("tool", "")):
             return None
 
         normalized_description = self._normalize_gui_description(decision.get("description", ""))
@@ -1155,7 +1542,7 @@ class HiSA:
 
         repeat_count = 1  # Count current candidate decision.
         for log in reversed(self.action_logs):
-            if log.get("type") != "gui_action":
+            if log.get("type") not in GUI_ACTION_TOOLS:
                 break
             if self._normalize_gui_description(log.get("description", "")) != normalized_description:
                 break
@@ -1163,7 +1550,7 @@ class HiSA:
 
         if repeat_count >= 3:
             return (
-                "Detected repeated gui_action description loop: "
+                "Detected repeated GUI-tool description loop: "
                 f"'{decision.get('description', '')}' repeated {repeat_count} consecutive times."
             )
         return None
@@ -1171,10 +1558,10 @@ class HiSA:
     def _detect_execution_loop(self, decision: Dict) -> Optional[str]:
         """Detect strict loops with identical action/result fingerprints."""
         tool = decision.get("tool", "")
-        if tool not in ["gui_action", "bash_execution"] or not self.action_logs:
+        if tool not in GUI_ACTION_TOOLS.union({"bash_execution"}) or not self.action_logs:
             return None
 
-        threshold = 5 if tool == "gui_action" else 3
+        threshold = 5 if tool in GUI_ACTION_TOOLS else 3
         candidate_action_fp = self._get_decision_action_fingerprint(decision)
         if not candidate_action_fp:
             return None
@@ -1207,7 +1594,7 @@ class HiSA:
             )
         return None
 
-    def _summarize_history_segment(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
+    def _context_refinement(self, logs: List[Dict], start_step: int, end_step: int, previous_summary: str = "") -> str:
         """Summarize a segment of action logs with context refinement."""
         
         if not logs and not previous_summary:
@@ -1251,7 +1638,7 @@ class HiSA:
             history_lines = []
             for log in logs:
                 if log.get("compact"):
-                    history_lines.append(self._render_compact_log(log["compact"]))
+                    history_lines.append(self._render_compact_log(log))
                 elif "step_abstract" in log:
                     history_lines.append(log["step_abstract"])
 
@@ -1319,8 +1706,18 @@ class HiSA:
         self.action_logs = []
         self.last_full_summary = None
         self.last_summary_log_index = 0
+        self.last_refinement_log_count = 0
         self.conversation_messages = []  # Store full conversation history when wo_step=True
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
+        self.current_subgoal = ""
+        self.current_proposed_subgoal = ""
+        self.consecutive_stuck_subgoals = 0
+        self.awaiting_final_verification = False
+        self.final_verification_observed = False
+        self.last_decision_subgoal_status = "continue"
+        self.last_blocked_feedback_event = None
+        self.last_blocked_feedback = None
+        self.last_error_feedback = None
 
         if self.record:
             self.env.controller.start_recording()
@@ -1398,6 +1795,22 @@ class HiSA:
 
                 # Check termination or infeasible
                 if decision["tool"] == "termination":
+                    verification = self._run_final_verification()
+                    if not verification:
+                        self.awaiting_final_verification = True
+                        self.final_verification_observed = False
+                        self.last_blocked_feedback = self._build_blocked_feedback(
+                            "termination_verification_failed",
+                            "",
+                        )
+                        self.last_error_feedback = self.last_blocked_feedback
+                        if self.wo_step:
+                            self.last_tool_output = "Final verification failed."
+                        self.logger.info(
+                            "Termination blocked: final verification failed",
+                        )
+                        continue
+                    self.logger.info("Final verification passed")
                     step = self.operation_count + 1
                     global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
                     screenshot_file = f"step_{step}.png"
@@ -1457,7 +1870,7 @@ class HiSA:
                     break
 
                 # Pre-calculate global planner token usage and set step_token_usage before tool execution
-                # This ensures _gui_action/_bash_execution can use it when creating action_log
+                # This ensures GUI-tool execution and bash execution can use it when creating action_log
                 global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
 
                 # Initialize step_token_usage with global planner data (visual_grounder/state_manager will be updated after execution)
@@ -1482,11 +1895,8 @@ class HiSA:
                 loop_error = self._detect_execution_loop(decision)
                 if loop_error:
                     self.logger.warning(loop_error)
-                    self.last_error_feedback = (
-                        f"{loop_error}\n"
-                        "Do not repeat the same action. Switch strategy immediately "
-                        "(different target, different tool, or different command)."
-                    )
+                    self.last_blocked_feedback = self._build_blocked_feedback("loop_detected", loop_error)
+                    self.last_error_feedback = self.last_blocked_feedback
                     if self.wo_step:
                         self.last_tool_output = f"Execution blocked: {loop_error}"
                     # Count this as a consumed step to avoid infinite planner-loop cycles.
@@ -1494,11 +1904,29 @@ class HiSA:
                     continue
 
                 # Execute tool and capture execution result text
+                self.last_blocked_feedback_event = None
                 execution_result_text = self._execute_tool(decision)
                 
                 # Store execution result for wo_step mode to maintain dialogue structure
                 if self.wo_step and execution_result_text:
                     self.last_tool_output = execution_result_text
+
+                status = self._record_subgoal_transition(decision)
+                if self.awaiting_final_verification:
+                    self.final_verification_observed = True
+
+                if status == "done":
+                    self._maybe_refine_context("subgoal_done")
+                elif status == "blocked":
+                    self._maybe_refine_context("subgoal_blocked")
+
+                if self.last_blocked_feedback_event:
+                    event_type = self.last_blocked_feedback_event.get("type", "")
+                    event_detail = self.last_blocked_feedback_event.get("detail", "")
+                    self.last_blocked_feedback = self._build_blocked_feedback(event_type, event_detail)
+                    self.last_error_feedback = self.last_blocked_feedback
+                    if self.wo_step and execution_result_text:
+                        self.last_tool_output = execution_result_text + "\n\n" + self.last_blocked_feedback
 
                 # Capture token usage after tool execution
                 usage_after_tool = self._get_usage_snapshot()
@@ -1572,51 +2000,13 @@ class HiSA:
             json_str = ""
             try:
                 # Get current screenshot
-                screenshot = None
-                for screenshot_attempt in range(3):
-                    screenshot = self.env.controller.get_screenshot()
-                    if screenshot is not None:
-                        break
-                    self.logger.warning(
-                        f"Screenshot unavailable for planning (retry {screenshot_attempt + 1}/3), waiting 2s..."
-                    )
-                    time.sleep(2)
+                screenshot = self._wait_until_screenshot_available()
                 if screenshot is None:
                     raise RuntimeError("Failed to capture screenshot for planning after retries.")
                 screenshot_b64 = base64.b64encode(screenshot).decode("utf-8")
 
-                # Context Refinement
-                total_logs = len(self.action_logs)
-                
-                # Only trigger context refinement if not disabled (wo_refinement=False)
-                if not self.wo_refinement and total_logs > 0 and total_logs % self.refine_period == 0:
-                    # Trigger context refinement
-                    if self.last_full_summary:
-                        # Not first time: use previous summary + new logs since last summary
-                        logs_to_summarize = self.action_logs[self.last_summary_log_index:]
-                        start_step = self.action_logs[0]["step"]
-                        end_step = self.action_logs[-1]["step"]
-                        summary = self._summarize_history_segment(
-                            logs_to_summarize, start_step, end_step,
-                            previous_summary=self.last_full_summary
-                        )
-                    else:
-                        # First time: summarize all logs without previous summary
-                        logs_to_summarize = self.action_logs
-                        start_step = logs_to_summarize[0]["step"]
-                        end_step = logs_to_summarize[-1]["step"]
-                        summary = self._summarize_history_segment(logs_to_summarize, start_step, end_step)
-
-                    self.last_full_summary = summary
-                    self.last_summary_log_index = total_logs
-                    self.logger.info(f"[refinement] {summary}")
-                    
-                    # Clear conversation messages and last tool output after context refinement
-                    if self.wo_step:
-                        self.conversation_messages = []
-                        self.last_tool_output = None  # Clear observation as it's now in summary
-
                 planner_system_prompt = self._build_planner_system_prompt()
+                active_blocked_feedback = self._get_active_blocked_feedback()
 
                 # ========== Build Messages ==========
                 if self.wo_step:
@@ -1637,42 +2027,28 @@ class HiSA:
                         ):
                             first_content[0]["text"] = f'Task: {self.task_instruction}\n\n{first_content[0]["text"]}'
 
-                    if len(conversation_to_append) == 0:
-                        messages.append({"role": "user", "content": f"Task: {self.task_instruction}"})
-                        if self.past_pattern_text:
-                            messages.append({
-                                "role": "user",
-                                "content": f"Relevant past patterns:\n{self.past_pattern_text}"
-                            })
-                        if not self.wo_refinement and self.last_full_summary:
-                            messages.append({
-                                "role": "user",
-                                "content": f"Summary of previous steps:\n{self.last_full_summary}"
-                            })
                     messages.extend(conversation_to_append)
 
+                    observation_text = self.last_tool_output or ""
                     if self.last_tool_output:
-                        messages.append({
-                            "role": "user",
-                            "content": f"Observation from previous action:\n{self.last_tool_output}"
-                        })
                         self.last_tool_output = None
 
-                    if self.last_error_feedback:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n\n"
-                                "Please fix the error and try again."
-                            )
-                        })
-                    else:
-                        prompt_text = (
-                            "Based on the execution history and current screenshot, what is the next action?"
-                            if len(conversation_to_append) == 0
-                            else "Based on the conversation history and current screenshot, what is the next action?"
-                        )
-                        messages.append({"role": "user", "content": prompt_text})
+                    prompt_text = (
+                        "Based on the execution history and current screenshot, what is the next action?"
+                        if len(conversation_to_append) == 0
+                        else "Based on the conversation history and current screenshot, what is the next action?"
+                    )
+                    if active_blocked_feedback:
+                        prompt_text += "\nPlease use the blocked feedback above to correct the next step."
+
+                    context_message = self._build_planner_context_message(
+                        include_task_header=(len(conversation_to_append) == 0),
+                        prompt_text=prompt_text,
+                        observation_text=observation_text,
+                        blocked_feedback_text=active_blocked_feedback,
+                    )
+                    if context_message:
+                        messages.append(context_message)
 
                     current_user_message = {
                         "role": "user",
@@ -1689,7 +2065,6 @@ class HiSA:
 
                     condensed_history = []
                     if not self.wo_refinement and self.last_full_summary:
-                        condensed_history = [self.last_full_summary]
                         for log in self.action_logs[self.last_summary_log_index:]:
                             if log.get("compact"):
                                 condensed_history.append(self._render_compact_log(log))
@@ -1702,40 +2077,18 @@ class HiSA:
                             elif log.get("detail"):
                                 condensed_history.append(self._render_compact_log(log))
 
-                    messages = [
-                        {"role": "system", "content": planner_system_prompt},
-                        {"role": "user", "content": f"Task: {self.task_instruction}"}
-                    ]
-
-                    if self.past_pattern_text:
-                        messages.append({
-                            "role": "user",
-                            "content": f"Relevant past patterns:\n{self.past_pattern_text}"
-                        })
-                    if not self.wo_refinement and self.last_full_summary:
-                        messages.append({
-                            "role": "user",
-                            "content": f"Summary of previous steps:\n{self.last_full_summary}"
-                        })
-                    for history_item in condensed_history:
-                        messages.append({
-                            "role": "user",
-                            "content": history_item
-                        })
-
-                    if self.last_error_feedback:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"<error_feedback>\n{self.last_error_feedback}\n</error_feedback>\n\n"
-                                "Please fix the error and try again."
-                            )
-                        })
-                    else:
-                        messages.append({
-                            "role": "user",
-                            "content": "Based on the execution history and current screenshot, decide the next action. Prefer the shortest reliable path and avoid repeating failed actions."
-                        })
+                    messages = [{"role": "system", "content": planner_system_prompt}]
+                    prompt_text = "Based on the execution history and current screenshot, decide the next action. Prefer the shortest reliable path and avoid repeating failed actions."
+                    if active_blocked_feedback:
+                        prompt_text += "\nPlease use the blocked feedback above to correct the next step."
+                    context_message = self._build_planner_context_message(
+                        include_task_header=True,
+                        history_items=condensed_history,
+                        prompt_text=prompt_text,
+                        blocked_feedback_text=active_blocked_feedback,
+                    )
+                    if context_message:
+                        messages.append(context_message)
 
                     messages.append({
                         "role": "user",
@@ -1778,22 +2131,38 @@ class HiSA:
                 # Parse JSON
                 decision = json.loads(repair_json(json_str))
 
+                if "subgoal" not in decision:
+                    raise ValueError("Missing 'subgoal' field in decision")
+                decision["subgoal"] = self._normalize_subgoal(decision["subgoal"])
+
                 # Validate decision structure
                 if "tool" not in decision:
                     raise ValueError("Missing 'tool' field in decision")
-                if decision["tool"] not in ["gui_action", "bash_execution", "wait", "termination", "infeasible"]:
+                if decision["tool"] not in VALID_TOOLS:
                     raise ValueError(f"Invalid tool: {decision['tool']}")
-                if decision["tool"] == "gui_action":
-                    gui_input = decision.get("input") if isinstance(decision.get("input"), dict) else {}
-                    action_name = decision.get("action", gui_input.get("action"))
-                    allowed_actions = {
-                        "click", "left_click", "double_click", "doubleclick",
-                        "right_click", "rightclick", "move", "hover",
-                        "drag", "drag_to", "left_click_drag",
-                        "type", "write", "press", "hotkey", "scroll",
-                    }
-                    if not isinstance(action_name, str) or action_name.strip().lower() not in allowed_actions:
-                        raise ValueError(f"Invalid gui_action action: {action_name}")
+                if self._is_gui_tool(decision["tool"]):
+                    if "input" not in decision:
+                        raise ValueError(f"Missing 'input' for GUI tool: {decision['tool']}")
+                    if decision["tool"] == "scroll":
+                        decision["input"] = _coerce_scroll_input(decision.get("input"))
+                    if decision["tool"] in {"type", "press", "hotkey"} and decision.get("input") in [None, ""]:
+                        raise ValueError(f"Input for tool '{decision['tool']}' cannot be empty")
+                    if decision["tool"] == "scroll" and not isinstance(decision.get("input"), (int, float)):
+                        raise ValueError("Input for tool 'scroll' must be a number")
+                    if decision["tool"] in {"type", "press", "hotkey"} and not isinstance(decision.get("input"), str):
+                        raise ValueError(f"Input for tool '{decision['tool']}' must be a string")
+                    if decision["tool"] in GROUNDED_GUI_TOOLS:
+                        gui_input = decision.get("input")
+                        has_description = isinstance(gui_input, str) and bool(gui_input.strip())
+                        thought_text = str(decision.get("thought", "") or "").strip()
+                        if not has_description and not thought_text:
+                            raise ValueError(f"Grounded GUI tool '{decision['tool']}' requires input description or thought")
+                elif decision["tool"] == "bash_execution":
+                    if "command" not in decision and "input" not in decision:
+                        raise ValueError("Missing command/input for bash_execution")
+                    command_value = decision["command"] if "command" in decision else decision["input"]
+                    if not isinstance(command_value, str) or not command_value.strip():
+                        raise ValueError("bash_execution requires a non-empty command string")
 
                 try:
                     self.logger.info(f"[decision]: {json.dumps(decision, indent=4)}")
@@ -1801,6 +2170,7 @@ class HiSA:
                     self.logger.info(f"[decision]: {decision}")
 
                 # Clear error feedback on success
+                self.last_blocked_feedback = None
                 self.last_error_feedback = None
                 
                 # Store conversation for wo_step mode ONLY after successful parsing
@@ -1849,50 +2219,36 @@ class HiSA:
                     # Continue to next retry
                     continue
                 else:
-                    # Last attempt failed, return None
                     self.logger.error("All retry attempts exhausted, cannot get valid decision")
                     with open(os.path.join(self.save_dir, "err_reason.txt"), "w") as f:
                         f.write("All retry attempts exhausted, cannot get valid decision")
-                    return None
-        
-        return None
+                    raise ValueError("All retry attempts exhausted, cannot get valid decision")
 
     def _execute_tool(self, decision: Dict) -> str:
         """Execute tool based on decision and return execution result text."""
-        tool = decision.get("tool", "")
-        description = decision.get("description", "")
+        tool = decision["tool"]
+        description = self._build_action_description(decision)
 
         # Store thought for step_abstract
         self.current_thought = decision.get("thought", "")
+        self.current_proposed_subgoal = self._normalize_subgoal(decision["subgoal"])
 
-        if tool == "gui_action":
-            gui_input = {}
-            if isinstance(decision.get("input"), dict):
-                gui_input.update(decision["input"])
-            for key in [
-                "action", "x", "y", "x1", "y1", "x2", "y2",
-                "start_x", "start_y", "end_x", "end_y",
-                "text", "value", "key", "keys", "amount",
-                "command", "action_type",
-            ]:
-                if key in decision:
-                    gui_input[key] = decision[key]
-            return self._gui_action(gui_input, description)
+        if self._is_gui_tool(tool):
+            return self._execute_gui_tool(tool, decision["input"], description)
 
         elif tool == "bash_execution":
-            command = decision.get("command", decision.get("input", ""))
+            command = decision["command"] if "command" in decision else decision["input"]
             return self._bash_execution(command)
 
         elif tool == "wait":
-            seconds = decision.get("seconds", decision.get("input", ""))
-            return self._wait(seconds)
+            return self._wait()
 
-        return ""
+        raise ValueError(f"Unsupported tool in _execute_tool: {tool}")
 
     def _normalize_bash_command(self, code: str) -> str:
         """Normalize bash command to enforce non-interactive sudo usage."""
         if not isinstance(code, str) or not code.strip():
-            return code
+            raise ValueError("Bash command must be a non-empty string")
 
         # Collapse common forms to plain "sudo ...":
         # "echo '' | sudo -S cmd", "echo 'password' | sudo -S cmd", "sudo -S cmd"
@@ -1910,7 +2266,7 @@ class HiSA:
         return normalized.strip()
 
     def _normalize_pyautogui_code(self, code: str) -> str:
-        """Normalize planner-produced gui_action code before parsing/execution."""
+        """Normalize planner-produced pyautogui code before parsing/execution."""
         if not isinstance(code, str) or not code.strip():
             return code
 
@@ -1919,98 +2275,38 @@ class HiSA:
         # the redundant x=/y= markers and preserve all other kwargs.
         return re.sub(r"(?<=\(|,)\s*([xy])\s*=\s*", "", code)
 
-    def _normalize_gui_action_input(self, code):
-        """Normalize gui_action input to the dict format expected by desktop_env.step."""
-        if isinstance(code, dict):
-            normalized = dict(code)
-            command = normalized.get("command")
-            action = normalized.get("action")
-            x = normalized.get("x")
-            y = normalized.get("y")
-            x1 = normalized.get("x1", normalized.get("start_x"))
-            y1 = normalized.get("y1", normalized.get("start_y"))
-            x2 = normalized.get("x2", normalized.get("end_x"))
-            y2 = normalized.get("y2", normalized.get("end_y"))
-            text = normalized.get("text", normalized.get("value"))
-            key = normalized.get("key")
-            keys = normalized.get("keys")
-            amount = normalized.get("amount")
-
-            # Support structured planner outputs like:
-            # {"action": "click", "description": "..."}
-            # {"action": "click", "x": 123, "y": 456}
-            if (not isinstance(command, str) or not command.strip()) and isinstance(action, str):
-                normalized_action = action.strip().lower()
-
-                def have_point(px, py):
-                    return isinstance(px, (int, float)) and isinstance(py, (int, float))
-
-                if normalized_action in ["click", "left_click"]:
-                    command = (
-                        f"pyautogui.click({int(x)}, {int(y)})"
-                        if have_point(x, y)
-                        else "pyautogui.click(X_COORD, Y_COORD)"
-                    )
-                elif normalized_action in ["double_click", "doubleclick"]:
-                    command = (
-                        f"pyautogui.doubleClick({int(x)}, {int(y)})"
-                        if have_point(x, y)
-                        else "pyautogui.doubleClick(X_COORD, Y_COORD)"
-                    )
-                elif normalized_action in ["right_click", "rightclick"]:
-                    command = (
-                        f"pyautogui.rightClick({int(x)}, {int(y)})"
-                        if have_point(x, y)
-                        else "pyautogui.rightClick(X_COORD, Y_COORD)"
-                    )
-                elif normalized_action in ["move", "hover"]:
-                    command = (
-                        f"pyautogui.moveTo({int(x)}, {int(y)})"
-                        if have_point(x, y)
-                        else "pyautogui.moveTo(X_COORD, Y_COORD)"
-                    )
-                elif normalized_action in ["drag", "drag_to", "left_click_drag"]:
-                    if have_point(x1, y1) and have_point(x2, y2):
-                        command = (
-                            f"pyautogui.moveTo({int(x1)}, {int(y1)}); "
-                            f"pyautogui.dragTo({int(x2)}, {int(y2)}, duration=0.5, button='left')"
-                        )
-                    else:
-                        command = (
-                            "pyautogui.moveTo(START_X_COORD, START_Y_COORD); "
-                            "pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')"
-                        )
-                elif normalized_action in ["type", "write"] and isinstance(text, str):
-                    command = f"pyautogui.write({text!r})"
-                elif normalized_action == "press" and isinstance(key, str):
-                    command = f"pyautogui.press({key!r})"
-                elif normalized_action == "hotkey":
-                    hotkey_keys = keys if isinstance(keys, list) else normalized.get("keys")
-                    if isinstance(hotkey_keys, list) and hotkey_keys:
-                        rendered = ", ".join(repr(str(k)) for k in hotkey_keys)
-                        command = f"pyautogui.hotkey({rendered})"
-                elif normalized_action == "scroll":
-                    if isinstance(amount, (int, float)):
-                        scroll_amount = int(amount)
-                    else:
-                        scroll_amount = -5
-                    if have_point(x, y):
-                        command = f"pyautogui.moveTo({int(x)}, {int(y)}); pyautogui.scroll({scroll_amount})"
-                    else:
-                        command = "pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll(" + str(scroll_amount) + ")"
-
-                if isinstance(command, str) and command.strip():
-                    normalized["command"] = command
-                    self.logger.info(f"[gui_action.normalize] action={normalized_action} -> command={command}")
-
-            if isinstance(command, str) and command.strip():
-                normalized["command"] = self._normalize_pyautogui_code(command)
-            normalized["action_type"] = normalized.get("action_type", "pyautogui")
-            return normalized
+    def _normalize_gui_tool_input(self, tool: str, code):
+        """Normalize GUI-tool input to the dict format expected by desktop_env.step."""
+        if tool == "click" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": "pyautogui.click(X_COORD, Y_COORD)"}
+        if tool == "double_click" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": "pyautogui.doubleClick(X_COORD, Y_COORD)"}
+        if tool == "right_click" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": "pyautogui.rightClick(X_COORD, Y_COORD)"}
+        if tool == "move" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": "pyautogui.moveTo(X_COORD, Y_COORD)"}
+        if tool == "drag" and isinstance(code, str):
+            return {
+                "tool": tool,
+                "action_type": "pyautogui",
+                "command": "pyautogui.moveTo(START_X_COORD, START_Y_COORD); pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')",
+            }
+        if tool == "scroll" and isinstance(code, (int, float)):
+            return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll({int(code)})"}
+        if tool == "type" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.write({code!r})"}
+        if tool == "press" and isinstance(code, str):
+            return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.press({code!r})"}
+        if tool == "hotkey" and isinstance(code, str) and code.strip():
+            keys = [part.strip() for part in re.split(r"\s*\+\s*", code.strip()) if part.strip()]
+            if keys:
+                rendered = ", ".join(repr(str(k)) for k in keys)
+                return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.hotkey({rendered})"}
 
         normalized_code = self._normalize_pyautogui_code(code)
         if isinstance(normalized_code, str) and normalized_code.strip():
             return {
+                "tool": tool,
                 "action_type": "pyautogui",
                 "command": normalized_code,
             }
@@ -2021,7 +2317,7 @@ class HiSA:
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            raise ValueError(f"Failed to parse gui_action code: {e}") from e
+            raise ValueError(f"Failed to parse GUI tool code: {e}") from e
 
         statements = []
         for stmt in tree.body:
@@ -2099,7 +2395,7 @@ class HiSA:
         return int(match.group(1)), int(match.group(2))
 
     def _ground_gui_code(self, code: str, description: str, screenshot: bytes) -> str:
-        """Auto-ground mouse-position gui_action code from action type and description."""
+        """Auto-ground mouse-position GUI tool code from action type and description."""
         if not isinstance(code, str) or not code.strip():
             return code
 
@@ -2113,7 +2409,7 @@ class HiSA:
         )
         if has_placeholders:
             if not description:
-                raise ValueError("Description required when using placeholders")
+                raise ValueError("Grounding requires action intent, but thought was empty.")
             return self._call_visual_grounder(description, screenshot, grounded_code)
         statements = self._parse_pyautogui_code(grounded_code)
 
@@ -2129,7 +2425,7 @@ class HiSA:
             end_x, end_y = self._extract_grounded_point(end_cmd)
             drag_stmt = self._find_first_call(statements, "dragTo")
             if drag_stmt is None:
-                raise ValueError("Failed to find dragTo action in gui_action code")
+                raise ValueError("Failed to find dragTo action in GUI tool code")
             move_stmt = self._find_first_call(statements, "moveTo")
             if move_stmt is not None:
                 self._set_call_point(move_stmt, start_x, start_y)
@@ -2145,24 +2441,24 @@ class HiSA:
         )
         if matched_single_action:
             if not description:
-                raise ValueError(f"Description is required for {matched_single_action} actions")
+                raise ValueError(f"Grounding requires action intent for {matched_single_action}, but thought was empty.")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             point_x, point_y = self._extract_grounded_point(grounded_point)
             action_stmt = self._find_first_call(statements, matched_single_action)
             if action_stmt is None:
-                raise ValueError(f"Failed to find {matched_single_action} action in gui_action code")
+                raise ValueError(f"Failed to find {matched_single_action} action in GUI tool code")
             self._set_call_point(action_stmt, point_x, point_y)
             return self._serialize_pyautogui_code(statements)
 
         if "pyautogui.scroll(" in grounded_code:
             if not description:
-                raise ValueError("Description is required for scroll actions")
+                raise ValueError("Grounding requires action intent for scroll, but thought was empty.")
             grounded_point = self._call_visual_grounder(description, screenshot, "pyautogui.moveTo(X_COORD, Y_COORD)")
             x, y = self._extract_grounded_point(grounded_point)
             move_stmt = self._find_first_call(statements, "moveTo")
             scroll_stmt = self._find_first_call(statements, "scroll")
             if scroll_stmt is None:
-                raise ValueError("Failed to find scroll action in gui_action code")
+                raise ValueError("Failed to find scroll action in GUI tool code")
             scroll_kwargs = dict(scroll_stmt["kwargs"])
             if "x" in scroll_kwargs or "y" in scroll_kwargs:
                 self._set_call_point(scroll_stmt, x, y)
@@ -2226,14 +2522,14 @@ class HiSA:
             raise ValueError(f"[GTA1] Expected (x, y) tuple, got: {py_cmd}")
         return py_cmd
 
-    def _gui_action(self, code: str, description: str = "") -> str:
-        """Execute gui_action tool - pyautogui code with optional placeholder replacement."""
-        code = self._normalize_gui_action_input(code)
+    def _execute_gui_tool(self, tool: str, code: Any, description: str = "") -> str:
+        """Execute a concrete GUI tool via pyautogui code with optional grounding."""
+        code = self._normalize_gui_tool_input(tool, code)
         requested_action_fingerprint = self._hash_text(code)
         if description:
-            self.logger.info(f"[gui_action] {description}")
+            self.logger.info(f"[{tool}] {description}")
         else:
-            self.logger.info(f"[gui_action] {code}")
+            self.logger.info(f"[{tool}] {code}")
 
         # Record step start time
         step_start_time = time.time()
@@ -2262,46 +2558,53 @@ class HiSA:
                 final_code = postprocess_action(code)
             obs, *_ = self.env.step(final_code, self.sleep_after_execution)
 
-            # Wait 10 seconds for action to take effect
-            time.sleep(10)
-
-            # Get after screenshot and evaluate
-            after_screenshot = obs['screenshot']
+            observed_screenshot = obs.get('screenshot') if isinstance(obs, dict) else None
+            after_screenshot, env_changed, wait_elapsed = self._wait_for_environment_change(
+                before_screenshot,
+                timeout_seconds=self.post_action_wait_timeout,
+                initial_after_screenshot=observed_screenshot,
+            )
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(after_screenshot)
 
             # Create description for step abstraction
             eval_desc = description if description else code
             
-            # Skip step abstraction if wo_step is True
-            if self.wo_step:
-                step_abstraction = ""
-            else:
-                step_abstraction = "Result: " + self._step_abstraction_result(
-                    before_screenshot, after_screenshot, eval_desc,
-                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
-                )
-                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
+            blocked_hint = (
+                f"no_visible_change after {wait_elapsed:.1f}s"
+                if not env_changed else ""
+            )
+            step_abstraction_result = self._step_abstraction(
+                before_screenshot, after_screenshot, eval_desc,
+                blocked_hint=blocked_hint,
+                wo_roi=self.wo_roi, roi_margin=self.roi_margin
+            )
+            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
+            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
             thought_prefix = self.current_thought if self.current_thought else ""
             if description:
                 step_abstract = (
                     f"Step {step}:\n"
-                    f"GUI action.\n"
+                    f"GUI tool: {tool}.\n"
                     f"Description: {description}.\n"
                     f"Code: {final_code}."
                 )
             else:
                 step_abstract = (
                     f"Step {step}:\n"
-                    f"GUI action.\n"
+                    f"GUI tool: {tool}.\n"
                     f"Code: {final_code}."
                 )
             if thought_prefix:
                 step_abstract += f"\nReasoning: {thought_prefix}"
-            if step_abstraction:
-                step_abstract += f"\n{step_abstraction}"
+            if step_abstraction_summary:
+                step_abstract += f"\n{step_abstraction_summary}"
+            step_abstract += (
+                f"\nWait observation: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s."
+            )
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -2311,17 +2614,21 @@ class HiSA:
 
             self.action_logs.append({
                 "step": step,
-                "type": "gui_action",
+                "type": tool,
                 "description": description,
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "detail": description or str(final_code),
+                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
-                    tool_type="gui_action",
+                    tool_type=tool,
                     success=True,
                     detail=description or final_code,
-                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else "",
+                    verification=(
+                        (step_abstraction_summary.replace("Result: ", "") + f" Wait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s.")
+                        if step_abstraction_summary else f"wait={'changed' if env_changed else 'timeout'} after {wait_elapsed:.1f}s"
+                    ),
                     next_hint="Verify the exact requested outcome before terminating."
                 ),
                 "step_time": round(step_time, 2),
@@ -2329,29 +2636,34 @@ class HiSA:
                 "loop_action_fingerprint": requested_action_fingerprint,
                 "loop_result_fingerprint": result_fingerprint
             })
+            if not env_changed:
+                self.last_blocked_feedback_event = {
+                    "type": "no_visible_change",
+                    "detail": description or str(final_code),
+                }
 
             # Return execution result text for wo_step mode
             if description:
-                return f"GUI Action: {description}\nCode: {final_code}\nStatus: Success\n{step_abstraction}"
+                return f"GUI Tool ({tool}): {description}\nCode: {final_code}\nStatus: Success\nWait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s\n{step_abstraction_summary}"
             else:
-                return f"GUI Action Code: {final_code}\nStatus: Success\n{step_abstraction}"
+                return f"GUI Tool ({tool}) Code: {final_code}\nStatus: Success\nWait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s\n{step_abstraction_summary}"
 
         except Exception as e:
-            self.logger.error(f"GUI action execution error: {e}")
+            self.logger.error(f"GUI tool execution error ({tool}): {e}")
 
             # Generate step_abstract for error
             thought_prefix = self.current_thought if self.current_thought else ""
             if description:
                 step_abstract = (
                     f"Step {step}:\n"
-                    f"GUI action failed.\n"
+                    f"GUI tool failed: {tool}.\n"
                     f"Description: {description}.\n"
                     f"Code: {code}."
                 )
             else:
                 step_abstract = (
                     f"Step {step}:\n"
-                    f"GUI action failed.\n"
+                    f"GUI tool failed: {tool}.\n"
                     f"Code: {code}."
                 )
             if thought_prefix:
@@ -2364,35 +2676,40 @@ class HiSA:
 
             self.action_logs.append({
                 "step": step,
-                "type": "gui_action",
+                "type": tool,
                 "description": description,
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "detail": description or str(code),
+                "subgoal_status": "blocked",
                 "compact": self._build_compact_log_entry(
                     step=step,
-                    tool_type="gui_action",
+                    tool_type=tool,
                     success=False,
                     detail=description or code,
                     verification=f"Error: {str(e)}",
-                    next_hint="Switch target or tool instead of repeating the same GUI action."
+                    next_hint="Switch target or tool instead of repeating the same GUI interaction."
                 ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": requested_action_fingerprint,
                 "loop_result_fingerprint": result_fingerprint
             })
+            self.last_blocked_feedback_event = {
+                "type": "tool_execution_failed",
+                "detail": str(e),
+            }
 
             # Return execution result text for wo_step mode
             if description:
-                return f"GUI Action: {description}\nCode: {code}\nStatus: Failed\nError: {str(e)}"
+                return f"GUI Tool ({tool}): {description}\nCode: {code}\nStatus: Failed\nError: {str(e)}"
             else:
-                return f"GUI Action Code: {code}\nStatus: Failed\nError: {str(e)}"
+                return f"GUI Tool ({tool}) Code: {code}\nStatus: Failed\nError: {str(e)}"
 
-    def _step_abstraction_result(self, before_screenshot: bytes, after_screenshot: bytes,
-            action_description: str, wo_roi: bool = False,
-            roi_margin: int = 50) -> str:
-        """Abstract step by comparing before/after screenshots.
+    def _step_abstraction(self, before_screenshot: Optional[bytes], after_screenshot: Optional[bytes],
+            action_description: str, blocked_hint: str = "", wo_roi: bool = False,
+            roi_margin: int = 50, bash_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        """Abstract step from GUI screenshots or bash execution observations.
 
         Args:
             before_screenshot: Screenshot before action
@@ -2400,127 +2717,94 @@ class HiSA:
             action_description: Description of the action performed
             wo_roi: If True, disable ROI cropping (default: False means ROI cropping is enabled)
             roi_margin: Margin to add around ROI when cropping (default: 50)
+            bash_context: Optional bash execution payload for non-GUI steps
 
         Returns:
-            Step abstract text (e.g., "Succeeded. Menu opened." or "Failed. No UI change.")
+            Dict with summary and subgoal_status.
         """
         try:
-            # Convert screenshots to PIL Images for ROI detection
-            before_img = Image.open(io.BytesIO(before_screenshot))
-            after_img = Image.open(io.BytesIO(after_screenshot))
-            
-            # Check for size mismatch and log detailed info for debugging
-            if before_img.size != after_img.size:
-                self.logger.error(f"[ANOMALY] Screenshot size mismatch detected!")
-                
-                # Save problematic screenshots for later analysis
-                import datetime
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                error_dir = os.path.join(self.operations_dir, "size_mismatch_errors")
-                os.makedirs(error_dir, exist_ok=True)
-                before_img.save(os.path.join(error_dir, f"{timestamp}_before.png"))
-                after_img.save(os.path.join(error_dir, f"{timestamp}_after.png"))
-                self.logger.error(f"  Saved error screenshots to: {error_dir}")
-                
-            # Optionally crop to change ROI (enabled by default, disabled when wo_roi=True)
-            if not wo_roi:
-                try:
-                    cropped_before, cropped_after = get_change_roi(
-                        before_img, after_img,
-                        margin=roi_margin,
-                    )
-
-                    # If ROI detected, use cropped images
-                    if cropped_before is not None and cropped_after is not None:
-                        before_img = cropped_before
-                        after_img = cropped_after
-                    else:
-                        # No change detected - directly return without calling LLM
-                        return "No change detected."
-                except Exception as roi_error:
-                    self.logger.warning(f"ROI detection failed, using full screenshots: {roi_error}")
-
-            # Convert (possibly cropped) images to base64
-            before_buffer = io.BytesIO()
-            after_buffer = io.BytesIO()
-            before_img.save(before_buffer, format="PNG")
-            after_img.save(after_buffer, format="PNG")
-
-            before_b64 = base64.b64encode(before_buffer.getvalue()).decode("utf-8")
-            after_b64 = base64.b64encode(after_buffer.getvalue()).decode("utf-8")
-
             prompt = STEP_ABSTRACTION_PROMPT.format(
-                action_description=action_description
+                previous_subgoal=self.current_subgoal if self.current_subgoal else "None",
+                proposed_subgoal=self.current_proposed_subgoal if self.current_proposed_subgoal else "None",
+                action_description=action_description,
+                blocked_hint=blocked_hint if blocked_hint else "None",
             )
+            if bash_context is not None:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Bash execution observations:\n"
+                            f"Command:\n{bash_context.get('code', '')}\n\n"
+                            f"Status: {bash_context.get('status', '')}\n"
+                            f"Exit code: {bash_context.get('exitcode', '')}\n\n"
+                            f"Output:\n{bash_context.get('logs', '')}\n\n"
+                            f"{prompt}"
+                        ),
+                    }
+                ]
+            else:
+                if before_screenshot is None or after_screenshot is None:
+                    raise ValueError("GUI step abstraction requires before and after screenshots")
 
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Before screenshot:"},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{before_b64}"},
-                        {"type": "input_text", "text": "After screenshot:"},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{after_b64}"},
-                        {"type": "input_text", "text": prompt}
-                    ]
-                }
-            ]
-            self._dump_prompt_entry(
-                stage="step_abstraction",
-                payload={"messages": messages},
-            )
+                before_img = Image.open(io.BytesIO(before_screenshot))
+                after_img = Image.open(io.BytesIO(after_screenshot))
 
-            step_abstraction = self.state_manager_llm(
-                messages,
-                enable_thinking=False,
-            )
-            self._dump_prompt_entry(
-                stage="step_abstraction_response",
-                payload=step_abstraction,
-            )
-            return step_abstraction.strip()
+                if before_img.size != after_img.size:
+                    self.logger.error(f"[ANOMALY] Screenshot size mismatch detected!")
+
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    error_dir = os.path.join(self.operations_dir, "size_mismatch_errors")
+                    os.makedirs(error_dir, exist_ok=True)
+                    before_img.save(os.path.join(error_dir, f"{timestamp}_before.png"))
+                    after_img.save(os.path.join(error_dir, f"{timestamp}_after.png"))
+                    self.logger.error(f"  Saved error screenshots to: {error_dir}")
+
+                if not wo_roi:
+                    try:
+                        cropped_before, cropped_after = get_change_roi(
+                            before_img, after_img,
+                            margin=roi_margin,
+                        )
+
+                        if cropped_before is not None and cropped_after is not None:
+                            before_img = cropped_before
+                            after_img = cropped_after
+                        else:
+                            raise ValueError("Step abstraction found no visual change ROI")
+                    except Exception as roi_error:
+                        self.logger.warning(f"ROI detection failed, using full screenshots: {roi_error}")
+
+                before_buffer = io.BytesIO()
+                after_buffer = io.BytesIO()
+                before_img.save(before_buffer, format="PNG")
+                after_img.save(after_buffer, format="PNG")
+
+                before_b64 = base64.b64encode(before_buffer.getvalue()).decode("utf-8")
+                after_b64 = base64.b64encode(after_buffer.getvalue()).decode("utf-8")
+
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Before screenshot:"},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{before_b64}"},
+                            {"type": "input_text", "text": "After screenshot:"},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{after_b64}"},
+                            {"type": "input_text", "text": prompt}
+                        ]
+                    }
+                ]
+
+            self._dump_prompt_entry(stage="step_abstraction", payload={"messages": messages})
+            step_abstraction = self.state_manager_llm(messages, enable_thinking=False)
+            self._dump_prompt_entry(stage="step_abstraction_response", payload=step_abstraction)
+            return self._parse_abstraction_payload(step_abstraction.strip())
 
         except Exception as e:
             self.logger.error(f"Failed to abstract step: {e}")
-            return "Step abstraction failed due to error."
-
-    def _bash_output_abstraction_result(self, code: str, logs: str, status: str, exitcode: int) -> str:
-        """Abstract bash execution result from command output instead of screenshots."""
-        try:
-            messages = [
-                {"role": "system", "content": BASH_OUTPUT_ABSTRACTION_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Command:\n{code}\n\n"
-                        f"Status: {status}\n"
-                        f"Exit code: {exitcode}\n\n"
-                        f"Output:\n{logs}"
-                    ),
-                },
-            ]
-            self._dump_prompt_entry(
-                stage="bash_output_abstraction",
-                payload={"messages": messages},
-            )
-            step_abstraction = self.state_manager_llm(
-                messages,
-                enable_thinking=False,
-            )
-            self._dump_prompt_entry(
-                stage="bash_output_abstraction_response",
-                payload=step_abstraction,
-            )
-            return step_abstraction.strip()
-        except Exception as e:
-            self.logger.error(f"Failed to abstract bash output: {e}")
-            status_str = "Succeeded" if exitcode == 0 and status == "success" else "Failed"
-            fallback_output = (logs or "").strip().replace("\n", " ")
-            if len(fallback_output) > 200:
-                fallback_output = fallback_output[:200] + "..."
-            if fallback_output:
-                return f"{status_str}. {fallback_output}"
-            return f"{status_str}. No output."
+            raise
 
     def _bash_execution(self, code: str) -> str:
         """Execute bash commands or Python scripts (not pyautogui)."""
@@ -2577,32 +2861,38 @@ except subprocess.TimeoutExpired as e:
             if status != "success" and output_dict.get("error"):
                 logs = (logs + "\n" + output_dict.get("error", "")).strip()
 
-            # Wait 10 seconds for action to take effect
-            time.sleep(10)
-
-            # Get after screenshot
-            after_screenshot = self.env.controller.get_screenshot()
+            before_screenshot = self.env.controller.get_screenshot()
+            after_screenshot, env_changed, wait_elapsed = self._wait_for_environment_change(
+                before_screenshot,
+                timeout_seconds=self.post_action_wait_timeout,
+            )
             screenshot_file = f"step_{step}.png"
 
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(after_screenshot)
 
-            # Step abstraction for bash execution
-            # Skip step abstraction if wo_step is True
-            if self.wo_step:
-                step_abstraction = ""
-            else:
-                step_abstraction = "Result: " + self._bash_output_abstraction_result(
-                    code=code,
-                    logs=logs,
-                    status=status,
-                    exitcode=exitcode,
-                )
-                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
+            blocked_hint = ""
+            if exitcode != 0 or status != "success":
+                blocked_hint = logs or f"exitcode={exitcode}"
+            step_abstraction_result = self._step_abstraction(
+                before_screenshot=None,
+                after_screenshot=None,
+                action_description=f"Bash command: {code}",
+                blocked_hint=blocked_hint,
+                bash_context={
+                    "code": code,
+                    "logs": logs,
+                    "status": status,
+                    "exitcode": exitcode,
+                },
+            )
+            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
+            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract summary
             thought_prefix = self.current_thought if self.current_thought else ""
-            if step_abstraction:
+            if step_abstraction_summary:
                 step_abstract = (
                     f"Step {step}:\n"
                     f"Bash command.\n"
@@ -2616,10 +2906,13 @@ except subprocess.TimeoutExpired as e:
                 )
             if thought_prefix:
                 step_abstract += f"\nReasoning: {thought_prefix}"
-            if step_abstraction:
-                step_abstract += f"\n{step_abstraction}"
+            if step_abstraction_summary:
+                step_abstract += f"\n{step_abstraction_summary}"
+            step_abstract += (
+                f"\nWait observation: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s."
+            )
             result_fingerprint = self._hash_text(
-                f"status={status}|exitcode={exitcode}|output={logs}"
+                f"status={status}|exitcode={exitcode}|output={logs}|wait={'changed' if env_changed else 'timeout'}"
             )
 
             # Calculate step execution time
@@ -2631,12 +2924,16 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": exitcode == 0 and status == "success",
                 "screenshot": screenshot_file,
                 "detail": code,
+                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
                     success=(exitcode == 0 and status == "success"),
                     detail=code,
-                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else f"exitcode={exitcode}",
+                    verification=(
+                        (step_abstraction_summary.replace("Result: ", "") + f" Wait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s.")
+                        if step_abstraction_summary else f"exitcode={exitcode}; wait={'changed' if env_changed else 'timeout'} after {wait_elapsed:.1f}s"
+                    ),
                     next_hint="Use the command output to decide whether GUI verification is still needed."
                 ),
                 "step_time": round(step_time, 2),
@@ -2644,10 +2941,15 @@ except subprocess.TimeoutExpired as e:
                 "loop_action_fingerprint": action_fingerprint,
                 "loop_result_fingerprint": result_fingerprint
             })
+            if exitcode != 0 or status != "success":
+                self.last_blocked_feedback_event = {
+                    "type": "tool_execution_failed",
+                    "detail": logs or f"exitcode={exitcode}",
+                }
 
             # Return execution result text for wo_step mode
             status_str = "Success" if (exitcode == 0 and status == "success") else "Failed"
-            return f"Bash Command: {code}\nStatus: {status_str}\nOutput:\n{logs}"
+            return f"Bash Command: {code}\nStatus: {status_str}\nWait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s\nOutput:\n{logs}"
             
         except Exception as e:
             self.logger.error(f"Bash execution error: {e}")
@@ -2676,6 +2978,7 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "detail": code,
+                "subgoal_status": "blocked",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
@@ -2688,21 +2991,18 @@ except subprocess.TimeoutExpired as e:
                 "loop_action_fingerprint": action_fingerprint,
                 "loop_result_fingerprint": result_fingerprint
             })
+            self.last_blocked_feedback_event = {
+                "type": "tool_execution_failed",
+                "detail": str(e),
+            }
 
             # Return execution result text for wo_step mode
             return f"Bash Command: {code}\nStatus: Failed\nError: {str(e)}"
 
-    def _wait(self, seconds_str: str) -> str:
-        """Wait for specified seconds and observe UI changes."""
-        try:
-            wait_seconds = float(seconds_str)
-            # Limit wait time to reasonable range
-            wait_seconds = max(5, min(wait_seconds, 60))
-        except:
-            self.logger.warning(f"Invalid wait time '{seconds_str}', using default 15 seconds")
-            wait_seconds = 15
-
-        self.logger.info(f"[wait] Waiting for {wait_seconds} seconds...")
+    def _wait(self) -> str:
+        """Wait until the environment changes or timeout is reached."""
+        wait_timeout = self.explicit_wait_timeout
+        self.logger.info(f"[wait] Polling for environment change with timeout={wait_timeout:.1f}s...")
 
         # Record step start time
         step_start_time = time.time()
@@ -2714,37 +3014,39 @@ except subprocess.TimeoutExpired as e:
             before_screenshot = self.env.controller.get_screenshot()
             screenshot_file = f"step_{step}.png"
 
-            # Wait
-            time.sleep(wait_seconds)
-
-            # Get after screenshot
-            after_screenshot = self.env.controller.get_screenshot()
+            after_screenshot, env_changed, wait_elapsed = self._wait_for_environment_change(
+                before_screenshot,
+                timeout_seconds=wait_timeout,
+            )
             with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
                 f.write(after_screenshot)
 
-            # Step abstraction for wait
-            # Skip step abstraction if wo_step is True
-            if self.wo_step:
-                step_abstraction = ""
-            else:
-                step_abstraction = "Result: " + self._step_abstraction_result(
-                    before_screenshot, after_screenshot,
-                    f"Waited {wait_seconds} seconds to observe UI changes",
-                    wo_roi=self.wo_roi, roi_margin=self.roi_margin
-                )
-                self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction}")
+            blocked_hint = (
+                f"wait timed out after {wait_elapsed:.1f}s"
+                if not env_changed else ""
+            )
+            step_abstraction_result = self._step_abstraction(
+                before_screenshot, after_screenshot,
+                f"Waited until the environment changed or timed out after {wait_timeout:.1f} seconds",
+                blocked_hint=blocked_hint,
+                wo_roi=self.wo_roi, roi_margin=self.roi_margin
+            )
+            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
+            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
             thought_prefix = self.current_thought if self.current_thought else ""
             step_abstract = (
                 f"Step {step}:\n"
                 f"Wait.\n"
-                f"Duration: {wait_seconds} seconds."
+                f"Mode: event-driven wait with timeout {wait_timeout:.1f} seconds."
             )
             if thought_prefix:
                 step_abstract += f"\nReasoning: {thought_prefix}"
-            if step_abstraction:
-                step_abstract += f"\n{step_abstraction}"
+            if step_abstraction_summary:
+                step_abstract += f"\n{step_abstraction_summary}"
+            step_abstract += f"\nOutcome: {'environment changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s."
 
             # Calculate step execution time
             step_time = time.time() - step_start_time
@@ -2754,21 +3056,30 @@ except subprocess.TimeoutExpired as e:
                 "type": "wait",
                 "execution_success": True,
                 "screenshot": screenshot_file,
-                "detail": f"waited {wait_seconds} seconds",
+                "detail": f"event-driven wait ({'changed' if env_changed else 'timeout'})",
+                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",
                     success=True,
-                    detail=f"waited {wait_seconds} seconds",
-                    verification=step_abstraction.replace("Result: ", "") if step_abstraction else "",
+                    detail=f"event-driven wait ({'changed' if env_changed else 'timeout'})",
+                    verification=(
+                        (step_abstraction_summary.replace("Result: ", "") + f" Outcome: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s.")
+                        if step_abstraction_summary else f"{'changed' if env_changed else 'timeout'} after {wait_elapsed:.1f}s"
+                    ),
                     next_hint="Check whether the requested UI state is now visible."
                 ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage
             })
+            if not env_changed:
+                self.last_blocked_feedback_event = {
+                    "type": "no_visible_change",
+                    "detail": f"event-driven wait timed out after {wait_elapsed:.1f}s",
+                }
 
             # Return execution result text for wo_step mode
-            return f"Wait: {wait_seconds}s\nStatus: Success\n{step_abstraction}"
+            return f"Wait: event-driven\nStatus: Success\nOutcome: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s\n{step_abstraction_summary}"
 
         except Exception as e:
             self.logger.error(f"Wait execution error: {e}")
@@ -2778,7 +3089,7 @@ except subprocess.TimeoutExpired as e:
             step_abstract = (
                 f"Step {step}:\n"
                 f"Wait failed.\n"
-                f"Duration: {wait_seconds} seconds."
+                f"Mode: event-driven wait with timeout {wait_timeout:.1f} seconds."
             )
             if thought_prefix:
                 step_abstract += f"\nReasoning: {thought_prefix}"
@@ -2792,21 +3103,26 @@ except subprocess.TimeoutExpired as e:
                 "type": "wait",
                 "execution_success": False,
                 "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
-                "detail": f"waited {wait_seconds} seconds",
+                "detail": "event-driven wait failed",
+                "subgoal_status": "blocked",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",
                     success=False,
-                    detail=f"waited {wait_seconds} seconds",
+                    detail="event-driven wait failed",
                     verification=f"Error: {str(e)}",
                     next_hint="Re-check the app state directly instead of relying on the failed wait."
                 ),
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage
             })
+            self.last_blocked_feedback_event = {
+                "type": "tool_execution_failed",
+                "detail": str(e),
+            }
 
             # Return execution result text for wo_step mode
-            return f"Wait: {wait_seconds}s\nStatus: Failed\nError: {str(e)}"
+            return f"Wait: event-driven\nStatus: Failed\nError: {str(e)}"
 
 
     def _evaluate_and_save(self, task_config: dict, additional_context: str,
@@ -2853,28 +3169,14 @@ except subprocess.TimeoutExpired as e:
             # self.logger.info("Closing temporary windows...")
             # self.env.step("pyautogui.press('esc')", 0.5)
 
-            # Wait for VM HTTP service to stabilize after task execution
-            self.logger.info("Waiting for VM to stabilize before evaluation...")
-            time.sleep(10)
-            
-            # Retry evaluation with exponential backoff to handle transient VM service issues
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    score = self.env.evaluate()
-                    break
-                except Exception as eval_error:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
-                        self.logger.warning(f"Evaluation attempt {attempt + 1} failed: {eval_error}. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        raise
+            # Poll evaluation until it succeeds or the timeout expires.
+            self.logger.info("Polling evaluation until the VM is ready...")
+            score = self._evaluate_with_polling()
         except Exception as e:
             self.logger.error(f"Evaluation failed after {max_retries} attempts: {e}")
             score = 0.0
 
-        gui_steps = len([log for log in self.action_logs if log["type"] == "gui_action"])
+        gui_steps = len([log for log in self.action_logs if log["type"] in GUI_ACTION_TOOLS])
         bash_steps = len([log for log in self.action_logs if log["type"] == "bash_execution"])
         wait_steps = len([log for log in self.action_logs if log["type"] == "wait"])
 

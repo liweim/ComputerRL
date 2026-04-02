@@ -5,15 +5,15 @@ git clone https://huggingface.co/Qwen/Qwen3.5-9B.git
 
 conda activate uitars
 export CUDA_VISIBLE_DEVICES=0
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name computerRL --model /data1/lwm/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /data1/lwm/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 > uitars.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name computerRL --model /home/weimingli/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /home/weimingli/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 > uitars.log 2>&1 &
 
 # 启动LLM
 conda activate uitars
-nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /data1/lwm/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 0.0.0.0 --port 1234 > gta1.log 2>&1 &
+nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /home/weimingli/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 0.0.0.0 --port 1234 > gta1.log 2>&1 &
 nohup python -m vllm.entrypoints.openai.api_server \
   --served-model-name qwen3.5-9b \
-  --model /data1/lwm/models/Qwen3.5-9B \
+  --model /home/weimingli/models/Qwen3.5-9B \
   --gpu-memory-utilization 0.4 \
   --max-model-len 65536 \
   --host 0.0.0.0 \
@@ -23,7 +23,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
 # 启动qwen3.5-9b with reasoning and tool choice
 nohup python -m vllm.entrypoints.openai.api_server \
   --served-model-name qwen3.5-9b \
-  --model /data1/lwm/models/Qwen3.5-9B \
+  --model /home/weimingli/models/Qwen3.5-9B \
   --gpu-memory-utilization 0.4 \
   --max-model-len 65536 \
   --host 0.0.0.0 \
@@ -34,7 +34,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
 
 # 启动embedding service
 conda activate uitars
-nohup python /data1/lwm/projects/ComputerRL/mm_agents/hisa/embedding.py > embedding.log 2>&1 &
+nohup python /home/weimingli/projects/ComputerRL/mm_agents/hisa/embedding.py > embedding.log 2>&1 &
 
 # 下载docker镜像
 git lfs install
@@ -59,7 +59,7 @@ conda activate spider2v
 nohup \
 python run_autoglm_v.py \
     --provider_name docker \
-    --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+    --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
     --result_dir results/computerRL_baseline \
     --headless \
     --max_steps 100 \
@@ -69,7 +69,7 @@ python run_autoglm_v.py \
 nohup \
 python run_autoglm_v_restart.py \
     --provider_name docker \
-    --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+    --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
     --result_dir results/computerRL_gta1-7b_restart_ori_res \
     --visual_grounder_model gta1-7b \
     --screen_width 1920 \
@@ -82,7 +82,7 @@ python run_autoglm_v_restart.py \
 nohup \
 python run_autoglm_v_restart.py \
     --provider_name docker \
-    --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+    --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
     --result_dir results/computerRL_qwen3.5-9b_gta1-7b_restart \
     --model qwen3.5-9b \
     --temperature 0.1 \
@@ -100,7 +100,7 @@ python run_autoglm_v_restart.py \
 nohup \
 python run_hisa.py \
   --provider_name docker \
-  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern \
   --headless \
   --max_steps 100 \
@@ -113,7 +113,7 @@ python run_hisa.py \
 nohup \
 python run_hisa.py \
   --provider_name docker \
-  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa_qwen3.5-9b_wo_refinement_pattern \
   --headless \
   --max_steps 100 \
@@ -126,7 +126,7 @@ nohup \
 python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
-  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa_qwen3.5-9b_wo_pattern \
   --headless \
   --max_steps 100 \
@@ -138,7 +138,7 @@ nohup \
 python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
-  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa_qwen3.5-9b \
   --headless \
   --max_steps 100 \
@@ -149,12 +149,23 @@ nohup \
 python run_hisa2.py \
   --provider_name docker \
   --vm_ram 8G \
-  --path_to_vm /data1/lwm/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
   --result_dir ./results/hisa2_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
-  > nohup5.out 2>&1 &
+  --test_all_meta_path ./evaluation_examples/test_medium1.json \
+  > nohup.out 2>&1 &
+
+nohup \
+python run_hisa2.py \
+  --provider_name docker \
+  --vm_ram 8G \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa2_qwen3.5-9b \
+  --headless \
+  --max_steps 100 \
+  --test_all_meta_path ./evaluation_examples/test_medium2.json \
+  > nohup2.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py
@@ -167,12 +178,12 @@ fuser -k 8001/tcp
 # debug
 Image.open(BytesIO(base64.b64decode(messages[-1]['content'][-1]['image_url'].split(",")[1]))).save('tmp/tmp.jpg')
 
-帮我分析一下/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern下面的任务的
-主要失败原因，只需要每个domain找两三个失败的例子分析一下，失败的例子汇总在/data1/lwm/projects/
+帮我分析一下/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern下面的任务的
+主要失败原因，只需要每个domain找两三个失败的例子分析一下，失败的例子汇总在/home/weimingli/projects/
 ComputerRL/results/task_success_failures.xlsx的hisa_qwen3.5-9b_wo_pattern这一列为0的样
-本，可以通过/data1/lwm/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern/*/*/
+本，可以通过/home/weimingli/projects/ComputerRL/results/hisa_qwen3.5-9b_wo_pattern/*/*/
 execution_log.json来看任务描述和每一步操作
-通过改prompt(/data1/lwm/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
+通过改prompt(/home/weimingli/projects/ComputerRL/mm_agents/hisa/main.py GLOBAL_PLANNER_PROMPT)来优化
 
 sudo npm install -g @openai/codex@latest
 
