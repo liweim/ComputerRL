@@ -153,24 +153,13 @@ python run_hisa2.py \
   --result_dir ./results/hisa2_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_one.json \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
   > nohup.out 2>&1 &
-
-nohup \
-python run_hisa2.py \
-  --provider_name docker \
-  --vm_ram 8G \
-  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa2_qwen3.5-9b \
-  --headless \
-  --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium2.json \
-  > nohup2.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py
 pkill -f run_autoglm_v_restart.py
-pkill -f run_hisa.py
+pkill -f run_hisa
 ps -fp 2011314
 tr '\0' ' ' < /proc/2010759/cmdline ; echo
 fuser -k 8001/tcp

@@ -9,5 +9,5 @@ when_to_use: Load when recent steps failed or the agent is stuck
 
 - If an action clearly failed, switch strategy: different target, different tool, or different command.
 - Do not repeat the same failed action sequence.
-- After async operations, use `wait` before judging the result.
+- The system observes the result after each action automatically; do not output `wait()`.
 - Use `infeasible` only when the task is objectively impossible after verification.

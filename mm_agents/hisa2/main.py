@@ -23,27 +23,35 @@ GUI_ACTION_TOOLS = {
     "right_click",
     "move",
     "drag",
+    "write",
     "type",
-    "press",
     "hotkey",
     "scroll",
 }
 GROUNDED_GUI_TOOLS = {"click", "double_click", "right_click", "move", "drag", "scroll"}
 NON_GUI_TOOLS = {"bash_execution", "wait", "termination", "infeasible"}
 VALID_TOOLS = GUI_ACTION_TOOLS | NON_GUI_TOOLS
+ACTION_SCRIPT_FUNCTIONS = {
+    "click",
+    "double_click",
+    "right_click",
+    "move",
+    "drag",
+    "write",
+    "hotkey",
+    "scroll",
+    "bash",
+    "termination",
+    "infeasible",
+}
 
 
-def _scroll_amount_from_instruction(value: str) -> int:
-    text = f" {str(value or '').strip().lower()} "
-    if not text:
-        raise ValueError("Input for tool 'scroll' cannot be empty")
-
-    # Use a fixed magnitude and infer direction from the instruction text.
-    if " up " in text:
-        return 10
-    if " down " in text:
-        return -10
-    raise ValueError("Input for tool 'scroll' must clearly specify direction, such as 'scroll up' or 'scroll down'")
+def _validate_scroll_amount(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("scroll amount must be an integer")
+    if value < -10 or value > 10:
+        raise ValueError("scroll amount must be within [-10, 10]")
+    return value
 
 
 # ==================== PROMPTS ====================
@@ -56,7 +64,7 @@ Core rules:
 - Never change the user's requested target, object, destination, or requirement to something nearby or easier.
 - Always review what the latest steps actually achieved before choosing the next action.
 - Use the latest screenshot as the source of truth for the current UI state.
-- If the current screenshot does not show the target yet, do not click it directly; reveal it first with scroll, wait, or another prerequisite action.
+- If the current screenshot does not show the target yet, do not click it directly; reveal it first with scroll or another prerequisite action.
 - Avoid repeating the same action when the latest screenshot and step evaluation show no meaningful new progress.
 - If the previous step did not produce the expected UI change, correct the mistake instead of mechanically repeating the same action.
 - Read visible text directly from screenshots when useful and record key evidence in `thought`.
@@ -66,38 +74,56 @@ Core rules:
 - Before termination, verify the exact requested outcome with concrete evidence from the current screenshot or a read-only command.
 - Do not terminate based only on a click succeeding, a popup/toast appearing, or a page/dialog opening.
 - If verification is inconclusive, continue working instead of terminating.
+- If the task cannot actually be completed because of a product limitation, missing capability, unsupported format, or objectively impossible constraint, use `infeasible(str)` instead of `termination(str)`.
+- Explaining why a task is impossible is not completion. Do not use `termination(...)` just because you explained the limitation.
 
 Response format:
 ```json
 {
     "thought": "string",
     "subgoal": "string",
-    "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
-    "input": "string"
+    "code": "string"
 }
 ```
 
 Field guide:
 - `thought`: brief reasoning about the next action, including key evidence from the screenshot or recent history when useful.
-- `subgoal`: the current phase-level objective you are working on; it should describe a meaningful stage of work, not a single low-level action. Good `subgoal` examples: `Locate the target file`, `Edit the requested fields`, `Verify the final output`. Bad `subgoal` examples: `Click the button`, `Wait`, `Press Enter`. Keep the same `subgoal` across multiple actions when they belong to the same stage. Change `subgoal` only when you intentionally move to a new stage or strategy.
-- `tool`: the one tool to execute next.
-- `input`: the string payload for that tool, see 'Tool guide' below. 
+- `subgoal`: the current phase-level objective you are working on; it should describe a meaningful stage of work, not a single low-level action. Good `subgoal` examples: `Locate the target file`, `Edit the requested fields`, `Verify the final output`. Bad `subgoal` examples: `Click the button`, `Press Enter`. Keep the same `subgoal` across multiple actions when they belong to the same stage. Change `subgoal` only when you intentionally move to a new stage or strategy.
+- `code`: Python-style action script to execute next. Use one function call per line. Actions run in order, and each action gets a fresh observation before the next action is grounded.
 
-Tool guide:
-- Allowed tools: `click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible`
-- `click` / `double_click` / `right_click` / `move` / `drag`: use a detailed, self-contained grounding instruction in `input`. Include the target element plus visible text, nearby anchors, panel/dialog location, relative position, or other screenshot-visible cues needed to disambiguate. Example: `{"tool": "click", "input": "Click the Submit button on the popup window"}`.
-- `type`: text to type. Example: `{"tool": "type", "input": "hello"}`
-- `press`: key to press. Example: `{"tool": "press", "input": "enter"}`
-- `hotkey`: shortcut. Example: `{"tool": "hotkey", "input": "ctrl+c"}`
-- `scroll`: use a detailed, self-contained grounding instruction in `input` that states both the target region and the direction to scroll. Must include "scroll up/down" in the `input`. Example: `{"tool": "scroll", "input": "Scroll down inside the destination dropdown on the left side panel"}`
-- `wait`: Example: `{"tool": "wait", "input": ""}`
-- `bash_execution`: command. Example: `{"tool": "bash_execution", "input": "ls -la"}`
-- `termination`: completion summary. Example: `{"tool": "termination", "input": "Task completed. [summary]"}`
-- `infeasible`: reason. Example: `{"tool": "infeasible", "input": "Detailed reason"}`
-"""
+Code guide:
+- Allowed functions: `click(str)`, `double_click(str)`, `right_click(str)`, `move(str)`, `drag(str, str, str)`, `write(str)`, `hotkey(str, ...)`, `scroll(str, int)`, `bash(str)`, `termination(str)`, `infeasible(str)`
+- For grounded GUI functions, use a detailed, self-contained instruction string that uniquely identifies the target on the current screenshot.
+- Every string argument in `code` must be a valid Python string literal. Put the entire natural-language instruction inside quotes. Good: `click("Click the Search engine option in the left sidebar of Chrome Settings")`. Bad: `click("Search engine" option in the left sidebar of Chrome Settings)`
+- `click(str)`, `double_click(str)`, `right_click(str)`, and `move(str)` each take exactly one string argument.
+- `drag(instruction, source, destination)`: `instruction` should describe the full drag action, and `source` / `destination` should name the start and end targets clearly. Example: `drag('Drag from cell A12 to cell A22 in column A', 'cell A12', 'cell A22')`
+- `scroll(description, amount)`: `description` must describe where to scroll, and `amount` must be an integer in `[-10, 10]`. Use a negative amount to scroll down and a positive amount to scroll up.
+- `write(str)`: text to type into the focused field. Put the entire text or spreadsheet formula inside one valid Python string literal. Example: `write('=TEXT(C2;\"0000000\")')`
+- `hotkey(...)`: pass one or more string arguments. Examples: `hotkey('ctrl', 'l')`, `hotkey('enter')` or `hotkey('ctrl+l')`. Do not output bare tokens like `backspace` or `enter`; always wrap them as function calls such as `hotkey('backspace')` or `hotkey('enter')`.
+- `bash(str)`: shell command to execute. Put the entire shell command inside one quoted string on a single line. Do not use heredoc syntax or place raw shell lines outside `bash(...)`. `bash(...)` may appear in a mixed action script when the sequence is necessary.
+- `termination(str)`: completion summary after the task is fully verified.
+- `infeasible(str)`: objective reason the task cannot be completed. Use `infeasible(...)` when the screenshot, app error message, or command output shows the requested end state cannot be achieved in this environment.
+
+- Response examples:
+```json
+{
+    "thought": "The address bar is visible and focused interaction is straightforward, so I can enter the URL and submit it in one short sequence.",
+    "subgoal": "Open the target website",
+    "code": "click('Click the browser address bar at the top of the window')\nwrite('https://example.com')\nhotkey('enter')"
+}
+```
+
+```json
+{
+    "thought": "The needed information is easier to verify from the shell than from the GUI, so I should run one read-only command.",
+    "subgoal": "Verify the generated file",
+    "code": "bash('ls -la ~/Downloads')"
+}
+```"""
 
 FIX_RESPONSE_PROMPT = """Error: Failed to parse your response.
 Error message: {error_message}
+{extra_guidance}
 
 Your response was:
 {response}
@@ -107,10 +133,15 @@ Please provide a valid JSON response in the exact format:
 {{
     "thought": "string",
     "subgoal": "string",
-    "tool": "click|double_click|right_click|move|drag|type|press|hotkey|scroll|wait|bash_execution|termination|infeasible",
-    "input": "string"
+    "code": "string"
 }}
-```"""
+```
+
+Important:
+- Always include `subgoal`
+- `code` must be Python-style action calls using only the allowed functions
+- Every string argument in `code` must be a valid quoted Python string literal
+- `scroll(...)` must have exactly two arguments: description string and integer amount in `[-10, 10]`"""
 
 STEP_ABSTRACTION_PROMPT = """Judge the latest executed step using the provided observations.
 
@@ -155,6 +186,8 @@ Rules:
 - Return only `pass` or `fail`.
 - Use `pass` only if the task requirements appear fully satisfied in the current screenshot and latest execution logs.
 - If there is uncertainty, return `fail`.
+- The screenshot is the primary evidence. If the screenshot does not directly show the requested final state, return `fail` even if prior logs claimed success.
+- Do not treat an explanation of impossibility, a shell message, or a transient status/toast as completion for a task that asked for an actual GUI, file, or configuration result.
 - For multi-target tasks (`all`, `both`, `each`, `respectively`), fail unless every requested target is explicitly covered.
 - For relative-date tasks, fail unless the exact resolved absolute date is explicitly covered.
 """
@@ -583,6 +616,10 @@ class PatternManager:
                 payload=response,
             )
 
+            if not isinstance(response, str) or not response.strip():
+                self.logger.warning("Pattern induction returned empty response")
+                return []
+
             # Try to parse as JSON
             if "```json" in response:
                 json_start = response.find("```json") + 7
@@ -868,11 +905,13 @@ class HiSA:
         self.last_blocked_feedback_event = None
         self.last_blocked_feedback = None
         self.last_error_feedback = None
+        self.current_step_id = 0
         self.post_action_wait_timeout = 10.0
         self.explicit_wait_timeout = 20.0
         self.wait_poll_interval = 1.0
         self.screenshot_wait_timeout = 6.0
         self.evaluation_wait_timeout = 25.0
+        self.evaluation_settle_seconds = 30.0
 
     def _sanitize_prompt_payload(self, value: Any):
         if isinstance(value, dict):
@@ -961,6 +1000,11 @@ class HiSA:
             return ""
         return body.strip()
 
+    def _skill_file_exists(self, name: str) -> bool:
+        if not name:
+            return False
+        return os.path.exists(os.path.join(self.skills_dir, name))
+
     def _get_domain_skill_name(self) -> str:
         domain = getattr(self, "current_domain", "") or getattr(self, "task_domain", "") or ""
         domain = re.sub(r"[^a-z0-9_]+", "_", domain.strip().lower())
@@ -1043,17 +1087,9 @@ class HiSA:
             GLOBAL_PLANNER_PROMPT,
         ]
         domain_skill_name = self._get_domain_skill_name()
-        if domain_skill_name:
+        if domain_skill_name and self._skill_file_exists(domain_skill_name):
             sections.append(self._load_skill_text(domain_skill_name))
-        if self._task_prefers_gui_skill() or any(
-            log.get("type") in GUI_ACTION_TOOLS for log in self.action_logs
-        ):
-            sections.append(self._load_skill_text("gui.md"))
-        if self._task_requires_bash_skill() or any(
-            log.get("type") == "bash_execution" for log in self.action_logs
-        ):
-            sections.append(self._load_skill_text("bash.md"))
-        if self._should_use_blocked_feedback_skill():
+        if self._should_use_blocked_feedback_skill() and self._skill_file_exists("blocked_feedback.md"):
             sections.append(self._load_skill_text("blocked_feedback.md"))
         return "\n\n".join(section.strip() for section in sections if section)
 
@@ -1503,6 +1539,8 @@ class HiSA:
 
     def _get_decision_action_fingerprint(self, decision: Dict) -> str:
         """Compute action fingerprint from current decision before execution."""
+        if decision.get("code"):
+            return self._hash_text(str(decision.get("code", "")).strip())
         tool = decision.get("tool", "")
         tool_input = decision.get("input", "")
 
@@ -1523,8 +1561,77 @@ class HiSA:
             return ""
         return re.sub(r"\s+", " ", str(description).strip()).lower()
 
+    def _normalize_action_arg(self, value: Any) -> str:
+        if isinstance(value, dict):
+            items = []
+            for key in sorted(value.keys()):
+                items.append(f"{key}={self._normalize_action_arg(value[key])}")
+            return "{" + ",".join(items) + "}"
+        if isinstance(value, (list, tuple)):
+            return "[" + ",".join(self._normalize_action_arg(item) for item in value) + "]"
+        return re.sub(r"\s+", " ", str(value).strip()).lower()
+
+    def _get_script_action_units(self, decision: Dict) -> List[Dict[str, str]]:
+        code = str(decision.get("code", "") or "").strip()
+        if not code:
+            return []
+        try:
+            actions = self._parse_action_script(code)
+        except Exception:
+            return []
+
+        units: List[Dict[str, str]] = []
+        for action in actions:
+            name = str(action.get("name", "") or "").strip()
+            args = action.get("args", [])
+            normalized_args = [self._normalize_action_arg(arg) for arg in args]
+            fingerprint = f"{name}(" + "|".join(normalized_args) + ")"
+            units.append({
+                "name": name,
+                "fingerprint": fingerprint,
+            })
+        return units
+
+    def _get_recent_decision_logs(self) -> List[Dict]:
+        decision_logs: List[Dict] = []
+        seen_steps = set()
+        for log in reversed(self.action_logs):
+            step = log.get("step")
+            if step in seen_steps:
+                continue
+            seen_steps.add(step)
+            decision_logs.append(log)
+        decision_logs.reverse()
+        return decision_logs
+
+    def _get_script_fingerprint_from_decision(self, decision: Dict) -> str:
+        units = self._get_script_action_units(decision)
+        if not units:
+            return ""
+        return " -> ".join(unit["fingerprint"] for unit in units)
+
     def _detect_repeated_gui_description(self, decision: Dict) -> Optional[str]:
         """Fail fast if the same GUI tool description is planned 3 consecutive times."""
+        if decision.get("code"):
+            units = self._get_script_action_units(decision)
+            gui_units = [unit for unit in units if unit["name"] in GUI_ACTION_TOOLS]
+            if not gui_units:
+                return None
+
+            normalized_description = " || ".join(unit["fingerprint"] for unit in gui_units)
+            recent_logs = self._get_recent_decision_logs()
+            repeat_count = 1
+            for log in reversed(recent_logs):
+                if (log.get("decision_gui_fingerprint") or "") != normalized_description:
+                    break
+                repeat_count += 1
+
+            if repeat_count >= 3:
+                return (
+                    "Detected repeated GUI action-script loop: "
+                    f"same GUI action sequence repeated {repeat_count} consecutive decisions."
+                )
+            return None
         if not self._is_gui_tool(decision.get("tool", "")):
             return None
 
@@ -1549,6 +1656,37 @@ class HiSA:
 
     def _detect_execution_loop(self, decision: Dict) -> Optional[str]:
         """Detect strict loops with identical action/result fingerprints."""
+        if decision.get("code"):
+            candidate_action_fp = self._get_script_fingerprint_from_decision(decision)
+            if not candidate_action_fp or not self.action_logs:
+                return None
+
+            recent_logs = self._get_recent_decision_logs()
+            if not recent_logs:
+                return None
+
+            last_log = recent_logs[-1]
+            last_action_fp = last_log.get("decision_action_fingerprint", "")
+            last_result_fp = last_log.get("decision_result_fingerprint", "")
+            if not last_action_fp or not last_result_fp:
+                return None
+            if candidate_action_fp != last_action_fp:
+                return None
+
+            repeat_count = 0
+            for log in reversed(recent_logs):
+                if log.get("decision_action_fingerprint") != last_action_fp:
+                    break
+                if log.get("decision_result_fingerprint") != last_result_fp:
+                    break
+                repeat_count += 1
+
+            if repeat_count >= 3:
+                return (
+                    "Detected repeated action-script loop: same action sequence and decision result "
+                    f"repeated {repeat_count} consecutive decisions."
+                )
+            return None
         tool = decision.get("tool", "")
         if tool not in GUI_ACTION_TOOLS.union({"bash_execution"}) or not self.action_logs:
             return None
@@ -1784,94 +1922,7 @@ class HiSA:
 
                 # Capture token usage after global planner decision
                 usage_after_global_planner = self._get_usage_snapshot()
-
-                # Check termination or infeasible
-                if decision["tool"] == "termination":
-                    verification = self._run_final_verification()
-                    if not verification:
-                        self.awaiting_final_verification = True
-                        self.final_verification_observed = False
-                        self.last_blocked_feedback = self._build_blocked_feedback(
-                            "termination_verification_failed",
-                            "",
-                        )
-                        self.last_error_feedback = self.last_blocked_feedback
-                        if self.wo_step:
-                            self.last_tool_output = "Final verification failed."
-                        self.logger.info(
-                            "Termination blocked: final verification failed",
-                        )
-                        continue
-                    self.logger.info("Final verification passed")
-                    step = self.operation_count + 1
-                    global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
-                    screenshot_file = f"step_{step}.png"
-                    try:
-                        screenshot = self.env.controller.get_screenshot()
-                        with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
-                            f.write(screenshot)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to capture termination screenshot: {e}")
-                        screenshot_file = ""
-
-                    thought_prefix = f"Thought: {decision.get('thought', '')} | " if decision.get('thought') else ""
-                    step_abstract = (
-                        f"Step {step}: termination | {thought_prefix}"
-                        f"Summary: {decision.get('input', 'Task completed.')} | Result: Terminated"
-                    )
-                    self.action_logs.append({
-                        "step": step,
-                        "type": "termination",
-                        "execution_success": True,
-                        "screenshot": screenshot_file,
-                        "detail": decision.get("message", decision.get("input", "Task completed.")),
-                        "compact": self._build_compact_log_entry(
-                            step=step,
-                            tool_type="termination",
-                            success=True,
-                            detail=decision.get("message", decision.get("input", "Task completed.")),
-                            verification="Task marked complete after explicit verification."
-                        ),
-                        "step_time": 0.0,
-                        "token_usage": {
-                            "global_planner": global_planner_usage["global_planner"],
-                            "visual_grounder": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
-                            "state_manager": global_planner_usage["state_manager"],
-                            "total": {
-                                "cost": global_planner_usage["global_planner"]["cost"] + global_planner_usage["state_manager"]["cost"],
-                                "prompt_tokens": global_planner_usage["global_planner"]["prompt_tokens"] + global_planner_usage["state_manager"]["prompt_tokens"],
-                                "completion_tokens": global_planner_usage["global_planner"]["completion_tokens"] + global_planner_usage["state_manager"]["completion_tokens"],
-                                "image_count": global_planner_usage["global_planner"]["image_count"] + global_planner_usage["state_manager"]["image_count"]
-                            }
-                        }
-                    })
-                    self.operation_count += 1
-                    is_infeasible = False
-                    self.logger.info("Task COMPLETED")
-                    break
-                elif decision["tool"] == "infeasible":
-                    is_infeasible = True
-                    infeasible_reason = decision.get('input', 'Task is objectively impossible to complete')
-                    self.logger.info(f"Task INFEASIBLE: {infeasible_reason}")
-                    # Send "FAIL" action to environment so action_history ends with "FAIL"
-                    # This is required for OSWorld's infeasible task evaluation
-                    try:
-                        self.env.step("FAIL", 0)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to send FAIL action: {e}")
-                    break
-
-                # Pre-calculate global planner token usage and set step_token_usage before tool execution
-                # This ensures GUI-tool execution and bash execution can use it when creating action_log
                 global_planner_usage = self._calculate_usage_delta(usage_before_step, usage_after_global_planner)
-
-                # Initialize step_token_usage with global planner data (visual_grounder/state_manager will be updated after execution)
-                self.step_token_usage = {
-                    "global_planner": global_planner_usage["global_planner"],
-                    "visual_grounder": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
-                    "state_manager": {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0},
-                    "total": global_planner_usage["global_planner"].copy()
-                }
 
                 repeated_description_error = self._detect_repeated_gui_description(decision)
                 if repeated_description_error:
@@ -1897,59 +1948,72 @@ class HiSA:
 
                 # Execute tool and capture execution result text
                 self.last_blocked_feedback_event = None
-                execution_result_text = self._execute_tool(decision)
+                self.current_step_id = self.operation_count + 1
+                execution_result_text, terminal_status, terminal_message = self._execute_tool(decision, global_planner_usage)
+                self.operation_count += 1
                 
                 # Store execution result for wo_step mode to maintain dialogue structure
                 if self.wo_step and execution_result_text:
                     self.last_tool_output = execution_result_text
 
-                status = self._record_subgoal_transition(decision)
-                if self.awaiting_final_verification:
-                    self.final_verification_observed = True
+                if terminal_status == "termination":
+                    verification = self._run_final_verification()
+                    if not verification:
+                        self.awaiting_final_verification = True
+                        self.final_verification_observed = False
+                        self.last_blocked_feedback = self._build_blocked_feedback("termination_verification_failed", "")
+                        self.last_error_feedback = self.last_blocked_feedback
+                        if self.wo_step:
+                            suffix = "\n\n" if execution_result_text else ""
+                            self.last_tool_output = (execution_result_text or "") + suffix + "Final verification failed."
+                        self.logger.info("Termination blocked: final verification failed")
+                        continue
+                    self.logger.info("Final verification passed")
 
-                if status == "done":
-                    self._maybe_refine_context("subgoal_done")
-                elif status == "blocked":
-                    self._maybe_refine_context("subgoal_blocked")
+                    step = self.current_step_id or (self.operation_count + 1)
+                    screenshot_file = f"step_{step}.png"
+                    try:
+                        screenshot = self.env.controller.get_screenshot()
+                        with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                            f.write(screenshot)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to capture termination screenshot: {e}")
+                        screenshot_file = ""
 
-                if self.last_blocked_feedback_event:
-                    event_type = self.last_blocked_feedback_event.get("type", "")
-                    event_detail = self.last_blocked_feedback_event.get("detail", "")
-                    self.last_blocked_feedback = self._build_blocked_feedback(event_type, event_detail)
-                    self.last_error_feedback = self.last_blocked_feedback
-                    if self.wo_step and execution_result_text:
-                        self.last_tool_output = execution_result_text + "\n\n" + self.last_blocked_feedback
+                    self.action_logs.append({
+                        "step": step,
+                        "type": "termination",
+                        "execution_success": True,
+                        "screenshot": screenshot_file,
+                        "detail": terminal_message or "Task completed.",
+                        "compact": self._build_compact_log_entry(
+                            step=step,
+                            tool_type="termination",
+                            success=True,
+                            detail=terminal_message or "Task completed.",
+                            verification="Task marked complete after explicit verification."
+                        ),
+                        "step_time": 0.0,
+                        "token_usage": {
+                            "global_planner": self._zero_usage_entry(),
+                            "visual_grounder": self._zero_usage_entry(),
+                            "state_manager": self._zero_usage_entry(),
+                            "total": self._zero_usage_entry(),
+                        }
+                    })
+                    is_infeasible = False
+                    self.logger.info("Task COMPLETED")
+                    break
 
-                # Capture token usage after tool execution
-                usage_after_tool = self._get_usage_snapshot()
-
-                # Calculate state_manager/visual_grounder token usage and update step_token_usage
-                tool_usage = self._calculate_usage_delta(usage_after_global_planner, usage_after_tool)
-                total_step_usage = self._calculate_usage_delta(usage_before_step, usage_after_tool)
-
-                # Update token usage: combine state_manager usage from history summarization and step abstraction
-                self.step_token_usage = {
-                    "global_planner": global_planner_usage["global_planner"],
-                    "visual_grounder": tool_usage["visual_grounder"],
-                    "state_manager": {
-                        "cost": global_planner_usage["state_manager"]["cost"] + tool_usage["state_manager"]["cost"],
-                        "prompt_tokens": global_planner_usage["state_manager"]["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
-                        "completion_tokens": global_planner_usage["state_manager"]["completion_tokens"] + tool_usage["state_manager"]["completion_tokens"],
-                        "image_count": global_planner_usage["state_manager"]["image_count"] + tool_usage["state_manager"]["image_count"]
-                    },
-                    "total": {
-                        "cost": total_step_usage["global_planner"]["cost"] + total_step_usage["visual_grounder"]["cost"] + total_step_usage["state_manager"]["cost"],
-                        "prompt_tokens": total_step_usage["global_planner"]["prompt_tokens"] + total_step_usage["visual_grounder"]["prompt_tokens"] + total_step_usage["state_manager"]["prompt_tokens"],
-                        "completion_tokens": total_step_usage["global_planner"]["completion_tokens"] + total_step_usage["visual_grounder"]["completion_tokens"] + total_step_usage["state_manager"]["completion_tokens"],
-                        "image_count": total_step_usage["global_planner"]["image_count"] + total_step_usage["visual_grounder"]["image_count"] + total_step_usage["state_manager"]["image_count"]
-                    }
-                }
-
-                # Update the action_log entry that was already added with complete token usage
-                if self.action_logs and self.action_logs[-1]["step"] == self.operation_count + 1:
-                    self.action_logs[-1]["token_usage"] = self.step_token_usage
-
-                self.operation_count += 1
+                if terminal_status == "infeasible":
+                    is_infeasible = True
+                    infeasible_reason = terminal_message or "Task is objectively impossible to complete"
+                    self.logger.info(f"Task INFEASIBLE: {infeasible_reason}")
+                    try:
+                        self.env.step("FAIL", 0)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send FAIL action: {e}")
+                    break
 
                 # Continue with next iteration
                 # (screenshot will be fetched in next _get_global_planner_decision call)
@@ -2127,30 +2191,11 @@ class HiSA:
                     raise ValueError("Missing 'subgoal' field in decision")
                 decision["subgoal"] = self._normalize_subgoal(decision["subgoal"])
 
-                # Validate decision structure
-                if "tool" not in decision:
-                    raise ValueError("Missing 'tool' field in decision")
-                if decision["tool"] not in VALID_TOOLS:
-                    raise ValueError(f"Invalid tool: {decision['tool']}")
-                if self._is_gui_tool(decision["tool"]):
-                    if "input" not in decision:
-                        raise ValueError(f"Missing 'input' for GUI tool: {decision['tool']}")
-                    if decision.get("input") in [None, ""]:
-                        raise ValueError(f"Input for tool '{decision['tool']}' cannot be empty")
-                    if not isinstance(decision.get("input"), str):
-                        raise ValueError(f"Input for tool '{decision['tool']}' must be a string")
-                    if decision["tool"] in GROUNDED_GUI_TOOLS:
-                        gui_input = decision.get("input")
-                        has_description = isinstance(gui_input, str) and bool(gui_input.strip())
-                        thought_text = str(decision.get("thought", "") or "").strip()
-                        if not has_description and not thought_text:
-                            raise ValueError(f"Grounded GUI tool '{decision['tool']}' requires input description or thought")
-                elif decision["tool"] == "bash_execution":
-                    if "command" not in decision and "input" not in decision:
-                        raise ValueError("Missing command/input for bash_execution")
-                    command_value = decision["command"] if "command" in decision else decision["input"]
-                    if not isinstance(command_value, str) or not command_value.strip():
-                        raise ValueError("bash_execution requires a non-empty command string")
+                if "code" not in decision:
+                    raise ValueError("Missing 'code' field in decision")
+                if not isinstance(decision.get("code"), str) or not decision["code"].strip():
+                    raise ValueError("Decision 'code' must be a non-empty string")
+                self._parse_action_script(decision["code"])
 
                 try:
                     self.logger.info(f"[decision]: {json.dumps(decision, indent=4)}")
@@ -2189,10 +2234,15 @@ class HiSA:
                 
                 # If not last attempt, set error feedback for retry
                 if attempt < self.max_parse_retries - 1:
+                    extra_guidance = self._build_action_script_parse_guidance(
+                        response=response,
+                        error_message=str(e),
+                    )
                     error_feedback = FIX_RESPONSE_PROMPT.format(
                         operation_count=self.operation_count,
                         max_steps=self.max_steps,
                         error_message=str(e),
+                        extra_guidance=extra_guidance,
                         response=response
                     )
                     self._dump_prompt_entry(
@@ -2212,26 +2262,120 @@ class HiSA:
                         f.write("All retry attempts exhausted, cannot get valid decision")
                     raise ValueError("All retry attempts exhausted, cannot get valid decision")
 
-    def _execute_tool(self, decision: Dict) -> str:
-        """Execute tool based on decision and return execution result text."""
-        tool = decision["tool"]
-        description = self._build_action_description(decision)
-
-        # Store thought for step_abstract
+    def _execute_tool(self, decision: Dict, planner_usage: Dict) -> Tuple[str, Optional[str], str]:
+        """Execute planner-produced action script and return output, terminal status, and terminal message."""
         self.current_thought = decision.get("thought", "")
         self.current_proposed_subgoal = self._normalize_subgoal(decision["subgoal"])
+        actions = self._parse_action_script(decision["code"])
+        self.current_decision_action_fingerprint = self._get_script_fingerprint_from_decision(decision)
+        gui_units = [unit["fingerprint"] for unit in self._get_script_action_units(decision) if unit["name"] in GUI_ACTION_TOOLS]
+        self.current_decision_gui_fingerprint = " || ".join(gui_units)
+        outputs: List[str] = []
+        terminal_status = None
+        terminal_message = ""
+        bash_seen = False
 
-        if self._is_gui_tool(tool):
-            return self._execute_gui_tool(tool, decision["input"], description)
+        for index, action in enumerate(actions):
+            name = action["name"]
+            args = action["args"]
+            include_planner = index == 0
+            usage_before_tool = self._get_usage_snapshot()
+            self.step_token_usage = self._build_step_token_usage(
+                planner_usage=planner_usage,
+                tool_usage={"visual_grounder": self._zero_usage_entry(), "state_manager": self._zero_usage_entry()},
+                include_planner=include_planner,
+            )
 
-        elif tool == "bash_execution":
-            command = decision["command"] if "command" in decision else decision["input"]
-            return self._bash_execution(command)
+            if name == "click":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("click() expects one string argument")
+                execution_result_text = self._execute_gui_tool("click", args[0], args[0])
+            elif name == "double_click":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("double_click() expects one string argument")
+                execution_result_text = self._execute_gui_tool("double_click", args[0], args[0])
+            elif name == "right_click":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("right_click() expects one string argument")
+                execution_result_text = self._execute_gui_tool("right_click", args[0], args[0])
+            elif name == "move":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("move() expects one string argument")
+                execution_result_text = self._execute_gui_tool("move", args[0], args[0])
+            elif name == "drag":
+                if len(args) not in {2, 3} or not all(isinstance(arg, str) for arg in args):
+                    raise ValueError("drag() expects two or three string arguments")
+                if len(args) == 3:
+                    drag_instruction, drag_source, drag_destination = args
+                    drag_input = f"{drag_source} -> {drag_destination}"
+                    drag_description = drag_instruction
+                else:
+                    drag_source, drag_destination = args
+                    drag_input = f"{drag_source} -> {drag_destination}"
+                    drag_description = f"Drag from {drag_source} to {drag_destination}"
+                execution_result_text = self._execute_gui_tool("drag", drag_input, drag_description)
+            elif name == "write":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("write() expects one string argument")
+                execution_result_text = self._execute_gui_tool("write", args[0], "")
+            elif name == "hotkey":
+                if not args or not all(isinstance(arg, str) for arg in args):
+                    raise ValueError("hotkey() expects one or more string arguments")
+                hotkey_input = args[0] if len(args) == 1 else "+".join(args)
+                execution_result_text = self._execute_gui_tool("hotkey", hotkey_input, "")
+            elif name == "scroll":
+                if len(args) != 2 or not isinstance(args[0], str):
+                    raise ValueError("scroll() expects description string and integer amount")
+                execution_result_text = self._execute_gui_tool(
+                    "scroll",
+                    {"instruction": args[0], "amount": _validate_scroll_amount(args[1])},
+                    args[0],
+                )
+            elif name == "bash":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("bash() expects one string argument")
+                bash_seen = True
+                execution_result_text = self._bash_execution(args[0])
+            elif name == "termination":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("termination() expects one string argument")
+                if index != len(actions) - 1:
+                    raise ValueError("termination() must be the last action in the script")
+                terminal_status = "termination"
+                terminal_message = args[0]
+                break
+            elif name == "infeasible":
+                if len(args) != 1 or not isinstance(args[0], str):
+                    raise ValueError("infeasible() expects one string argument")
+                if index != len(actions) - 1:
+                    raise ValueError("infeasible() must be the last action in the script")
+                terminal_status = "infeasible"
+                terminal_message = args[0]
+                break
+            else:
+                raise ValueError(f"Unsupported action function: {name}")
 
-        elif tool == "wait":
-            return self._wait()
+            outputs.append(execution_result_text)
+            usage_after_tool = self._get_usage_snapshot()
+            tool_usage = self._calculate_usage_delta(usage_before_tool, usage_after_tool)
+            step_token_usage = self._build_step_token_usage(planner_usage, tool_usage, include_planner=include_planner)
+            self._patch_latest_step_token_usage(self.current_step_id or (self.operation_count + 1), step_token_usage)
+            self.step_token_usage = step_token_usage
 
-        raise ValueError(f"Unsupported tool in _execute_tool: {tool}")
+            status = self._record_subgoal_transition(decision)
+            if self.awaiting_final_verification:
+                self.final_verification_observed = True
+            if status == "done":
+                self._maybe_refine_context("subgoal_done")
+            elif status == "blocked":
+                self._maybe_refine_context("subgoal_blocked")
+            if self.last_blocked_feedback_event:
+                event_type = self.last_blocked_feedback_event.get("type", "")
+                event_detail = self.last_blocked_feedback_event.get("detail", "")
+                self.last_blocked_feedback = self._build_blocked_feedback(event_type, event_detail)
+                self.last_error_feedback = self.last_blocked_feedback
+
+        return "\n\n".join(part for part in outputs if part), terminal_status, terminal_message
 
     def _normalize_bash_command(self, code: str) -> str:
         """Normalize bash command to enforce non-interactive sudo usage."""
@@ -2263,6 +2407,301 @@ class HiSA:
         # the redundant x=/y= markers and preserve all other kwargs.
         return re.sub(r"(?<=\(|,)\s*([xy])\s*=\s*", "", code)
 
+    def _build_action_script_parse_guidance(self, response: str, error_message: str) -> str:
+        error_text = str(error_message)
+        if (
+            "Failed to parse action script" not in error_text
+            and "Action script must contain only function-call statements" not in error_text
+            and "drag() expects two or three string arguments" not in error_text
+            and "move() expects one string argument" not in error_text
+            and "click() expects one string argument" not in error_text
+            and "double_click() expects one string argument" not in error_text
+            and "right_click() expects one string argument" not in error_text
+            and "bash() expects one string argument" not in error_text
+            and "Unsupported action function: wait" not in error_text
+        ):
+            return ""
+
+        code_snippet = ""
+        try:
+            json_str = str(response or "").strip()
+            if "```json" in json_str:
+                json_start = json_str.find("```json") + 7
+                json_end = json_str.find("```", json_start)
+                json_str = json_str[json_start:json_end].strip()
+            elif "```" in json_str:
+                json_start = json_str.find("```") + 3
+                json_end = json_str.find("```", json_start)
+                json_str = json_str[json_start:json_end].strip()
+            parsed = json.loads(repair_json(json_str))
+            if isinstance(parsed, dict):
+                code_snippet = str(parsed.get("code", "") or "").strip()
+        except Exception:
+            code_snippet = ""
+
+        guidance_lines = [
+            "Action-script fix requirements:",
+            "- `code` must be valid Python syntax with one function call per line.",
+            "- Put the entire natural-language target inside a single quoted string argument.",
+            "- Do not leave text outside quotes.",
+            "- Balance every `(` with `)`.",
+            "- `click()`, `double_click()`, `right_click()`, and `move()` each require exactly one quoted instruction string.",
+            "- Use `drag('full instruction', 'source', 'destination')` for drag actions.",
+            "- Put the full `write(...)` text or spreadsheet formula inside one valid Python string literal.",
+            "- For formulas with quotes inside them, keep the outer Python quotes different. Example: `write('=TEXT(C2;\"0000000\")')`.",
+            "- For single-key actions use `hotkey('enter')`; for combos use `hotkey('ctrl', 'a')`.",
+            "- Do not output bare tokens like `backspace` or `enter`; write `hotkey('backspace')` or `hotkey('enter')`.",
+            "- Put each shell command inside exactly one `bash('...')` call on a single line.",
+            "- Do not use heredoc syntax in `bash(...)` and do not place raw shell commands on separate lines outside `bash(...)`.",
+        ]
+        if "Action script must contain only function-call statements" in error_text:
+            guidance_lines.append(
+                "- Every line must be a function call. Invalid: `backspace`. Valid: `hotkey('backspace')`."
+            )
+        if "drag() expects two or three string arguments" in error_text:
+            guidance_lines.append(
+                "- `drag()` cannot take a single description string. Use `drag('full instruction', 'source', 'destination')`."
+            )
+        if (
+            "move() expects one string argument" in error_text
+            or "click() expects one string argument" in error_text
+            or "double_click() expects one string argument" in error_text
+            or "right_click() expects one string argument" in error_text
+        ):
+            guidance_lines.append(
+                "- `click()`, `double_click()`, `right_click()`, and `move()` each accept exactly one quoted instruction string."
+            )
+        if "unterminated string literal" in error_text or "'(' was never closed" in error_text:
+            guidance_lines.append(
+                "- If `write(...)` contains a spreadsheet formula, keep the whole formula inside one quoted Python string, for example `write('=TEXT(C2;\"0000000\")')`."
+            )
+            guidance_lines.append(
+                "- If `bash(...)` contains a shell command, keep the whole command inside one quoted Python string on a single line; do not use heredoc blocks."
+            )
+        if "bash() expects one string argument" in error_text:
+            guidance_lines.append(
+                "- `bash()` accepts exactly one quoted shell command string."
+            )
+        if "Unsupported action function: wait" in error_text:
+            guidance_lines.append(
+                "- `wait()` is not supported. Remove it and let the system observe the result after each action automatically."
+            )
+        if code_snippet:
+            guidance_lines.append(f"- Current invalid `code`: {code_snippet}")
+        return "\n".join(guidance_lines)
+
+    def _repair_action_script_line(self, line: str) -> str:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return ""
+
+        if stripped in {"wait", "wait()"}:
+            return ""
+
+        if stripped in {"enter", "backspace", "tab", "esc", "escape"}:
+            return f"hotkey({stripped!r})"
+
+        call_match = re.match(r"^([A-Za-z_]\w*)\((.*)\)\s*$", stripped)
+        if not call_match:
+            shell_prefixes = (
+                "find ",
+                "ls ",
+                "cat ",
+                "cd ",
+                "mkdir ",
+                "grep ",
+                "sed ",
+                "python ",
+                "python3 ",
+                "libreoffice ",
+            )
+            if stripped.startswith(shell_prefixes) or any(token in stripped for token in {"&&", "||", "2>/", ">/", "~/", "/home/"}):
+                return f"bash({stripped!r})"
+            return stripped
+
+        name, raw_args = call_match.groups()
+        raw_args = raw_args.strip()
+
+        def split_simple_args(text: str) -> List[str]:
+            parts: List[str] = []
+            current: List[str] = []
+            quote_char = ""
+            depth = 0
+            for ch in str(text or ""):
+                if quote_char:
+                    current.append(ch)
+                    if ch == quote_char:
+                        quote_char = ""
+                    continue
+                if ch in {"'", '"'}:
+                    quote_char = ch
+                    current.append(ch)
+                    continue
+                if ch in "([{":
+                    depth += 1
+                    current.append(ch)
+                    continue
+                if ch in ")]}":
+                    depth = max(0, depth - 1)
+                    current.append(ch)
+                    continue
+                if ch == "," and depth == 0:
+                    part = "".join(current).strip()
+                    if part:
+                        parts.append(part)
+                    current = []
+                    continue
+                current.append(ch)
+            tail = "".join(current).strip()
+            if tail:
+                parts.append(tail)
+            return parts
+
+        def as_single_string_arg(text: str) -> str:
+            cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+            if cleaned:
+                try:
+                    parsed = ast.literal_eval(cleaned)
+                    if isinstance(parsed, str):
+                        return repr(parsed)
+                except Exception:
+                    pass
+            cleaned = cleaned.strip().strip(",")
+            if cleaned.startswith(("'", '"')):
+                cleaned = cleaned[1:]
+            if cleaned.endswith(("'", '"')):
+                cleaned = cleaned[:-1]
+            cleaned = cleaned.replace('"', "").replace("'", "").strip()
+            return repr(cleaned)
+
+        if name in {"click", "double_click", "right_click", "move", "write", "bash", "termination", "infeasible"}:
+            return f"{name}({as_single_string_arg(raw_args)})"
+
+        if name == "hotkey":
+            parts = split_simple_args(raw_args)
+            if not parts:
+                return stripped
+            if len(parts) == 1:
+                single = parts[0].strip()
+                if not single.startswith(("'", '"')) and "+" in single:
+                    parts = [part.strip() for part in single.split("+") if part.strip()]
+            repaired_parts = [as_single_string_arg(part) for part in parts if str(part).strip()]
+            return f"hotkey({', '.join(repaired_parts)})" if repaired_parts else stripped
+
+        if name == "scroll":
+            arg_parts = split_simple_args(raw_args)
+            if len(arg_parts) <= 1:
+                description = arg_parts[0] if arg_parts else raw_args
+                lowered = description.lower()
+                amount = -5 if "down" in lowered else 5 if "up" in lowered else -5
+                return f"scroll({as_single_string_arg(description)}, {amount})"
+            amount_text = str(arg_parts[1]).strip()
+            try:
+                amount_value = int(ast.literal_eval(amount_text))
+            except Exception:
+                try:
+                    amount_value = int(amount_text)
+                except Exception:
+                    lowered = str(arg_parts[0]).lower()
+                    amount_value = -5 if "down" in lowered else 5 if "up" in lowered else -5
+            return f"scroll({as_single_string_arg(arg_parts[0])}, {amount_value})"
+
+        if name == "drag":
+            arg_parts = split_simple_args(raw_args)
+            if len(arg_parts) >= 3:
+                repaired_parts = [as_single_string_arg(part) for part in arg_parts[:3]]
+                return f"drag({', '.join(repaired_parts)})"
+            if len(arg_parts) == 2:
+                repaired_parts = [as_single_string_arg(part) for part in arg_parts]
+                return f"drag({', '.join(repaired_parts)})"
+            instruction = arg_parts[0] if arg_parts else raw_args
+            instruction_text = str(instruction).strip().strip("'\"")
+            match = re.search(r"\bfrom\s+(.+?)\s+\bto\s+(.+)$", instruction_text, re.IGNORECASE)
+            if match:
+                source = match.group(1).strip(" .")
+                destination = match.group(2).strip(" .")
+                return f"drag({as_single_string_arg(instruction_text)}, {as_single_string_arg(source)}, {as_single_string_arg(destination)})"
+            return f"drag({as_single_string_arg(instruction_text)}, {as_single_string_arg('drag source')}, {as_single_string_arg('drag destination')})"
+
+        return stripped
+
+    def _repair_action_script(self, code: str) -> str:
+        if not isinstance(code, str):
+            return code
+        repaired_lines = []
+        for raw_line in code.splitlines():
+            repaired_line = self._repair_action_script_line(raw_line)
+            if repaired_line:
+                repaired_lines.append(repaired_line)
+        repaired = "\n".join(repaired_lines).strip()
+        return repaired or code
+
+    def _parse_action_script(self, code: str) -> List[Dict[str, Any]]:
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("Action script must be a non-empty string")
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            repaired_code = self._repair_action_script(code)
+            if repaired_code != code:
+                try:
+                    tree = ast.parse(repaired_code)
+                    code = repaired_code
+                except SyntaxError:
+                    raise ValueError(f"Failed to parse action script: {e}") from e
+            else:
+                raise ValueError(f"Failed to parse action script: {e}") from e
+
+        actions: List[Dict[str, Any]] = []
+        for stmt in tree.body:
+            if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+                raise ValueError("Action script must contain only function-call statements")
+            call = stmt.value
+            if not isinstance(call.func, ast.Name):
+                raise ValueError("Only direct function calls are allowed in action script")
+            name = str(call.func.id or "").strip()
+            if name not in ACTION_SCRIPT_FUNCTIONS:
+                raise ValueError(f"Unsupported action function: {name}")
+            if call.keywords:
+                raise ValueError(f"Keyword arguments are not supported for {name}()")
+            try:
+                args = [ast.literal_eval(arg) for arg in call.args]
+            except Exception as e:
+                raise ValueError(f"Failed to parse arguments for {name}(): {e}") from e
+            actions.append({"name": name, "args": args, "source": ast.unparse(stmt).strip()})
+
+        if not actions:
+            raise ValueError("Action script must contain at least one function call")
+        return actions
+
+    def _zero_usage_entry(self) -> Dict[str, float]:
+        return {"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "image_count": 0}
+
+    def _build_step_token_usage(self, planner_usage: Dict, tool_usage: Dict, include_planner: bool) -> Dict:
+        global_planner_usage = planner_usage["global_planner"] if include_planner else self._zero_usage_entry()
+        state_manager_usage = planner_usage["state_manager"] if include_planner else self._zero_usage_entry()
+        return {
+            "global_planner": global_planner_usage,
+            "visual_grounder": tool_usage["visual_grounder"],
+            "state_manager": {
+                "cost": state_manager_usage["cost"] + tool_usage["state_manager"]["cost"],
+                "prompt_tokens": state_manager_usage["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
+                "completion_tokens": state_manager_usage["completion_tokens"] + tool_usage["state_manager"]["completion_tokens"],
+                "image_count": state_manager_usage["image_count"] + tool_usage["state_manager"]["image_count"],
+            },
+            "total": {
+                "cost": global_planner_usage["cost"] + tool_usage["visual_grounder"]["cost"] + state_manager_usage["cost"] + tool_usage["state_manager"]["cost"],
+                "prompt_tokens": global_planner_usage["prompt_tokens"] + tool_usage["visual_grounder"]["prompt_tokens"] + state_manager_usage["prompt_tokens"] + tool_usage["state_manager"]["prompt_tokens"],
+                "completion_tokens": global_planner_usage["completion_tokens"] + tool_usage["visual_grounder"]["completion_tokens"] + state_manager_usage["completion_tokens"] + tool_usage["state_manager"]["completion_tokens"],
+                "image_count": global_planner_usage["image_count"] + tool_usage["visual_grounder"]["image_count"] + state_manager_usage["image_count"] + tool_usage["state_manager"]["image_count"],
+            },
+        }
+
+    def _patch_latest_step_token_usage(self, step: int, token_usage: Dict) -> None:
+        if self.action_logs and self.action_logs[-1].get("step") == step:
+            self.action_logs[-1]["token_usage"] = token_usage
+
     def _normalize_gui_tool_input(self, tool: str, code):
         """Normalize GUI-tool input to the dict format expected by desktop_env.step."""
         if tool == "click" and isinstance(code, str):
@@ -2279,16 +2718,14 @@ class HiSA:
                 "action_type": "pyautogui",
                 "command": "pyautogui.moveTo(START_X_COORD, START_Y_COORD); pyautogui.dragTo(END_X_COORD, END_Y_COORD, duration=0.5, button='left')",
             }
-        if tool == "scroll" and isinstance(code, str):
+        if tool == "scroll" and isinstance(code, dict):
             return {
                 "tool": tool,
                 "action_type": "pyautogui",
-                "command": f"pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll({_scroll_amount_from_instruction(code)})",
+                "command": f"pyautogui.moveTo(X_COORD, Y_COORD); pyautogui.scroll({_validate_scroll_amount(code.get('amount'))})",
             }
-        if tool == "type" and isinstance(code, str):
+        if tool in {"write", "type"} and isinstance(code, str):
             return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.write({code!r})"}
-        if tool == "press" and isinstance(code, str):
-            return {"tool": tool, "action_type": "pyautogui", "command": f"pyautogui.press({code!r})"}
         if tool == "hotkey" and isinstance(code, str) and code.strip():
             keys = [part.strip() for part in re.split(r"\s*\+\s*", code.strip()) if part.strip()]
             if keys:
@@ -2526,7 +2963,7 @@ class HiSA:
         # Record step start time
         step_start_time = time.time()
 
-        step = self.operation_count + 1
+        step = self.current_step_id or (self.operation_count + 1)
 
         try:
             # Get before screenshot
@@ -2626,7 +3063,12 @@ class HiSA:
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": requested_action_fingerprint,
-                "loop_result_fingerprint": result_fingerprint
+                "loop_result_fingerprint": result_fingerprint,
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status={step_subgoal_status}|env_changed={env_changed}|detail={description or final_code}"
+                ),
             })
             if not env_changed:
                 self.last_blocked_feedback_event = {
@@ -2685,7 +3127,12 @@ class HiSA:
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": requested_action_fingerprint,
-                "loop_result_fingerprint": result_fingerprint
+                "loop_result_fingerprint": result_fingerprint,
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status=blocked|error={str(e)}|detail={description or code}"
+                ),
             })
             self.last_blocked_feedback_event = {
                 "type": "tool_execution_failed",
@@ -2807,7 +3254,7 @@ class HiSA:
         # Record step start time
         step_start_time = time.time()
 
-        step = self.operation_count + 1
+        step = self.current_step_id or (self.operation_count + 1)
 
         try:
             # Provider workaround:
@@ -2931,7 +3378,12 @@ except subprocess.TimeoutExpired as e:
                 "step_time": round(step_time, 2),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": action_fingerprint,
-                "loop_result_fingerprint": result_fingerprint
+                "loop_result_fingerprint": result_fingerprint,
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status={step_subgoal_status}|exitcode={exitcode}|output={logs}"
+                ),
             })
             if exitcode != 0 or status != "success":
                 self.last_blocked_feedback_event = {
@@ -2981,7 +3433,12 @@ except subprocess.TimeoutExpired as e:
                 ),
                 "token_usage": self.step_token_usage,
                 "loop_action_fingerprint": action_fingerprint,
-                "loop_result_fingerprint": result_fingerprint
+                "loop_result_fingerprint": result_fingerprint,
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status=blocked|bash_error={str(e)}|code={code}"
+                ),
             })
             self.last_blocked_feedback_event = {
                 "type": "tool_execution_failed",
@@ -2999,7 +3456,7 @@ except subprocess.TimeoutExpired as e:
         # Record step start time
         step_start_time = time.time()
 
-        step = self.operation_count + 1
+        step = self.current_step_id or (self.operation_count + 1)
 
         try:
             # Get before screenshot
@@ -3161,14 +3618,26 @@ except subprocess.TimeoutExpired as e:
             # self.logger.info("Closing temporary windows...")
             # self.env.step("pyautogui.press('esc')", 0.5)
 
+            if self.evaluation_settle_seconds > 0:
+                self.logger.info(
+                    f"Waiting {self.evaluation_settle_seconds:.1f} seconds before evaluation to let the environment settle..."
+                )
+                time.sleep(self.evaluation_settle_seconds)
+
             # Poll evaluation until it succeeds or the timeout expires.
             self.logger.info("Polling evaluation until the VM is ready...")
             score = self._evaluate_with_polling()
         except Exception as e:
-            self.logger.error(f"Evaluation failed after {max_retries} attempts: {e}")
+            self.logger.error(
+                f"Evaluation failed within {self.evaluation_wait_timeout:.1f} seconds: {e}"
+            )
             score = 0.0
 
-        gui_steps = len([log for log in self.action_logs if log["type"] in GUI_ACTION_TOOLS])
+        gui_steps = len({
+            log.get("step")
+            for log in self.action_logs
+            if log.get("type") in GUI_ACTION_TOOLS and log.get("step") is not None
+        })
         bash_steps = len([log for log in self.action_logs if log["type"] == "bash_execution"])
         wait_steps = len([log for log in self.action_logs if log["type"] == "wait"])
         termination_steps = len([log for log in self.action_logs if log["type"] == "termination"])
