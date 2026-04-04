@@ -1,10 +1,12 @@
 {
-    "libreoffice_calc": [
-        "1954cced-e748-45c4-9c26-9855b97fbc5e",
-        "30e3e107-1cfb-46ee-a755-2cd080d7ba6a"
+    "libreoffice_writer": [
+        "8472fece-c7dd-4241-8d65-9b3cd1a0b568"
     ],
-    "libreoffice_impress": [
-        "2b94c692-6abb-48ae-ab0b-b3e8a19cb340",
-        "7ae48c60-f143-4119-b659-15b8f485eb9a"
+    "multi_apps": [
+        "5df7b33a-9f77-4101-823e-02f863e1c1ae",
+        "f8369178-fafe-40c2-adc4-b9b08a125456"
+    ],
+    "os": [
+        "13584542-872b-42d8-b299-866967b5c3ef"
     ]
 }

@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import textwrap
 from typing import Dict, List, Tuple
@@ -21,6 +22,35 @@ def str2bool(value):
     if value in {"false", "0", "no", "n"}:
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _normalize_memory_prefix(domain: str, task_id: str) -> str:
+    normalized_domain = re.sub(r"[^a-z0-9_]+", "_", (domain or "general").strip().lower())
+    normalized_domain = re.sub(r"_+", "_", normalized_domain).strip("_") or "general"
+    normalized_task_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(task_id or "unknown").strip())
+    normalized_task_id = re.sub(r"_+", "_", normalized_task_id).strip("_") or "unknown"
+    return f"{normalized_domain}_{normalized_task_id}"
+
+
+def _cleanup_task_memories(result_dir: str, domain: str, task_id: str) -> None:
+    memory_dir = os.path.join(result_dir, "memories", re.sub(r"[^a-z0-9_]+", "_", (domain or "general").strip().lower()).strip("_") or "general")
+    if not os.path.isdir(memory_dir):
+        return
+
+    prefix = _normalize_memory_prefix(domain, task_id) + "_"
+    removed_any = False
+    for file_name in os.listdir(memory_dir):
+        if not file_name.endswith(".md") or file_name == "MEMORY.md":
+            continue
+        if not file_name.startswith(prefix):
+            continue
+        os.remove(os.path.join(memory_dir, file_name))
+        removed_any = True
+
+    if removed_any:
+        index_path = os.path.join(memory_dir, "MEMORY.md")
+        if os.path.exists(index_path):
+            os.remove(index_path)
 
 
 def _ensure_vm_resolution(env, width: int, height: int, logger: logging.Logger) -> None:
@@ -351,6 +381,7 @@ def run(args, logger=None, tasks=None):
             target_dir = os.path.join(args.result_dir, f"{domain}/{task_id}")
             if os.path.exists(target_dir):
                 shutil.rmtree(target_dir)
+            _cleanup_task_memories(args.result_dir, domain, task_id)
     
     try:
         if not args.get_score:
@@ -378,6 +409,8 @@ def run(args, logger=None, tasks=None):
                     # Clean up existing directory and prepare for execution
                     if os.path.exists(target_dir):
                         shutil.rmtree(target_dir)
+                    if args.rerun or args.rerun_fail:
+                        _cleanup_task_memories(args.result_dir, domain, task_id)
                     os.makedirs(target_dir, exist_ok=True)
                     
                     result_domain, score = process_single_task(domain, task_id, cfg, logger, args)
