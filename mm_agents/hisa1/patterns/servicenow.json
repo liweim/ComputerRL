@@ -1,0 +1,12 @@
+[
+  {
+    "id": 1,
+    "type": "success",
+    "lesson": "Open the filter/sort controls by clicking the filter/funnel control — this reliably reveals the filter and 'Order results by' section."
+  },
+  {
+    "id": 2,
+    "type": "success",
+    "lesson": "When selecting an item from a long dropdown, use the control's inline search (type the target text into the dropdown's search box) and then click the filtered result — typing+select reliably picked the desired entry after repeated direct-click attempts failed."
+  }
+]

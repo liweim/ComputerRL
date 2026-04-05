@@ -64,7 +64,7 @@ python run_autoglm_v.py \
     --headless \
     --max_steps 100 \
     --test_all_meta_path ./evaluation_examples/test_all.json \
-    > nohup4.out 2>&1 &
+    > nohup.out 2>&1 &
 
 nohup \
 python run_autoglm_v_restart.py \
@@ -77,7 +77,7 @@ python run_autoglm_v_restart.py \
     --headless \
     --max_steps 100 \
     --test_all_meta_path ./evaluation_examples/test_medium.json \
-    > nohup3.out 2>&1 &
+    > nohup.out 2>&1 &
 
 nohup \
 python run_autoglm_v_restart.py \
@@ -94,8 +94,7 @@ python run_autoglm_v_restart.py \
     --headless \
     --max_steps 100 \
     --test_all_meta_path ./evaluation_examples/test_medium.json \
-    --rerun_fail \
-    > nohup2.out 2>&1 &
+    > nohup.out 2>&1 &
 
 nohup \
 python run_hisa.py \
@@ -104,10 +103,10 @@ python run_hisa.py \
   --result_dir ./results/hisa_qwen3.5-9b_wo_step_refinement_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
   --wo_step \
   --wo_refinement \
   --wo_pattern \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -117,22 +116,22 @@ python run_hisa.py \
   --result_dir ./results/hisa_qwen3.5-9b_wo_refinement_pattern \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
   --wo_refinement \
   --wo_pattern \
-  > nohup2.out 2>&1 &
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  > nohup.out 2>&1 &
 
 nohup \
 python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern_2 \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_all.json \
   --wo_pattern \
-  > nohup3.out 2>&1 &
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  > nohup2.out 2>&1 &
 
 nohup \
 python run_hisa.py \
@@ -143,7 +142,19 @@ python run_hisa.py \
   --headless \
   --max_steps 100 \
   --test_all_meta_path ./evaluation_examples/test_medium.json \
-  > nohup4.out 2>&1 &
+  > nohup.out 2>&1 &
+
+nohup \
+python run_hisa1.py \
+  --provider_name docker \
+  --vm_ram 8G \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa1_qwen3.5-9b_subgoal_wo_pattern \
+  --headless \
+  --max_steps 100 \
+  --wo_pattern \
+  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  > nohup.out 2>&1 &
 
 nohup \
 python run_hisa2.py \

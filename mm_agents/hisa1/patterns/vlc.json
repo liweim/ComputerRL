@@ -1,0 +1,27 @@
+[
+    {
+      "id": 1,
+      "type": "require",
+      "lesson": "VLC cannot play DRM-protected content from external streaming platforms."
+    },
+    {
+      "id": 2,
+      "type": "require",
+      "lesson": "Changes to Preferences must be explicitly saved, and often require restarting the application to take full effect."
+    },
+    {
+      "id": 3,
+      "type": "require",
+      "lesson": "VLC automatically closes when a video ends by default, and there is no setting to keep the window open after playback completes."
+    },
+    {
+      "id": 4,
+      "type": "require",
+      "lesson": "VLC does not support DRM-protected content due to licensing restrictions. Content from services like Google Play Movies, Netflix, or other DRM-protected platforms cannot be played in VLC."
+    },
+    {
+      "id": 5,
+      "type": "require",
+      "lesson": "VLC has no hardware sensors or ambient light detection. Video adjustments (brightness, contrast) must be configured manually and cannot adapt automatically to environmental conditions."
+    }
+  ]

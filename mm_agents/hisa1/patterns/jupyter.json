@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Do NOT add new cells unless explicitly requested by the user"
+  },
+  {
+    "id": 2,
+    "type": "require",
+    "lesson": "After making modifications to notebook content, always execute 'Run All Cells' (icon '>>') to verify the changes work correctly"
+  },
+  {
+    "id": 3,
+    "type": "require",
+    "lesson": "Before completing the task, save the notebook using Ctrl+S to ensure changes are persisted"
+  }
+]

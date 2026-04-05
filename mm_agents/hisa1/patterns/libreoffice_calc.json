@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Always use GUI operations for pivot table"
+  },
+  {
+    "id": 2,
+    "type": "require",
+    "lesson": "If no new sheet name is required, use Sheet2 as the new sheet name"
+  },
+  {
+    "id": 3,
+    "type": "require",
+    "lesson": "LibreOffice Calc does not have Sparkline chart functionality (which is Excel-specific). For inline visualizations, use regular chart objects or conditional formatting."
+  }
+]

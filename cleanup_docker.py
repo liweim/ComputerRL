@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import docker
 import logging
 
@@ -42,4 +43,11 @@ def cleanup_osworld_containers(remove_running: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    cleanup_osworld_containers(remove_running=False)
+    parser = argparse.ArgumentParser(description="Cleanup OSWorld Docker containers.")
+    parser.add_argument(
+        "--force-running",
+        action="store_true",
+        help="Also stop and remove currently running happysixd/osworld-docker containers.",
+    )
+    args = parser.parse_args()
+    cleanup_osworld_containers(remove_running=args.force_running)

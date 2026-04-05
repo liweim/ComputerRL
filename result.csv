@@ -20,7 +20,11 @@ hisa_qwen3.5-9b_wo_step_refinement_pattern_nothink,19.40,19.40,0.00,486.15,477.9
 hisa_qwen3.5-9b_wo_refinement_pattern,44.65,44.65,0.00,134.26,124.87,9.38,20.06,399.56,
 hisa_qwen3.5-9b_wo_pattern_tool,29.49,26.92,0.00,255.22,185.83,69.39,30.13,1737.87,
 hisa_qwen3.5-9b_wo_pattern,48.42,47.52,0.00,142.86,132.73,10.12,21.92,422.6,
-hisa_qwen3.5-9b,42.36,41.45,0.00,163.47,150.60,12.87,23.89,509.37,
+hisa_qwen3.5-9b_wo_pattern_2,27.47,27.47,0.00,142.90,132.70,10.20,21.63,420.53,
+hisa_qwen3.5-9b,49.19,47.39,0.00,166.16,153.31,12.85,23.75,494.56,
+hisa2_qwen3.5-9b,33.25,33.25,0.00,180.40,169.87,10.53,20.49,332.04,
+hisa2_qwen3.5-9b_exp,28.21,28.21,0.00,182.43,172.41,10.02,19.83,338.01,
+hisa1_qwen3.5-9b_subgoal_wo_pattern,32.37,30.57,0.00,174.51,162.55,11.95,24.47,474.92,
 ,,,,,,,,,
 OSWorld/all (369),,,,,,,,,
 Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step

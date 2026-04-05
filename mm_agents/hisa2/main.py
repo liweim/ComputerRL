@@ -897,6 +897,7 @@ class HiSA:
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
         self.prompt_dump_path = ""
         self.prompt_dump_counter = 0
+        self.last_dumped_system_prompt_hash = ""
         self.current_subgoal = ""
         self.consecutive_stuck_subgoals = 0
         self.awaiting_final_verification = False
@@ -930,6 +931,7 @@ class HiSA:
 
     def _init_prompt_dump_file(self) -> None:
         self.prompt_dump_counter = 0
+        self.last_dumped_system_prompt_hash = ""
         base_dir = self.save_dir or "."
         self.prompt_dump_path = os.path.join(base_dir, "model_trace.txt")
         os.makedirs(base_dir, exist_ok=True)
@@ -952,13 +954,32 @@ class HiSA:
             "index": self.prompt_dump_counter,
             "stage": stage,
             "step": step if step is not None else self.operation_count + 1,
-            "attempt": attempt,
         }
+        if attempt is not None:
+            block_meta["attempt"] = attempt
         for key, value in metadata.items():
             if value is not None:
                 block_meta[key] = value
 
-        sanitized_payload = self._sanitize_prompt_payload(payload)
+        payload_to_dump = payload
+        if (
+            stage == "global_planner"
+            and isinstance(payload, dict)
+            and isinstance(payload.get("messages"), list)
+            and payload["messages"]
+        ):
+            messages = copy.deepcopy(payload["messages"])
+            first_message = messages[0] if isinstance(messages[0], dict) else None
+            system_content = first_message.get("content") if isinstance(first_message, dict) else None
+            if first_message and first_message.get("role") == "system" and isinstance(system_content, str):
+                prompt_hash = self._hash_text(system_content)
+                if self.last_dumped_system_prompt_hash == prompt_hash:
+                    first_message["content"] = "<same as previous global_planner system prompt>"
+                else:
+                    self.last_dumped_system_prompt_hash = prompt_hash
+            payload_to_dump = {"messages": messages}
+
+        sanitized_payload = self._sanitize_prompt_payload(payload_to_dump)
         with open(self.prompt_dump_path, "a", encoding="utf-8") as f:
             f.write(f"\n## Prompt {self.prompt_dump_counter:04d}\n")
             for key, value in block_meta.items():

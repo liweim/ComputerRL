@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "type": "require",
+    "lesson": "Always modify existing files in-place using appropriate libraries (e.g., python-docx) instead of creating new files unless explicitly instructed."
+  },
+  {
+    "id": 2,
+    "type": "require",
+    "lesson": "CRITICAL: Identify and CLOSE the target file in the GUI before executing modification scripts to prevent permission errors."
+  },
+  {
+    "id": 3,
+    "type": "require",
+    "lesson": "Perform COMPLETE OVERWRITES of content blocks/paragraphs rather than appending, to ensure the final state is deterministic."
+  },
+  {
+    "id": 4,
+    "type": "require",
+    "lesson": "Strictly preserve existing headers, titles, styles, and structural elements unless the task specifically requests changing them."
+  },
+  {
+    "id": 5,
+    "type": "require",
+    "lesson": "Ensure fonts, colors, and formatting are maintained during script-based modifications."
+  },
+  {
+    "id": 6,
+    "type": "require",
+    "lesson": "LibreOffice Writer is designed for single-user editing. It does not have real-time multi-user collaborative editing features like Google Docs. Document sharing requires manual file exchange or server-based document management."
+  }
+]

@@ -1,0 +1,32 @@
+[
+    {
+      "id": 1,
+      "type": "require",
+      "lesson": "Modifications to 'settings.json' must be strictly formatted valid JSON and saved to disk to be recognized."
+    },
+    {
+      "id": 2,
+      "type": "require",
+      "lesson": "Core environment changes (e.g., Display Language, Theme) often require a window reload or restart to apply."
+    },
+    {
+      "id": 3,
+      "type": "require",
+      "lesson": "VS Code architecture supports one workspace per window. Opening multiple .code-workspace files requires separate window instances."
+    },
+    {
+      "id": 4,
+      "type": "require",
+      "lesson": "Many VS Code features require extensions: custom backgrounds need extensions, array/data visualization needs extensions, automated file creation on startup needs extensions. Check if functionality requires extensions before attempting through settings."
+    },
+    {
+      "id": 5,
+      "type": "require",
+      "lesson": "VS Code display language changes require language pack extensions to be installed. Built-in settings can only switch between already-installed language packs."
+    },
+    {
+      "id": 6,
+      "type": "require",
+      "lesson": "VS Code has no built-in data structure visualization in the editor. Visualizing variables (like numpy arrays) requires debugger mode with appropriate extensions or external tools."
+    }
+  ]
