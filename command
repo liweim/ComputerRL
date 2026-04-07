@@ -3,13 +3,13 @@ git lfs install
 git clone https://www.modelscope.cn/shawliu9/computerrl-glm4_1v-9b.git
 git clone https://huggingface.co/Qwen/Qwen3.5-9B.git
 
-conda activate uitars
+conda activate vllm
 export CUDA_VISIBLE_DEVICES=0
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name computerRL --model /home/weimingli/projects/computerrl-glm4_1v-9b --gpu-memory-utilization 0.4 --port 30000 > autoglm.log 2>&1 &
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name uitars-1.5-7b --model /home/weimingli/models/UI-TARS-1.5-7B --gpu-memory-utilization 0.4 --max-model-len 65536 --port 1235 > uitars.log 2>&1 &
 
 # 启动LLM
-conda activate uitars
+conda activate vllm
 nohup python -m vllm.entrypoints.openai.api_server --served-model-name gta1-7b --model /home/weimingli/models/GTA1-7B --gpu-memory-utilization 0.35 --max-model-len 65536 --host 0.0.0.0 --port 1234 > gta1.log 2>&1 &
 nohup python -m vllm.entrypoints.openai.api_server \
   --served-model-name qwen3.5-9b \
@@ -33,7 +33,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
   --tool-call-parser qwen3_coder > qwen.log 2>&1 &
 
 # 启动embedding service
-conda activate uitars
+conda activate vllm
 nohup python /home/weimingli/projects/ComputerRL/mm_agents/hisa/embedding.py > embedding.log 2>&1 &
 
 # 下载docker镜像
@@ -126,11 +126,11 @@ python run_hisa.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern_2 \
+  --result_dir ./results/hisa_qwen3.5-9b_wo_pattern_3_T2 \
   --headless \
   --max_steps 100 \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup2.out 2>&1 &
 
 nohup \
@@ -161,11 +161,24 @@ python run_hisa2.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa2_qwen3.5-9b \
+  --result_dir ./results/hisa2_qwen3.5-9b_wo_pattern_judge \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --wo_pattern \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
   > nohup.out 2>&1 &
+
+nohup \
+python run_hisa3.py \
+  --provider_name docker \
+  --vm_ram 8G \
+  --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
+  --result_dir ./results/hisa3_qwen3.5-9b_wo_pattern_judge \
+  --headless \
+  --max_steps 100 \
+  --wo_pattern \
+  --test_all_meta_path ./evaluation_examples/test_one.json \
+  > nohup2.out 2>&1 &
 
 # 杀进程
 ps -ef | grep run_autoglm_v_restart.py

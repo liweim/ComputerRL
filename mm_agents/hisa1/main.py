@@ -775,6 +775,7 @@ class HiSA:
         self.last_full_summary = None  # Last complete history summary
         self.last_summary_log_index = 0  # Number of action logs already folded into last_full_summary
         self.last_refinement_log_count = 0
+        self.last_refinement_step = 0
         self.step_token_usage = {}  # Store token usage for current step
         self.current_thought = ""  # Store current step's thought for step_abstract
         self.current_proposed_subgoal = ""
@@ -1075,11 +1076,12 @@ class HiSA:
         if self.wo_refinement or total_logs <= 0:
             return
 
-        logs_since_last_refinement = total_logs - int(getattr(self, "last_refinement_log_count", 0) or 0)
-        if logs_since_last_refinement <= 3:
+        if reason not in {"done", "blocked"}:
             return
 
-        if reason not in {"done", "blocked"}:
+        current_end_step = int(self.action_logs[-1]["step"])
+        last_refinement_step = int(getattr(self, "last_refinement_step", 0) or 0)
+        if current_end_step - last_refinement_step <= 3:
             return
 
         if self.last_full_summary:
@@ -1101,6 +1103,7 @@ class HiSA:
         self.last_full_summary = summary
         self.last_summary_log_index = total_logs
         self.last_refinement_log_count = total_logs
+        self.last_refinement_step = end_step
         self.logger.info(f"[refinement:{reason or 'periodic'}] {summary}")
 
         if self.wo_step:
@@ -1359,6 +1362,7 @@ class HiSA:
         self.last_full_summary = None
         self.last_summary_log_index = 0
         self.last_refinement_log_count = 0
+        self.last_refinement_step = 0
         self.conversation_messages = []  # Store full conversation history when wo_step=True
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
         self.current_subgoal = ""
@@ -1535,6 +1539,27 @@ class HiSA:
                 loop_error = self._detect_execution_loop(decision)
                 if loop_error:
                     self.logger.warning(loop_error)
+                    step = self.operation_count + 1
+                    self.action_logs.append({
+                        "step": step,
+                        "type": "loop_block",
+                        "execution_success": False,
+                        "screenshot": "",
+                        "subgoal": decision.get("subgoal", self.current_subgoal or ""),
+                        "execution_status": "blocked",
+                        "blocking_reason": "behavior_loop",
+                        "detail": loop_error,
+                        "step_abstract": self._build_step_abstract(
+                            step=step,
+                            tool_type="loop_block",
+                            success=False,
+                            detail=loop_error,
+                            verification="Repeated the same GUI action pattern without meaningful progress."
+                        ),
+                        "step_trace": f"Step {step}: loop blocked.\nDetail: {loop_error}",
+                        "step_time": 0.0,
+                        "token_usage": self.step_token_usage,
+                    })
                     self.last_execution_status = "blocked"
                     self.last_blocking_reason = "behavior_loop"
                     self.last_error_feedback = (
@@ -1542,6 +1567,12 @@ class HiSA:
                         "Do not repeat the same action. Switch strategy immediately "
                         "(different target, different tool, or different command)."
                     )
+                    self.logger.info(
+                        "[execution_status] step=%s status=blocked blocking_reason=behavior_loop subgoal=%s",
+                        step,
+                        decision.get("subgoal", self.current_subgoal or ""),
+                    )
+                    self._maybe_refine_context("blocked")
                     if self.wo_step:
                         self.last_tool_output = f"Execution blocked: {loop_error}"
                     # Count this as a consumed step to avoid infinite planner-loop cycles.

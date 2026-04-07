@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import ast
 import base64
+import builtins
+import contextlib
 import copy
 import json
 import os
 import logging
+import subprocess as py_subprocess
 import traceback
 import re
 import hashlib
@@ -32,6 +35,7 @@ GROUNDED_GUI_TOOLS = {"click", "double_click", "right_click", "move", "drag", "s
 NON_GUI_TOOLS = {"bash_execution", "wait", "termination", "infeasible"}
 VALID_TOOLS = GUI_ACTION_TOOLS | NON_GUI_TOOLS
 ACTION_SCRIPT_FUNCTIONS = {
+    "import_subprocess",
     "click",
     "double_click",
     "right_click",
@@ -40,18 +44,40 @@ ACTION_SCRIPT_FUNCTIONS = {
     "write",
     "hotkey",
     "scroll",
-    "bash",
     "termination",
     "infeasible",
 }
 
 
+class _TerminalActionSignal(Exception):
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class _TerminalActionSignal(Exception):
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 def _validate_scroll_amount(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("scroll amount must be an integer")
-    if value < -10 or value > 10:
-        raise ValueError("scroll amount must be within [-10, 10]")
+    if value < -5 or value > 5:
+        raise ValueError("scroll amount must be within [-5, 5]")
     return value
+
+
+def _infer_scroll_amount(description: str, default_magnitude: int = 5) -> int:
+    text = f" {str(description or '').lower()} "
+    if " up " in text:
+        return default_magnitude
+    if " down " in text:
+        return -default_magnitude
+    raise ValueError("scroll() requires an amount or a description containing 'up' or 'down'")
 
 
 # ==================== PROMPTS ====================
@@ -74,6 +100,7 @@ Core rules:
 - Before termination, verify the exact requested outcome with concrete evidence from the current screenshot or a read-only command.
 - Do not terminate based only on a click succeeding, a popup/toast appearing, or a page/dialog opening.
 - If verification is inconclusive, continue working instead of terminating.
+- Do not use `termination(...)` if your own verification message says a requirement is still missing, mismatched, or only partially satisfied.
 - If the task cannot actually be completed because of a product limitation, missing capability, unsupported format, or objectively impossible constraint, use `infeasible(str)` instead of `termination(str)`.
 - Explaining why a task is impossible is not completion. Do not use `termination(...)` just because you explained the limitation.
 
@@ -91,18 +118,18 @@ Field guide:
 - `subgoal`: a phase-level objective, not a single action. Use `continue` if the next action is still pursuing the current subgoal. Otherwise provide a new phase-level objective.
 - Good: `Open Chrome settings`, `Configure the default search engine`, `Verify the final result`.
 - Bad: `Click Settings`, `Type the filename`, `Press Enter`, `Scroll down`.
-- `code`: Python-style action script to execute next. Use one function call per line. Actions run in order, and each action gets a fresh observation before the next action is grounded.
+- `code`: valid Python code to execute next. You may use normal Python statements.
 
 Code guide:
-- Allowed functions: `click(str)`, `double_click(str)`, `right_click(str)`, `move(str)`, `drag(str, str, str)`, `write(str)`, `hotkey(str, ...)`, `scroll(str, int)`, `bash(str)`, `termination(str)`, `infeasible(str)`
+- Allowed GUI/helper functions: `click(str)`, `double_click(str)`, `right_click(str)`, `move(str)`, `drag(str, str, str)`, `write(str)`, `hotkey(str, ...)`, `scroll(str, int)`, `termination(str)`, `infeasible(str)`
+- For shell commands, write normal Python code with `import subprocess` and `subprocess.run(...)`. When you pass a shell command string, use `shell=True`. Example: `import subprocess` then `subprocess.run('ls -la ~/Downloads', shell=True)`.
 - For grounded GUI functions, use a detailed, self-contained instruction string that uniquely identifies the target on the current screenshot.
 - Every string argument in `code` must be a valid Python string literal. Put the entire natural-language instruction inside quotes. Good: `click("Click the Search engine option in the left sidebar of Chrome Settings")`. Bad: `click("Search engine" option in the left sidebar of Chrome Settings)`
-- `click(str)`, `double_click(str)`, `right_click(str)`, and `move(str)` each take exactly one string argument.
 - `drag(instruction, source, destination)`: `instruction` should describe the full drag action, and `source` / `destination` should name the start and end targets clearly. Example: `drag('Drag from cell A12 to cell A22 in column A', 'cell A12', 'cell A22')`
-- `scroll(description, amount)`: `description` must describe where to scroll, and `amount` must be an integer in `[-10, 10]`. Use a negative amount to scroll down and a positive amount to scroll up.
-- `write(str)`: text to type into the focused field. Put the entire text or spreadsheet formula inside one valid Python string literal. Example: `write('=TEXT(C2;\"0000000\")')`
-- `hotkey(...)`: pass one or more string arguments. Examples: `hotkey('ctrl', 'l')`, `hotkey('enter')` or `hotkey('ctrl+l')`. Do not output bare tokens like `backspace` or `enter`; always wrap them as function calls such as `hotkey('backspace')` or `hotkey('enter')`.
-- `bash(str)`: shell command to execute. Put the entire shell command inside one quoted string on a single line. Do not use heredoc syntax or place raw shell lines outside `bash(...)`. `bash(...)` may appear in a mixed action script when the sequence is necessary.
+- `scroll(description, amount)`: make the scroll direction clear in the description. `amount` must be an integer in `[-5, 5]`.
+- `write(str)`: keep the entire text or formula inside one Python string.
+- `hotkey(...)`: wrap keys as function calls, for example `hotkey('enter')` or `hotkey('ctrl', 'l')`.
+- `subprocess.run(...)`: use it directly for shell execution.
 - `termination(str)`: completion summary after the task is fully verified.
 - `infeasible(str)`: objective reason the task cannot be completed. Use `infeasible(...)` when the screenshot, app error message, or command output shows the requested end state cannot be achieved in this environment.
 
@@ -119,7 +146,7 @@ Code guide:
 {
     "thought": "The needed information is easier to verify from the shell than from the GUI, so I should run one read-only command.",
     "subgoal": "Verify the generated file",
-    "code": "bash('ls -la ~/Downloads')"
+    "code": "import subprocess\nsubprocess.run('ls -la ~/Downloads', shell=True)"
 }
 ```"""
 
@@ -143,9 +170,9 @@ Important:
 - Always include `subgoal`
 - Use `subgoal: "continue"` when staying on the same subgoal
 - Otherwise `subgoal` must be a stage goal, not a single click or keystroke
-- `code` must be Python-style action calls using only the allowed functions
-- Every string argument in `code` must be a valid quoted Python string literal
-- `scroll(...)` must have exactly two arguments: description string and integer amount in `[-10, 10]`"""
+- `code` must be valid Python code
+- Every natural-language target or text value must stay inside quotes
+- `scroll(...)` must include a description string; if you omit the second argument, include `up` or `down` in the description so the system can infer the direction"""
 
 STEP_ABSTRACTION_PROMPT = """Compare the latest observations and summarize what happened in 1-2 concise sentences.
 
@@ -309,6 +336,12 @@ class PatternManager:
         domain = re.sub(r"[^a-z0-9_]+", "_", domain)
         domain = re.sub(r"_+", "_", domain).strip("_")
         return domain or "general"
+
+    def _normalize_memory_prefix(self, domain: str, task_id: str) -> str:
+        normalized_domain = self._normalize_domain(domain)
+        normalized_task_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(task_id or "unknown").strip())
+        normalized_task_id = re.sub(r"_+", "_", normalized_task_id).strip("_") or "unknown"
+        return f"{normalized_domain}_{normalized_task_id}"
 
     def _get_memory_dir(self, domain: str) -> str:
         return os.path.join(self.memory_root, self._normalize_domain(domain))
@@ -487,7 +520,8 @@ class PatternManager:
                     continue
 
                 file_stub = hashlib.sha256(f"{lesson_type}:{lesson_text}".encode("utf-8")).hexdigest()[:10]
-                file_name = f"{lesson_type}_{int(time.time())}_{file_stub}.md"
+                memory_prefix = self._normalize_memory_prefix(normalized_domain, task_id or "unknown")
+                file_name = f"{memory_prefix}_{lesson_type}_{int(time.time())}_{file_stub}.md"
                 file_path = os.path.join(memory_dir, file_name)
                 description = lesson_text
                 typed_signature = task_signature or self._normalize_domain(domain)
@@ -888,7 +922,6 @@ class HiSA:
         self.last_tool_output = None  # Store last tool execution result for wo_step mode
         self.prompt_dump_path = ""
         self.prompt_dump_counter = 0
-        self.last_dumped_system_prompt_hash = ""
         self.current_subgoal = ""
         self.consecutive_stuck_subgoals = 0
         self.awaiting_final_verification = False
@@ -922,7 +955,6 @@ class HiSA:
 
     def _init_prompt_dump_file(self) -> None:
         self.prompt_dump_counter = 0
-        self.last_dumped_system_prompt_hash = ""
         base_dir = self.save_dir or "."
         self.prompt_dump_path = os.path.join(base_dir, "model_trace.txt")
         os.makedirs(base_dir, exist_ok=True)
@@ -952,25 +984,7 @@ class HiSA:
             if value is not None:
                 block_meta[key] = value
 
-        payload_to_dump = payload
-        if (
-            stage == "global_planner"
-            and isinstance(payload, dict)
-            and isinstance(payload.get("messages"), list)
-            and payload["messages"]
-        ):
-            messages = copy.deepcopy(payload["messages"])
-            first_message = messages[0] if isinstance(messages[0], dict) else None
-            system_content = first_message.get("content") if isinstance(first_message, dict) else None
-            if first_message and first_message.get("role") == "system" and isinstance(system_content, str):
-                prompt_hash = self._hash_text(system_content)
-                if self.last_dumped_system_prompt_hash == prompt_hash:
-                    first_message["content"] = "<same as previous global_planner system prompt>"
-                else:
-                    self.last_dumped_system_prompt_hash = prompt_hash
-            payload_to_dump = {"messages": messages}
-
-        sanitized_payload = self._sanitize_prompt_payload(payload_to_dump)
+        sanitized_payload = self._sanitize_prompt_payload(payload)
         with open(self.prompt_dump_path, "a", encoding="utf-8") as f:
             f.write(f"\n## Prompt {self.prompt_dump_counter:04d}\n")
             for key, value in block_meta.items():
@@ -1304,7 +1318,7 @@ class HiSA:
         proposed_subgoal = self._normalize_subgoal(decision.get("subgoal", ""))
         latest_log = self.action_logs[-1] if self.action_logs else {}
         verified = str((latest_log.get("compact") or {}).get("verified", "") or "").lower()
-        if decision.get("tool") == "termination":
+        if "termination(" in str(decision.get("code", "") or ""):
             return "finish", ""
         if latest_log.get("execution_success") is False:
             return "blocked", "progress_stall"
@@ -1332,6 +1346,7 @@ class HiSA:
         previous_subgoal = self.current_subgoal
         status = self._normalize_execution_status(decision.get("execution_status", "continue"))
         blocking_reason = self._normalize_blocking_reason(decision.get("blocking_reason", ""))
+
         if self.action_logs:
             self.action_logs[-1]["subgoal"] = proposed_subgoal
             self.action_logs[-1]["execution_status"] = status
@@ -1393,7 +1408,47 @@ class HiSA:
                 "Do one more targeted verification or finish the missing requirement."
                 + (f"\nMissing: {detail}" if detail else "")
             )
+        if event_type == "termination_self_contradiction":
+            return (
+                "Blocked feedback: your termination message itself says the task is not fully complete.\n"
+                "Do not terminate until the missing requirement is actually satisfied."
+                + (f"\nMissing: {detail}" if detail else "")
+            )
         return detail or "Blocked feedback: reassess the current subgoal and choose a different strategy."
+
+    def _termination_message_has_unmet_requirement(self, message: str) -> bool:
+        text = re.sub(r"\s+", " ", str(message or "").strip()).lower()
+        if not text:
+            return False
+        unmet_markers = [
+            "not complete",
+            "not fully complete",
+            "not completed",
+            "not achieved",
+            "not applied",
+            "not visible",
+            "not found",
+            "not installed",
+            "not configured",
+            "not set",
+            "failed",
+            "still needs",
+            "needs additional",
+            "requires additional",
+            "does not match",
+            "did not match",
+            "differs from",
+            "instead of",
+            "however",
+            "but ",
+        ]
+        positive_markers = [
+            "task completed",
+            "fully verified",
+            "successfully completed",
+            "requested final state is visible",
+        ]
+        return any(marker in text for marker in unmet_markers) and not any(marker in text for marker in positive_markers)
 
     def _run_final_verification(self) -> bool:
         screenshot = self._wait_until_screenshot_available(timeout_seconds=2.0)
@@ -1615,8 +1670,31 @@ class HiSA:
             return "[" + ",".join(self._normalize_action_arg(item) for item in value) + "]"
         return re.sub(r"\s+", " ", str(value).strip()).lower()
 
+    def _coerce_action_script_to_python(self, code: str) -> str:
+        text = str(code or "").strip()
+        if not text:
+            return text
+
+        helper_names = [name for name in ACTION_SCRIPT_FUNCTIONS if name != "import_subprocess"]
+        helper_pattern = r"\b(?:%s)\s*\(" % "|".join(re.escape(name) for name in helper_names)
+        if re.search(helper_pattern, text):
+            return text
+        if "import subprocess" in text or "subprocess.run" in text:
+            return text
+
+        first_line = next((line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")), "")
+        if not first_line:
+            return text
+
+        if re.match(r"^(import|from|if|for|while|try|with|def|class|return|print|assert|del|pass|break|continue|raise)\b", first_line):
+            return text
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*(\(|=|\.|\[|:)", first_line):
+            return text
+
+        return f"import subprocess\nsubprocess.run({text!r}, shell=True)"
+
     def _get_script_action_units(self, decision: Dict) -> List[Dict[str, str]]:
-        code = str(decision.get("code", "") or "").strip()
+        code = self._coerce_action_script_to_python(str(decision.get("code", "") or "").strip())
         if not code:
             return []
         try:
@@ -1983,7 +2061,7 @@ class HiSA:
                 loop_error = self._detect_execution_loop(decision)
                 if loop_error:
                     self.logger.warning(loop_error)
-                    step = self.current_step_id or (self.operation_count + 1)
+                    step = self.operation_count + 1
                     self.action_logs.append({
                         "step": step,
                         "type": "loop_block",
@@ -2002,12 +2080,7 @@ class HiSA:
                             next_hint="Switch target, tool, or overall approach instead of repeating the same action script."
                         ),
                         "step_time": 0.0,
-                        "token_usage": {
-                            "global_planner": self._zero_usage_entry(),
-                            "visual_grounder": self._zero_usage_entry(),
-                            "state_manager": self._zero_usage_entry(),
-                            "total": self._zero_usage_entry(),
-                        }
+                        "token_usage": self.step_token_usage,
                     })
                     self.last_blocked_feedback = self._build_blocked_feedback("loop_detected", loop_error)
                     self.last_error_feedback = self.last_blocked_feedback
@@ -2035,6 +2108,20 @@ class HiSA:
                     self.last_tool_output = execution_result_text
 
                 if terminal_status == "termination":
+                    if self._termination_message_has_unmet_requirement(terminal_message):
+                        self.awaiting_final_verification = True
+                        self.final_verification_observed = False
+                        self.last_blocked_feedback = self._build_blocked_feedback(
+                            "termination_self_contradiction",
+                            terminal_message,
+                        )
+                        self.last_error_feedback = self.last_blocked_feedback
+                        if self.wo_step:
+                            suffix = "\n\n" if execution_result_text else ""
+                            self.last_tool_output = (execution_result_text or "") + suffix + "Termination blocked: the completion message still describes an unmet requirement."
+                        self.logger.info("Termination blocked: completion message indicates unmet requirements")
+                        continue
+
                     verification = self._run_final_verification()
                     if not verification:
                         self.awaiting_final_verification = True
@@ -2269,10 +2356,12 @@ class HiSA:
 
                 if "subgoal" not in decision:
                     raise ValueError("Missing 'subgoal' field in decision")
+
                 if "code" not in decision:
                     raise ValueError("Missing 'code' field in decision")
                 if not isinstance(decision.get("code"), str) or not decision["code"].strip():
                     raise ValueError("Decision 'code' must be a non-empty string")
+                decision["code"] = self._coerce_action_script_to_python(decision["code"])
                 decision["subgoal"] = self._resolve_planner_subgoal(decision["subgoal"], decision["code"])
                 self._parse_action_script(decision["code"])
 
@@ -2345,6 +2434,7 @@ class HiSA:
         """Execute planner-produced action script and return output, terminal status, and terminal message."""
         self.current_thought = decision.get("thought", "")
         self.current_proposed_subgoal = self._normalize_subgoal(decision["subgoal"])
+        decision["code"] = self._coerce_action_script_to_python(decision["code"])
         actions = self._parse_action_script(decision["code"])
         self.current_decision_action_fingerprint = self._get_script_fingerprint_from_decision(decision)
         gui_units = [unit["fingerprint"] for unit in self._get_script_action_units(decision) if unit["name"] in GUI_ACTION_TOOLS]
@@ -2352,88 +2442,11 @@ class HiSA:
         outputs: List[str] = []
         terminal_status = None
         terminal_message = ""
-        bash_seen = False
 
-        for index, action in enumerate(actions):
-            name = action["name"]
-            args = action["args"]
-            include_planner = index == 0
-            usage_before_tool = self._get_usage_snapshot()
-            self.step_token_usage = self._build_step_token_usage(
-                planner_usage=planner_usage,
-                tool_usage={"visual_grounder": self._zero_usage_entry(), "state_manager": self._zero_usage_entry()},
-                include_planner=include_planner,
-            )
+        action_index = 0
 
-            if name == "click":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("click() expects one string argument")
-                execution_result_text = self._execute_gui_tool("click", args[0], args[0])
-            elif name == "double_click":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("double_click() expects one string argument")
-                execution_result_text = self._execute_gui_tool("double_click", args[0], args[0])
-            elif name == "right_click":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("right_click() expects one string argument")
-                execution_result_text = self._execute_gui_tool("right_click", args[0], args[0])
-            elif name == "move":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("move() expects one string argument")
-                execution_result_text = self._execute_gui_tool("move", args[0], args[0])
-            elif name == "drag":
-                if len(args) not in {2, 3} or not all(isinstance(arg, str) for arg in args):
-                    raise ValueError("drag() expects two or three string arguments")
-                if len(args) == 3:
-                    drag_instruction, drag_source, drag_destination = args
-                    drag_input = f"{drag_source} -> {drag_destination}"
-                    drag_description = drag_instruction
-                else:
-                    drag_source, drag_destination = args
-                    drag_input = f"{drag_source} -> {drag_destination}"
-                    drag_description = f"Drag from {drag_source} to {drag_destination}"
-                execution_result_text = self._execute_gui_tool("drag", drag_input, drag_description)
-            elif name == "write":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("write() expects one string argument")
-                execution_result_text = self._execute_gui_tool("write", args[0], "")
-            elif name == "hotkey":
-                if not args or not all(isinstance(arg, str) for arg in args):
-                    raise ValueError("hotkey() expects one or more string arguments")
-                hotkey_input = args[0] if len(args) == 1 else "+".join(args)
-                execution_result_text = self._execute_gui_tool("hotkey", hotkey_input, "")
-            elif name == "scroll":
-                if len(args) != 2 or not isinstance(args[0], str):
-                    raise ValueError("scroll() expects description string and integer amount")
-                execution_result_text = self._execute_gui_tool(
-                    "scroll",
-                    {"instruction": args[0], "amount": _validate_scroll_amount(args[1])},
-                    args[0],
-                )
-            elif name == "bash":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("bash() expects one string argument")
-                bash_seen = True
-                execution_result_text = self._bash_execution(args[0])
-            elif name == "termination":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("termination() expects one string argument")
-                if index != len(actions) - 1:
-                    raise ValueError("termination() must be the last action in the script")
-                terminal_status = "termination"
-                terminal_message = args[0]
-                break
-            elif name == "infeasible":
-                if len(args) != 1 or not isinstance(args[0], str):
-                    raise ValueError("infeasible() expects one string argument")
-                if index != len(actions) - 1:
-                    raise ValueError("infeasible() must be the last action in the script")
-                terminal_status = "infeasible"
-                terminal_message = args[0]
-                break
-            else:
-                raise ValueError(f"Unsupported action function: {name}")
-
+        def _finalize_runtime_action(execution_result_text: str, include_planner: bool, usage_before_tool: Dict) -> str:
+            nonlocal action_index
             outputs.append(execution_result_text)
             usage_after_tool = self._get_usage_snapshot()
             tool_usage = self._calculate_usage_delta(usage_before_tool, usage_after_tool)
@@ -2448,9 +2461,20 @@ class HiSA:
             else:
                 decision.pop("blocking_reason", None)
             if blocking_reason:
-                self.logger.info("[execution_status] step=%s status=%s blocking_reason=%s subgoal=%s", self.current_step_id or (self.operation_count + 1), derived_status, blocking_reason, decision.get("subgoal", ""))
+                self.logger.info(
+                    "[execution_status] step=%s status=%s blocking_reason=%s subgoal=%s",
+                    self.current_step_id or (self.operation_count + 1),
+                    derived_status,
+                    blocking_reason,
+                    decision.get("subgoal", ""),
+                )
             else:
-                self.logger.info("[execution_status] step=%s status=%s subgoal=%s", self.current_step_id or (self.operation_count + 1), derived_status, decision.get("subgoal", ""))
+                self.logger.info(
+                    "[execution_status] step=%s status=%s subgoal=%s",
+                    self.current_step_id or (self.operation_count + 1),
+                    derived_status,
+                    decision.get("subgoal", ""),
+                )
             status = self._record_subgoal_transition(decision)
             if self.awaiting_final_verification:
                 self.final_verification_observed = True
@@ -2463,6 +2487,167 @@ class HiSA:
                 event_detail = self.last_blocked_feedback_event.get("detail", "")
                 self.last_blocked_feedback = self._build_blocked_feedback(event_type, event_detail)
                 self.last_error_feedback = self.last_blocked_feedback
+            action_index += 1
+            return execution_result_text
+
+        def _run_runtime_action(fn: Callable[[], str]) -> str:
+            include_planner = action_index == 0
+            usage_before_tool = self._get_usage_snapshot()
+            self.step_token_usage = self._build_step_token_usage(
+                planner_usage=planner_usage,
+                tool_usage={"visual_grounder": self._zero_usage_entry(), "state_manager": self._zero_usage_entry()},
+                include_planner=include_planner,
+            )
+            return _finalize_runtime_action(fn(), include_planner, usage_before_tool)
+
+        class _RuntimeSubprocessModule:
+            def __init__(self, outer):
+                self._outer = outer
+
+            def run(self, *args, **kwargs):
+                result_holder: Dict[str, Any] = {}
+
+                def _call():
+                    execution_text, completed_process = self._outer._subprocess_run_execution(
+                        list(args),
+                        dict(kwargs),
+                        return_completed_process=True,
+                    )
+                    result_holder["value"] = completed_process
+                    return execution_text
+
+                _run_runtime_action(_call)
+                return result_holder.get("value")
+
+        def _runtime_click(arg: str):
+            return _run_runtime_action(lambda: self._execute_gui_tool("click", arg, arg))
+
+        def _runtime_double_click(arg: str):
+            return _run_runtime_action(lambda: self._execute_gui_tool("double_click", arg, arg))
+
+        def _runtime_right_click(arg: str):
+            return _run_runtime_action(lambda: self._execute_gui_tool("right_click", arg, arg))
+
+        def _runtime_move(arg: str):
+            return _run_runtime_action(lambda: self._execute_gui_tool("move", arg, arg))
+
+        def _runtime_drag(*args):
+            if len(args) == 3:
+                drag_instruction, drag_source, drag_destination = args
+                drag_input = f"{drag_source} -> {drag_destination}"
+                drag_description = drag_instruction
+            elif len(args) == 2:
+                drag_source, drag_destination = args
+                drag_input = f"{drag_source} -> {drag_destination}"
+                drag_description = f"Drag from {drag_source} to {drag_destination}"
+            else:
+                raise ValueError("drag() expects two or three string arguments")
+            return _run_runtime_action(lambda: self._execute_gui_tool("drag", drag_input, drag_description))
+
+        def _runtime_write(arg: str):
+            return _run_runtime_action(lambda: self._execute_gui_tool("write", arg, ""))
+
+        def _runtime_hotkey(*args):
+            if not args or not all(isinstance(arg, str) for arg in args):
+                raise ValueError("hotkey() expects one or more string arguments")
+            hotkey_input = args[0] if len(args) == 1 else "+".join(args)
+            return _run_runtime_action(lambda: self._execute_gui_tool("hotkey", hotkey_input, ""))
+
+        def _runtime_scroll(description: str, amount: Optional[int] = None):
+            resolved_amount = _validate_scroll_amount(amount) if amount is not None else _infer_scroll_amount(description)
+            return _run_runtime_action(
+                lambda: self._execute_gui_tool(
+                    "scroll",
+                    {"instruction": description, "amount": resolved_amount},
+                    description,
+                )
+            )
+
+        def _runtime_termination(message: str):
+            raise _TerminalActionSignal("termination", message)
+
+        def _runtime_infeasible(message: str):
+            raise _TerminalActionSignal("infeasible", message)
+
+        def _runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "subprocess" and level == 0:
+                return _RuntimeSubprocessModule(self)
+            return builtins.__import__(name, globals, locals, fromlist, level)
+
+        runtime_builtins = dict(builtins.__dict__)
+        runtime_builtins["__import__"] = _runtime_import
+
+        safe_globals = {
+            "__builtins__": runtime_builtins,
+            "click": _runtime_click,
+            "double_click": _runtime_double_click,
+            "right_click": _runtime_right_click,
+            "move": _runtime_move,
+            "drag": _runtime_drag,
+            "write": _runtime_write,
+            "hotkey": _runtime_hotkey,
+            "scroll": _runtime_scroll,
+            "termination": _runtime_termination,
+            "infeasible": _runtime_infeasible,
+            "subprocess": _RuntimeSubprocessModule(self),
+        }
+        runtime_locals: Dict[str, Any] = {}
+
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+
+        try:
+            with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+                exec(compile(decision["code"], "<action_script>", "exec"), safe_globals, runtime_locals)
+        except _TerminalActionSignal as signal:
+            terminal_status = signal.status
+            terminal_message = signal.message
+        except Exception as exec_error:
+            self.logger.error(f"Python execution error: {exec_error}")
+            step = self.current_step_id or (self.operation_count + 1)
+            screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}.png"
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(screenshot)
+
+            error_text = f"{type(exec_error).__name__}: {exec_error}"
+            self.action_logs.append({
+                "step": step,
+                "type": "python_execution",
+                "execution_success": False,
+                "screenshot": screenshot_file,
+                "detail": decision.get("code", ""),
+                "execution_status": "blocked",
+                "blocking_reason": "progress_stall",
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="python_execution",
+                    success=False,
+                    detail=decision.get("code", ""),
+                    verification=f"Error: {error_text}",
+                    next_hint="Fix the Python code or helper call instead of repeating the same failing step."
+                ),
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": self.current_decision_action_fingerprint,
+                "loop_result_fingerprint": self._hash_text(f"python_error={error_text}"),
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status=blocked|python_error={error_text}|code={decision.get('code', '')}"
+                ),
+            })
+            self.last_blocked_feedback_event = {
+                "type": "tool_execution_failed",
+                "detail": error_text,
+            }
+            outputs.append(f"[python error]\n{error_text}")
+
+        stdout_text = captured_stdout.getvalue().strip()
+        stderr_text = captured_stderr.getvalue().strip()
+        if stdout_text:
+            outputs.append(f"[python stdout]\n{stdout_text}")
+        if stderr_text:
+            outputs.append(f"[python stderr]\n{stderr_text}")
 
         return "\n\n".join(part for part in outputs if part), terminal_status, terminal_message
 
@@ -2500,14 +2685,6 @@ class HiSA:
         error_text = str(error_message)
         if (
             "Failed to parse action script" not in error_text
-            and "Action script must contain only function-call statements" not in error_text
-            and "drag() expects two or three string arguments" not in error_text
-            and "move() expects one string argument" not in error_text
-            and "click() expects one string argument" not in error_text
-            and "double_click() expects one string argument" not in error_text
-            and "right_click() expects one string argument" not in error_text
-            and "bash() expects one string argument" not in error_text
-            and "Unsupported action function: wait" not in error_text
         ):
             return ""
 
@@ -2530,50 +2707,18 @@ class HiSA:
 
         guidance_lines = [
             "Action-script fix requirements:",
-            "- `code` must be valid Python syntax with one function call per line.",
+            "- `code` must be valid Python syntax.",
             "- Put the entire natural-language target inside a single quoted string argument.",
             "- Do not leave text outside quotes.",
             "- Balance every `(` with `)`.",
-            "- `click()`, `double_click()`, `right_click()`, and `move()` each require exactly one quoted instruction string.",
-            "- Use `drag('full instruction', 'source', 'destination')` for drag actions.",
+            "- Use valid Python code. Helper calls such as `click(...)`, `drag(...)`, `write(...)`, `hotkey(...)`, and `scroll(...)` are available.",
+            "- For shell execution, write normal Python such as `import subprocess` and `subprocess.run(...)`.",
             "- Put the full `write(...)` text or spreadsheet formula inside one valid Python string literal.",
             "- For formulas with quotes inside them, keep the outer Python quotes different. Example: `write('=TEXT(C2;\"0000000\")')`.",
-            "- For single-key actions use `hotkey('enter')`; for combos use `hotkey('ctrl', 'a')`.",
-            "- Do not output bare tokens like `backspace` or `enter`; write `hotkey('backspace')` or `hotkey('enter')`.",
-            "- Put each shell command inside exactly one `bash('...')` call on a single line.",
-            "- Do not use heredoc syntax in `bash(...)` and do not place raw shell commands on separate lines outside `bash(...)`.",
         ]
-        if "Action script must contain only function-call statements" in error_text:
-            guidance_lines.append(
-                "- Every line must be a function call. Invalid: `backspace`. Valid: `hotkey('backspace')`."
-            )
-        if "drag() expects two or three string arguments" in error_text:
-            guidance_lines.append(
-                "- `drag()` cannot take a single description string. Use `drag('full instruction', 'source', 'destination')`."
-            )
-        if (
-            "move() expects one string argument" in error_text
-            or "click() expects one string argument" in error_text
-            or "double_click() expects one string argument" in error_text
-            or "right_click() expects one string argument" in error_text
-        ):
-            guidance_lines.append(
-                "- `click()`, `double_click()`, `right_click()`, and `move()` each accept exactly one quoted instruction string."
-            )
         if "unterminated string literal" in error_text or "'(' was never closed" in error_text:
             guidance_lines.append(
                 "- If `write(...)` contains a spreadsheet formula, keep the whole formula inside one quoted Python string, for example `write('=TEXT(C2;\"0000000\")')`."
-            )
-            guidance_lines.append(
-                "- If `bash(...)` contains a shell command, keep the whole command inside one quoted Python string on a single line; do not use heredoc blocks."
-            )
-        if "bash() expects one string argument" in error_text:
-            guidance_lines.append(
-                "- `bash()` accepts exactly one quoted shell command string."
-            )
-        if "Unsupported action function: wait" in error_text:
-            guidance_lines.append(
-                "- `wait()` is not supported. Remove it and let the system observe the result after each action automatically."
             )
         if code_snippet:
             guidance_lines.append(f"- Current invalid `code`: {code_snippet}")
@@ -2592,20 +2737,6 @@ class HiSA:
 
         call_match = re.match(r"^([A-Za-z_]\w*)\((.*)\)\s*$", stripped)
         if not call_match:
-            shell_prefixes = (
-                "find ",
-                "ls ",
-                "cat ",
-                "cd ",
-                "mkdir ",
-                "grep ",
-                "sed ",
-                "python ",
-                "python3 ",
-                "libreoffice ",
-            )
-            if stripped.startswith(shell_prefixes) or any(token in stripped for token in {"&&", "||", "2>/", ">/", "~/", "/home/"}):
-                return f"bash({stripped!r})"
             return stripped
 
         name, raw_args = call_match.groups()
@@ -2663,7 +2794,7 @@ class HiSA:
             cleaned = cleaned.replace('"', "").replace("'", "").strip()
             return repr(cleaned)
 
-        if name in {"click", "double_click", "right_click", "move", "write", "bash", "termination", "infeasible"}:
+        if name in {"click", "double_click", "right_click", "move", "write", "termination", "infeasible"}:
             return f"{name}({as_single_string_arg(raw_args)})"
 
         if name == "hotkey":
@@ -2725,6 +2856,53 @@ class HiSA:
         repaired = "\n".join(repaired_lines).strip()
         return repaired or code
 
+    def _parse_call_args(self, call: ast.Call) -> Tuple[List[Any], Dict[str, Any]]:
+        try:
+            args = [ast.literal_eval(arg) for arg in call.args]
+            kwargs = {
+                str(kw.arg): ast.literal_eval(kw.value)
+                for kw in call.keywords
+                if kw.arg is not None
+            }
+        except Exception as e:
+            raise ValueError(f"Failed to parse call arguments: {e}") from e
+        return args, kwargs
+
+    def _validate_action_signature(self, name: str, args: List[Any], kwargs: Dict[str, Any]) -> None:
+        if name == "import_subprocess":
+            return
+        if kwargs and name in ACTION_SCRIPT_FUNCTIONS:
+            raise ValueError(f"Keyword arguments are not supported for {name}()")
+        if name in {"click", "double_click", "right_click", "move", "write", "termination", "infeasible"}:
+            if len(args) != 1 or not isinstance(args[0], str):
+                raise ValueError(f"{name}() expects one string argument")
+            return
+        if name == "drag":
+            if len(args) not in {2, 3} or not all(isinstance(arg, str) for arg in args):
+                raise ValueError("drag() expects two or three string arguments")
+            return
+        if name == "hotkey":
+            if not args or not all(isinstance(arg, str) for arg in args):
+                raise ValueError("hotkey() expects one or more string arguments")
+            return
+        if name == "scroll":
+            if len(args) != 2 or not isinstance(args[0], str):
+                raise ValueError("scroll() expects description string and integer amount")
+            _validate_scroll_amount(args[1])
+            return
+        if name == "subprocess.run":
+            if not args:
+                raise ValueError("subprocess.run() expects at least one positional argument")
+            command = args[0]
+            if not isinstance(command, (str, list, tuple)):
+                raise ValueError("subprocess.run() command must be a string or list")
+            if isinstance(command, (list, tuple)) and not all(isinstance(part, str) for part in command):
+                raise ValueError("subprocess.run() list command must contain only strings")
+            unsupported_kwargs = set(kwargs) - {"shell", "capture_output", "text", "check", "timeout", "cwd"}
+            if unsupported_kwargs:
+                raise ValueError(f"Unsupported subprocess call: unsupported kwargs {sorted(unsupported_kwargs)}")
+            return
+
     def _parse_action_script(self, code: str) -> List[Dict[str, Any]]:
         if not isinstance(code, str) or not code.strip():
             raise ValueError("Action script must be a non-empty string")
@@ -2732,36 +2910,37 @@ class HiSA:
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            repaired_code = self._repair_action_script(code)
-            if repaired_code != code:
-                try:
-                    tree = ast.parse(repaired_code)
-                    code = repaired_code
-                except SyntaxError:
-                    raise ValueError(f"Failed to parse action script: {e}") from e
-            else:
-                raise ValueError(f"Failed to parse action script: {e}") from e
+            raise ValueError(f"Failed to parse action script: {e}") from e
 
         actions: List[Dict[str, Any]] = []
-        for stmt in tree.body:
-            if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
-                raise ValueError("Action script must contain only function-call statements")
-            call = stmt.value
-            if not isinstance(call.func, ast.Name):
-                raise ValueError("Only direct function calls are allowed in action script")
-            name = str(call.func.id or "").strip()
-            if name not in ACTION_SCRIPT_FUNCTIONS:
-                raise ValueError(f"Unsupported action function: {name}")
-            if call.keywords:
-                raise ValueError(f"Keyword arguments are not supported for {name}()")
-            try:
-                args = [ast.literal_eval(arg) for arg in call.args]
-            except Exception as e:
-                raise ValueError(f"Failed to parse arguments for {name}(): {e}") from e
-            actions.append({"name": name, "args": args, "source": ast.unparse(stmt).strip()})
+        call_nodes = sorted(
+            (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+            key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
+        )
+        for call in call_nodes:
+            name = ""
+            if isinstance(call.func, ast.Name):
+                candidate = str(call.func.id or "").strip()
+                if candidate in ACTION_SCRIPT_FUNCTIONS:
+                    name = candidate
+            elif (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "subprocess"
+                and call.func.attr == "run"
+            ):
+                name = "subprocess.run"
 
-        if not actions:
-            raise ValueError("Action script must contain at least one function call")
+            if not name:
+                continue
+
+            try:
+                args, kwargs = self._parse_call_args(call)
+            except Exception:
+                args, kwargs = [], {}
+            source = ast.get_source_segment(code, call) or ast.unparse(call).strip()
+            actions.append({"name": name, "args": args, "kwargs": kwargs, "source": source})
+
         return actions
 
     def _zero_usage_entry(self) -> Dict[str, float]:
@@ -3092,12 +3271,17 @@ class HiSA:
                 f"no_visible_change after {wait_elapsed:.1f}s"
                 if not env_changed else ""
             )
-            step_abstraction_summary = self._step_abstraction(
+            step_abstraction_result = self._step_abstraction(
                 before_screenshot, after_screenshot, eval_desc,
                 blocked_hint=blocked_hint,
-                wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                wo_roi=self.wo_roi, roi_margin=self.roi_margin,
+                execution_context={
+                    "type": "gui",
+                    "code": final_code,
+                    "status": "success" if env_changed else "timeout",
+                },
             )
-            step_abstraction_summary = "Result: " + step_abstraction_summary
+            step_abstraction_summary = "Result: " + step_abstraction_result
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
@@ -3235,8 +3419,8 @@ class HiSA:
 
     def _step_abstraction(self, before_screenshot: Optional[bytes], after_screenshot: Optional[bytes],
             action_description: str, blocked_hint: str = "", wo_roi: bool = False,
-            roi_margin: int = 50, bash_context: Optional[Dict[str, Any]] = None) -> str:
-        """Abstract step from GUI screenshots or bash execution observations.
+            roi_margin: int = 50, execution_context: Optional[Dict[str, Any]] = None) -> str:
+        """Abstract step from execution observations.
 
         Args:
             before_screenshot: Screenshot before action
@@ -3244,7 +3428,7 @@ class HiSA:
             action_description: Description of the action performed
             wo_roi: If True, disable ROI cropping (default: False means ROI cropping is enabled)
             roi_margin: Margin to add around ROI when cropping (default: 50)
-            bash_context: Optional bash execution payload for non-GUI steps
+            execution_context: Optional execution payload for non-GUI or mixed-output steps
 
         Returns:
             Concise summary string.
@@ -3254,24 +3438,36 @@ class HiSA:
                 action_description=action_description,
                 blocked_hint=blocked_hint if blocked_hint else "None",
             )
-            if bash_context is not None:
-                messages = [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Bash execution observations:\n"
-                            f"Command:\n{bash_context.get('code', '')}\n\n"
-                            f"Status: {bash_context.get('status', '')}\n"
-                            f"Exit code: {bash_context.get('exitcode', '')}\n\n"
-                            f"Output:\n{bash_context.get('logs', '')}\n\n"
-                            f"{prompt}"
-                        ),
-                    }
-                ]
-            else:
-                if before_screenshot is None or after_screenshot is None:
-                    raise ValueError("GUI step abstraction requires before and after screenshots")
+            observation_lines: List[str] = []
+            if execution_context:
+                context_type = str(execution_context.get("type", "execution") or "execution")
+                observation_lines.append(f"Execution type: {context_type}")
+                code_text = str(execution_context.get("code", "") or "").strip()
+                if code_text:
+                    observation_lines.append(f"Code or command:\n{code_text}")
+                status_text = str(execution_context.get("status", "") or "").strip()
+                if status_text:
+                    observation_lines.append(f"Status: {status_text}")
+                exitcode = execution_context.get("exitcode", None)
+                if exitcode not in (None, ""):
+                    observation_lines.append(f"Exit code: {exitcode}")
+                stdout_text = str(execution_context.get("stdout", "") or "").strip()
+                if stdout_text:
+                    observation_lines.append(f"stdout:\n{stdout_text}")
+                stderr_text = str(execution_context.get("stderr", "") or "").strip()
+                if stderr_text:
+                    observation_lines.append(f"stderr:\n{stderr_text}")
+                logs_text = str(execution_context.get("logs", "") or "").strip()
+                if logs_text:
+                    observation_lines.append(f"Output:\n{logs_text}")
 
+            include_screenshots = (
+                before_screenshot is not None
+                and after_screenshot is not None
+                and self._screenshots_meaningfully_different(before_screenshot, after_screenshot)
+            )
+
+            if include_screenshots:
                 before_img = Image.open(io.BytesIO(before_screenshot))
                 after_img = Image.open(io.BytesIO(after_screenshot))
 
@@ -3309,16 +3505,24 @@ class HiSA:
                 before_b64 = base64.b64encode(before_buffer.getvalue()).decode("utf-8")
                 after_b64 = base64.b64encode(after_buffer.getvalue()).decode("utf-8")
 
+                content: List[Dict[str, str]] = []
+                if observation_lines:
+                    content.append({"type": "input_text", "text": "Execution observations:\n" + "\n\n".join(observation_lines)})
+                content.extend([
+                    {"type": "input_text", "text": "Before screenshot:"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{before_b64}"},
+                    {"type": "input_text", "text": "After screenshot:"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{after_b64}"},
+                    {"type": "input_text", "text": prompt},
+                ])
+                messages = [{"role": "user", "content": content}]
+            else:
+                if not observation_lines:
+                    observation_lines.append("No meaningful screenshot change was observed.")
                 messages = [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "Before screenshot:"},
-                            {"type": "input_image", "image_url": f"data:image/png;base64,{before_b64}"},
-                            {"type": "input_text", "text": "After screenshot:"},
-                            {"type": "input_image", "image_url": f"data:image/png;base64,{after_b64}"},
-                            {"type": "input_text", "text": prompt}
-                        ]
+                        "content": "Execution observations:\n" + "\n\n".join(observation_lines) + "\n\n" + prompt,
                     }
                 ]
 
@@ -3399,19 +3603,20 @@ except subprocess.TimeoutExpired as e:
             blocked_hint = ""
             if exitcode != 0 or status != "success":
                 blocked_hint = logs or f"exitcode={exitcode}"
-            step_abstraction_summary = self._step_abstraction(
+            step_abstraction_result = self._step_abstraction(
                 before_screenshot=None,
                 after_screenshot=None,
                 action_description=f"Bash command: {code}",
                 blocked_hint=blocked_hint,
-                bash_context={
+                execution_context={
+                    "type": "bash_execution",
                     "code": code,
                     "logs": logs,
                     "status": status,
                     "exitcode": exitcode,
                 },
             )
-            step_abstraction_summary = "Result: " + step_abstraction_summary
+            step_abstraction_summary = "Result: " + step_abstraction_result
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract summary
@@ -3533,6 +3738,183 @@ except subprocess.TimeoutExpired as e:
             # Return execution result text for wo_step mode
             return f"Bash Command: {code}\nStatus: Failed\nError: {str(e)}"
 
+    def _subprocess_run_execution(self, args: List[Any], kwargs: Dict[str, Any], return_completed_process: bool = False):
+        command = args[0]
+        shell = bool(kwargs.get("shell", isinstance(command, str)))
+        timeout = kwargs.get("timeout", self.bash_timeout)
+        cwd = kwargs.get("cwd", self.bash_working_dir)
+        capture_output = bool(kwargs.get("capture_output", True))
+        text_mode = bool(kwargs.get("text", True))
+        check = bool(kwargs.get("check", False))
+        command_repr = command if isinstance(command, str) else list(command)
+        command_text = f"subprocess.run({command_repr!r})"
+        action_fingerprint = self._hash_text(
+            f"{command_repr}|shell={shell}|timeout={timeout}|cwd={cwd}|capture_output={capture_output}|text={text_mode}|check={check}"
+        )
+        self.logger.info(f"[subprocess.run] {command_text}")
+
+        step_start_time = time.time()
+        step = self.current_step_id or (self.operation_count + 1)
+
+        try:
+            py_wrapper = f"""
+import subprocess
+import sys
+import os
+
+command = {json.dumps(command)}
+working_dir = os.path.expanduser({json.dumps(cwd)})
+if not os.path.isdir(working_dir):
+    working_dir = os.path.expanduser("~")
+env = os.environ.copy()
+env.setdefault("HOME", os.path.expanduser("~"))
+env["SHELL"] = "/bin/bash"
+env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+result = subprocess.run(
+    command,
+    shell={repr(shell)},
+    stdout=subprocess.PIPE if {repr(capture_output)} else None,
+    stderr=subprocess.STDOUT if {repr(capture_output)} else None,
+    text={repr(text_mode)},
+    timeout={repr(timeout)},
+    cwd=working_dir,
+    env=env,
+    check=False,
+)
+output = result.stdout if result.stdout is not None else ""
+sys.stdout.write(output)
+sys.exit(result.returncode)
+"""
+            output_dict = self.env.controller.run_python_script(py_wrapper) or {}
+            status = output_dict.get("status", "error")
+            exitcode = output_dict.get("return_code", 1)
+            logs = output_dict.get("output", "")
+            if not logs and output_dict.get("message"):
+                logs = output_dict.get("message", "")
+            if status != "success" and output_dict.get("error"):
+                logs = (logs + "\n" + output_dict.get("error", "")).strip()
+
+            if check and exitcode != 0:
+                status = "error"
+
+            before_screenshot = self.env.controller.get_screenshot()
+            after_screenshot, env_changed, wait_elapsed = self._wait_for_environment_change(
+                before_screenshot,
+                timeout_seconds=self.post_action_wait_timeout,
+            )
+            screenshot_file = f"step_{step}.png"
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(after_screenshot)
+
+            blocked_hint = ""
+            if exitcode != 0 or status != "success":
+                blocked_hint = logs or f"exitcode={exitcode}"
+            step_abstraction_result = self._step_abstraction(
+                before_screenshot=None,
+                after_screenshot=None,
+                action_description=command_text,
+                blocked_hint=blocked_hint,
+                execution_context={
+                    "type": "subprocess.run",
+                    "code": command_text,
+                    "logs": logs,
+                    "status": status,
+                    "exitcode": exitcode,
+                },
+            )
+            step_abstraction_summary = "Result: " + step_abstraction_result
+            self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
+
+            step_time = time.time() - step_start_time
+            result_fingerprint = self._hash_text(
+                f"status={status}|exitcode={exitcode}|output={logs}|wait={'changed' if env_changed else 'timeout'}"
+            )
+            success = exitcode == 0 and status == "success"
+            self.action_logs.append({
+                "step": step,
+                "type": "subprocess_execution",
+                "execution_success": success,
+                "screenshot": screenshot_file,
+                "detail": command_text,
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="subprocess_execution",
+                    success=success,
+                    detail=command_text,
+                    verification=(
+                        (step_abstraction_summary.replace("Result: ", "") + f" Wait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s.")
+                        if step_abstraction_summary else f"exitcode={exitcode}; wait={'changed' if env_changed else 'timeout'} after {wait_elapsed:.1f}s"
+                    ),
+                    next_hint="Use the command output to decide whether GUI verification is still needed."
+                ),
+                "step_time": round(step_time, 2),
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": action_fingerprint,
+                "loop_result_fingerprint": result_fingerprint,
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"exitcode={exitcode}|output={logs}"
+                ),
+            })
+            if not success:
+                self.last_blocked_feedback_event = {
+                    "type": "tool_execution_failed",
+                    "detail": logs or f"exitcode={exitcode}",
+                }
+
+            status_str = "Success" if success else "Failed"
+            result_text = f"{command_text}\nStatus: {status_str}\nWait: {'changed' if env_changed else 'timeout/no visible change'} after {wait_elapsed:.1f}s\nOutput:\n{logs}"
+            completed_process = py_subprocess.CompletedProcess(
+                args=command_repr,
+                returncode=exitcode,
+                stdout=logs if capture_output else None,
+                stderr=None,
+            )
+            if return_completed_process:
+                return result_text, completed_process
+            return result_text
+        except Exception as e:
+            self.logger.error(f"subprocess.run execution error: {e}")
+            screenshot = self.env.controller.get_screenshot()
+            screenshot_file = f"step_{step}.png"
+            with open(os.path.join(self.operations_dir, screenshot_file), "wb") as f:
+                f.write(screenshot)
+
+            self.action_logs.append({
+                "step": step,
+                "type": "subprocess_execution",
+                "execution_success": False,
+                "screenshot": screenshot_file,
+                "detail": command_text,
+                "execution_status": "blocked",
+                "blocking_reason": "progress_stall",
+                "compact": self._build_compact_log_entry(
+                    step=step,
+                    tool_type="subprocess_execution",
+                    success=False,
+                    detail=command_text,
+                    verification=f"Error: {str(e)}",
+                    next_hint="Fix the subprocess.run call instead of repeating the same failing command."
+                ),
+                "token_usage": self.step_token_usage,
+                "loop_action_fingerprint": action_fingerprint,
+                "loop_result_fingerprint": self._hash_text(f"error={str(e)}"),
+                "decision_action_fingerprint": self.current_decision_action_fingerprint,
+                "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
+                "decision_result_fingerprint": self._hash_text(
+                    f"status=blocked|subprocess_error={str(e)}|code={command_text}"
+                ),
+            })
+            self.last_blocked_feedback_event = {
+                "type": "tool_execution_failed",
+                "detail": str(e),
+            }
+            result_text = f"{command_text}\nStatus: Failed\nError: {str(e)}"
+            if return_completed_process:
+                raise
+            return result_text
+
     def _wait(self) -> str:
         """Wait until the environment changes or timeout is reached."""
         wait_timeout = self.explicit_wait_timeout
@@ -3559,13 +3941,17 @@ except subprocess.TimeoutExpired as e:
                 f"wait timed out after {wait_elapsed:.1f}s"
                 if not env_changed else ""
             )
-            step_abstraction_summary = self._step_abstraction(
+            step_abstraction_result = self._step_abstraction(
                 before_screenshot, after_screenshot,
                 f"Waited until the environment changed or timed out after {wait_timeout:.1f} seconds",
                 blocked_hint=blocked_hint,
-                wo_roi=self.wo_roi, roi_margin=self.roi_margin
+                wo_roi=self.wo_roi, roi_margin=self.roi_margin,
+                execution_context={
+                    "type": "wait",
+                    "status": "changed" if env_changed else "timeout",
+                },
             )
-            step_abstraction_summary = "Result: " + step_abstraction_summary
+            step_abstraction_summary = "Result: " + step_abstraction_result
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
