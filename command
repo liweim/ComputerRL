@@ -149,7 +149,7 @@ python run_hisa1.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa1_qwen3.5-9b_subgoal_wo_pattern \
+  --result_dir ./results/hisa1_qwen3.5-9b_subgoal_wo_pattern_judge \
   --headless \
   --max_steps 100 \
   --wo_pattern \

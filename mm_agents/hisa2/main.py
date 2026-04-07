@@ -88,7 +88,9 @@ Response format:
 
 Field guide:
 - `thought`: brief reasoning about the next action, including key evidence from the screenshot or recent history when useful.
-- `subgoal`: the current phase-level objective you are working on; it should describe a meaningful stage of work, not a single low-level action. Good `subgoal` examples: `Locate the target file`, `Edit the requested fields`, `Verify the final output`. Bad `subgoal` examples: `Click the button`, `Press Enter`. Keep the same `subgoal` across multiple actions when they belong to the same stage. Change `subgoal` only when you intentionally move to a new stage or strategy.
+- `subgoal`: a phase-level objective, not a single action. Use `continue` if the next action is still pursuing the current subgoal. Otherwise provide a new phase-level objective.
+- Good: `Open Chrome settings`, `Configure the default search engine`, `Verify the final result`.
+- Bad: `Click Settings`, `Type the filename`, `Press Enter`, `Scroll down`.
 - `code`: Python-style action script to execute next. Use one function call per line. Actions run in order, and each action gets a fresh observation before the next action is grounded.
 
 Code guide:
@@ -139,34 +141,22 @@ Please provide a valid JSON response in the exact format:
 
 Important:
 - Always include `subgoal`
+- Use `subgoal: "continue"` when staying on the same subgoal
+- Otherwise `subgoal` must be a stage goal, not a single click or keystroke
 - `code` must be Python-style action calls using only the allowed functions
 - Every string argument in `code` must be a valid quoted Python string literal
 - `scroll(...)` must have exactly two arguments: description string and integer amount in `[-10, 10]`"""
 
-STEP_ABSTRACTION_PROMPT = """Judge the latest executed step using the provided observations.
+STEP_ABSTRACTION_PROMPT = """Compare the latest observations and summarize what happened in 1-2 concise sentences.
 
-Previous current subgoal: {previous_subgoal}
-Proposed subgoal for this step: {proposed_subgoal}
 Action: {action_description}
 Blocked hint: {blocked_hint}
 
-Return JSON:
-{{
-  "summary": "1-2 sentence concise UI/result summary",
-  "subgoal_status": "continue|done|blocked"
-}}
-
 Rules:
-- The current step always belongs to the proposed subgoal.
-- If the proposed subgoal differs from the previous current subgoal, this step is already part of the new subgoal.
-- Judge the status from the actual result shown in the provided observations.
-- `continue`: the step made progress but the proposed subgoal still needs more work.
-- `done`: use only if the observations show that the proposed subgoal itself has been achieved.
-- `done` requires that all requirements stated in the proposed subgoal are satisfied, not just a partial or intermediate part of it.
-- `blocked`: the step failed to make reliable progress, timed out, or hit a blocking issue.
-- Do not use `done` just because the next target became visible, a prerequisite was prepared, or the UI moved closer to the goal.
-- If the step only revealed the next target or created a prerequisite state, use `continue`.
-- Keep `summary` concise and concrete.
+- Describe what changed, or say no visible change.
+- Mention clear errors if shown.
+- Do not judge subgoal status or long-horizon task completion.
+- Keep the summary concise and concrete.
 """
 
 FINAL_VERIFICATION_PROMPT = """Decide whether the GUI task is fully completed.
@@ -902,7 +892,7 @@ class HiSA:
         self.consecutive_stuck_subgoals = 0
         self.awaiting_final_verification = False
         self.final_verification_observed = False
-        self.last_decision_subgoal_status = "continue"
+        self.last_execution_status = "continue"
         self.last_blocked_feedback_event = None
         self.last_blocked_feedback = None
         self.last_error_feedback = None
@@ -1120,23 +1110,33 @@ class HiSA:
             raise ValueError("Subgoal cannot be empty")
         return text
 
-    def _normalize_subgoal_status(self, value: str) -> str:
+    def _normalize_execution_status(self, value: str) -> str:
         status = re.sub(r"\s+", " ", str(value or "").strip().lower())
-        if status not in {"continue", "done", "blocked"}:
+        if status not in {"continue", "done", "blocked", "finish"}:
             return "continue"
         return status
 
-    def _parse_abstraction_payload(self, raw_text: str) -> Dict[str, str]:
-        parsed = json.loads(repair_json(raw_text))
-        summary = re.sub(r"\s+", " ", str(parsed.get("summary", "") or "").strip())
-        if not summary:
-            raise ValueError("Abstraction response missing non-empty 'summary'")
-        if "subgoal_status" not in parsed:
-            raise ValueError("Abstraction response missing 'subgoal_status'")
-        return {
-            "summary": summary,
-            "subgoal_status": self._normalize_subgoal_status(parsed["subgoal_status"]),
-        }
+    def _resolve_planner_subgoal(self, value: str, code: str = "") -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            raise ValueError("Subgoal cannot be empty")
+        if text.lower() == "continue":
+            if "termination(" in str(code or ""):
+                return self.current_subgoal or "Verify task completion"
+            if not self.current_subgoal:
+                raise ValueError("subgoal='continue' is invalid before an initial subgoal is established")
+            return self.current_subgoal
+        return self._normalize_subgoal(text)
+
+    def _normalize_blocking_reason(self, value: str) -> str:
+        reason = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if reason not in {"behavior_loop", "progress_stall"}:
+            return ""
+        return reason
+
+    def _parse_abstraction_payload(self, raw_text: str) -> str:
+        summary = re.sub(r"\s+", " ", str(raw_text or "").strip())
+        return summary or "Step abstraction failed due to error."
 
     def _build_subgoal_context_lines(self) -> List[str]:
         lines = []
@@ -1245,8 +1245,10 @@ class HiSA:
         ]
         if log.get("subgoal"):
             parts.append(f"subgoal={log.get('subgoal')}")
-        if log.get("subgoal_status"):
-            parts.append(f"subgoal_status={log.get('subgoal_status')}")
+        if log.get("execution_status"):
+            parts.append(f"execution_status={log.get('execution_status')}")
+        if log.get("blocking_reason"):
+            parts.append(f"blocking_reason={log.get('blocking_reason')}")
         detail = log.get("detail") or compact.get("detail") or ""
         if detail:
             parts.append(f"detail={detail}")
@@ -1264,13 +1266,9 @@ class HiSA:
             return
 
         logs_since_last_refinement = total_logs - int(getattr(self, "last_refinement_log_count", 0) or 0)
-        should_refine = False
-        if reason in {"subgoal_done", "subgoal_blocked"} and logs_since_last_refinement > 3:
-            should_refine = True
-        elif total_logs % max(1, self.refine_period) == 0:
-            should_refine = True
-
-        if not should_refine:
+        if logs_since_last_refinement <= 3:
+            return
+        if reason not in {"done", "blocked"}:
             return
 
         if self.last_full_summary:
@@ -1298,24 +1296,47 @@ class HiSA:
             self.conversation_messages = []
             self.last_tool_output = None
 
+    def _derive_execution_status(self, decision: Dict) -> Tuple[str, str]:
+        proposed_subgoal = self._normalize_subgoal(decision.get("subgoal", ""))
+        latest_log = self.action_logs[-1] if self.action_logs else {}
+        verified = str((latest_log.get("compact") or {}).get("verified", "") or "").lower()
+        if decision.get("tool") == "termination":
+            return "finish", ""
+        if latest_log.get("execution_success") is False:
+            return "blocked", "progress_stall"
+        if "no visible change" in verified or "timeout/no visible change" in verified:
+            same_subgoal_logs = []
+            for log in reversed(self.action_logs):
+                if log.get("subgoal") and log.get("subgoal") != proposed_subgoal:
+                    break
+                same_subgoal_logs.append(log)
+            no_change_count = 0
+            for log in same_subgoal_logs:
+                log_verified = str((log.get("compact") or {}).get("verified", "") or "").lower()
+                if "no visible change" in log_verified or "timeout/no visible change" in log_verified:
+                    no_change_count += 1
+                else:
+                    break
+            if no_change_count >= 2:
+                return "blocked", "progress_stall"
+        if self.current_subgoal and proposed_subgoal != self.current_subgoal:
+            return "done", ""
+        return "continue", ""
+
     def _record_subgoal_transition(self, decision: Dict) -> str:
         proposed_subgoal = self._normalize_subgoal(decision.get("subgoal", ""))
         previous_subgoal = self.current_subgoal
-        latest_log = self.action_logs[-1] if self.action_logs else {}
-        status = self._normalize_subgoal_status(latest_log.get("subgoal_status", "continue"))
-        decision["subgoal_status"] = status
-        self.logger.info(
-            "[subgoal_status] previous=%s | proposed=%s | derived=%s",
-            previous_subgoal if previous_subgoal else "None",
-            proposed_subgoal,
-            status,
-        )
-
+        status = self._normalize_execution_status(decision.get("execution_status", "continue"))
+        blocking_reason = self._normalize_blocking_reason(decision.get("blocking_reason", ""))
         if self.action_logs:
             self.action_logs[-1]["subgoal"] = proposed_subgoal
-            self.action_logs[-1]["subgoal_status"] = status
+            self.action_logs[-1]["execution_status"] = status
+            if blocking_reason:
+                self.action_logs[-1]["blocking_reason"] = blocking_reason
+            else:
+                self.action_logs[-1].pop("blocking_reason", None)
 
-        self.last_decision_subgoal_status = status
+        self.last_execution_status = status
 
         if status == "blocked":
             self.consecutive_stuck_subgoals += 1
@@ -1327,8 +1348,6 @@ class HiSA:
         elif proposed_subgoal != previous_subgoal:
             self.current_subgoal = proposed_subgoal
 
-        if status in {"done", "blocked"}:
-            self.last_refinement_log_count = len(self.action_logs)
         return status
 
     def _build_termination_guard_feedback(self) -> str:
@@ -1865,7 +1884,7 @@ class HiSA:
         self.consecutive_stuck_subgoals = 0
         self.awaiting_final_verification = False
         self.final_verification_observed = False
-        self.last_decision_subgoal_status = "continue"
+        self.last_execution_status = "continue"
         self.last_blocked_feedback_event = None
         self.last_blocked_feedback = None
         self.last_error_feedback = None
@@ -2006,6 +2025,8 @@ class HiSA:
                         "type": "termination",
                         "execution_success": True,
                         "screenshot": screenshot_file,
+                        "subgoal": self.current_subgoal or "Verify task completion",
+                        "execution_status": "finish",
                         "detail": terminal_message or "Task completed.",
                         "compact": self._build_compact_log_entry(
                             step=step,
@@ -2210,12 +2231,11 @@ class HiSA:
 
                 if "subgoal" not in decision:
                     raise ValueError("Missing 'subgoal' field in decision")
-                decision["subgoal"] = self._normalize_subgoal(decision["subgoal"])
-
                 if "code" not in decision:
                     raise ValueError("Missing 'code' field in decision")
                 if not isinstance(decision.get("code"), str) or not decision["code"].strip():
                     raise ValueError("Decision 'code' must be a non-empty string")
+                decision["subgoal"] = self._resolve_planner_subgoal(decision["subgoal"], decision["code"])
                 self._parse_action_script(decision["code"])
 
                 try:
@@ -2383,13 +2403,23 @@ class HiSA:
             self._patch_latest_step_token_usage(self.current_step_id or (self.operation_count + 1), step_token_usage)
             self.step_token_usage = step_token_usage
 
+            derived_status, blocking_reason = self._derive_execution_status(decision)
+            decision["execution_status"] = derived_status
+            if blocking_reason:
+                decision["blocking_reason"] = blocking_reason
+            else:
+                decision.pop("blocking_reason", None)
+            if blocking_reason:
+                self.logger.info("[execution_status] step=%s status=%s blocking_reason=%s subgoal=%s", self.current_step_id or (self.operation_count + 1), derived_status, blocking_reason, decision.get("subgoal", ""))
+            else:
+                self.logger.info("[execution_status] step=%s status=%s subgoal=%s", self.current_step_id or (self.operation_count + 1), derived_status, decision.get("subgoal", ""))
             status = self._record_subgoal_transition(decision)
             if self.awaiting_final_verification:
                 self.final_verification_observed = True
             if status == "done":
-                self._maybe_refine_context("subgoal_done")
+                self._maybe_refine_context("done")
             elif status == "blocked":
-                self._maybe_refine_context("subgoal_blocked")
+                self._maybe_refine_context("blocked")
             if self.last_blocked_feedback_event:
                 event_type = self.last_blocked_feedback_event.get("type", "")
                 event_detail = self.last_blocked_feedback_event.get("detail", "")
@@ -3024,13 +3054,12 @@ class HiSA:
                 f"no_visible_change after {wait_elapsed:.1f}s"
                 if not env_changed else ""
             )
-            step_abstraction_result = self._step_abstraction(
+            step_abstraction_summary = self._step_abstraction(
                 before_screenshot, after_screenshot, eval_desc,
                 blocked_hint=blocked_hint,
                 wo_roi=self.wo_roi, roi_margin=self.roi_margin
             )
-            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
-            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            step_abstraction_summary = "Result: " + step_abstraction_summary
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
@@ -3069,7 +3098,6 @@ class HiSA:
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "detail": description or str(final_code),
-                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type=tool,
@@ -3088,7 +3116,7 @@ class HiSA:
                 "decision_action_fingerprint": self.current_decision_action_fingerprint,
                 "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
                 "decision_result_fingerprint": self._hash_text(
-                    f"status={step_subgoal_status}|env_changed={env_changed}|detail={description or final_code}"
+                    f"env_changed={env_changed}|detail={description or final_code}"
                 ),
             })
             if not env_changed:
@@ -3136,7 +3164,8 @@ class HiSA:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "detail": description or str(code),
-                "subgoal_status": "blocked",
+                "execution_status": "blocked",
+                "blocking_reason": "progress_stall",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type=tool,
@@ -3168,7 +3197,7 @@ class HiSA:
 
     def _step_abstraction(self, before_screenshot: Optional[bytes], after_screenshot: Optional[bytes],
             action_description: str, blocked_hint: str = "", wo_roi: bool = False,
-            roi_margin: int = 50, bash_context: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+            roi_margin: int = 50, bash_context: Optional[Dict[str, Any]] = None) -> str:
         """Abstract step from GUI screenshots or bash execution observations.
 
         Args:
@@ -3180,12 +3209,10 @@ class HiSA:
             bash_context: Optional bash execution payload for non-GUI steps
 
         Returns:
-            Dict with summary and subgoal_status.
+            Concise summary string.
         """
         try:
             prompt = STEP_ABSTRACTION_PROMPT.format(
-                previous_subgoal=self.current_subgoal if self.current_subgoal else "None",
-                proposed_subgoal=self.current_proposed_subgoal if self.current_proposed_subgoal else "None",
                 action_description=action_description,
                 blocked_hint=blocked_hint if blocked_hint else "None",
             )
@@ -3334,7 +3361,7 @@ except subprocess.TimeoutExpired as e:
             blocked_hint = ""
             if exitcode != 0 or status != "success":
                 blocked_hint = logs or f"exitcode={exitcode}"
-            step_abstraction_result = self._step_abstraction(
+            step_abstraction_summary = self._step_abstraction(
                 before_screenshot=None,
                 after_screenshot=None,
                 action_description=f"Bash command: {code}",
@@ -3346,8 +3373,7 @@ except subprocess.TimeoutExpired as e:
                     "exitcode": exitcode,
                 },
             )
-            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
-            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            step_abstraction_summary = "Result: " + step_abstraction_summary
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract summary
@@ -3384,7 +3410,6 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": exitcode == 0 and status == "success",
                 "screenshot": screenshot_file,
                 "detail": code,
-                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
@@ -3403,7 +3428,7 @@ except subprocess.TimeoutExpired as e:
                 "decision_action_fingerprint": self.current_decision_action_fingerprint,
                 "decision_gui_fingerprint": self.current_decision_gui_fingerprint,
                 "decision_result_fingerprint": self._hash_text(
-                    f"status={step_subgoal_status}|exitcode={exitcode}|output={logs}"
+                    f"exitcode={exitcode}|output={logs}"
                 ),
             })
             if exitcode != 0 or status != "success":
@@ -3443,7 +3468,8 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file,
                 "detail": code,
-                "subgoal_status": "blocked",
+                "execution_status": "blocked",
+                "blocking_reason": "progress_stall",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="bash_execution",
@@ -3495,14 +3521,13 @@ except subprocess.TimeoutExpired as e:
                 f"wait timed out after {wait_elapsed:.1f}s"
                 if not env_changed else ""
             )
-            step_abstraction_result = self._step_abstraction(
+            step_abstraction_summary = self._step_abstraction(
                 before_screenshot, after_screenshot,
                 f"Waited until the environment changed or timed out after {wait_timeout:.1f} seconds",
                 blocked_hint=blocked_hint,
                 wo_roi=self.wo_roi, roi_margin=self.roi_margin
             )
-            step_abstraction_summary = "Result: " + step_abstraction_result["summary"]
-            step_subgoal_status = step_abstraction_result["subgoal_status"]
+            step_abstraction_summary = "Result: " + step_abstraction_summary
             self.logger.info(f"[step_abstraction] Step {step}: {step_abstraction_summary}")
 
             # Generate step_abstract
@@ -3527,7 +3552,6 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": True,
                 "screenshot": screenshot_file,
                 "detail": f"event-driven wait ({'changed' if env_changed else 'timeout'})",
-                "subgoal_status": step_subgoal_status,
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",
@@ -3574,7 +3598,8 @@ except subprocess.TimeoutExpired as e:
                 "execution_success": False,
                 "screenshot": screenshot_file if 'screenshot_file' in locals() else "",
                 "detail": "event-driven wait failed",
-                "subgoal_status": "blocked",
+                "execution_status": "blocked",
+                "blocking_reason": "progress_stall",
                 "compact": self._build_compact_log_entry(
                     step=step,
                     tool_type="wait",

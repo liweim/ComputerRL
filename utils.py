@@ -677,10 +677,11 @@ if __name__ == "__main__":
     # summary('results/hisa_qwen3.5-9b_wo_step_refinement_pattern', 'evaluation_examples/test_medium.json')
     # summary('results/hisa_qwen3.5-9b_wo_refinement_pattern', 'evaluation_examples/test_medium.json')
     # summary('results/hisa_qwen3.5-9b_wo_pattern', 'evaluation_examples/test_medium.json')
-    summary('results/hisa_qwen3.5-9b_wo_pattern_2', 'evaluation_examples/test_medium.json')
+    # summary('results/hisa_qwen3.5-9b_wo_pattern_2_rerun', 'evaluation_examples/test_medium.json')
+    summary('results/hisa_qwen3.5-9b_wo_pattern_2_T2', 'evaluation_examples/test_few.json')
     # summary('results/hisa_qwen3.5-9b', 'evaluation_examples/test_medium.json')
     # summary('results/hisa2_qwen3.5-9b', 'evaluation_examples/debug.json')
     # summary('results/hisa2_qwen3.5-9b_exp', 'evaluation_examples/debug.json')
-    summary('results/hisa1_qwen3.5-9b_subgoal_wo_pattern', 'evaluation_examples/test_medium.json')
+    # summary('results/hisa1_qwen3.5-9b_subgoal_wo_pattern_judge', 'evaluation_examples/test_medium.json')
     
     # compare_results(['hisa_qwen3.5-9b_wo_pattern', 'hisa1_qwen3.5-9b_subgoal_wo_pattern'])
