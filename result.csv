@@ -1,46 +1,40 @@
-OSWorld/small (39),,,,,,,,,
-Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step
-CoACT,,58.86,,,,,,,
-langgraph_o4mini_cua_50,,53.86,0.17,95.89,,,,,
-hisa_gpt5_gta1_50,,51.25,0.25,112.67,,,9.26,800.51,86.48
-hisa_wo_pattern,43.56,43.56,0.00,61.10,59.30,1.80,14.51,250.62,17.27
-computerRL_baseline,48.683,48.683,0.000,113.243,111.128,2.116,16.872,230.335,14.98
-computerRL_gta1-7b_restart,43.55,43.55,0.00,46.96,45.73,1.23,8.33,208.72,
-computerRL_gta1-7b_restart_ori_res,41.03,41.03,0.00,79.39,77.61,1.78,10.72,254.43,
-hisa_qwen3.5-9b_wo_step_refinement_pattern_think,53.76,53.76,0.00,258.03,250.32,7.71,24.03,419.25,
-,,,,,,,,,
-OSWorld/few (33),,,,,,,,,
-hisa_qwen3.5-9b_wo_pattern,48.19,48.19,0.00,167.26,155.24,12.02,25.79,485.72,
-hisa_qwen3.5-9b_wo_pattern_2_T4,42.42,39.39,0.00,135.56,125.94,9.62,20.09,433.06,
-hisa_qwen3.5-9b_wo_pattern_3_T4,36.36,36.36,0.00,201.88,186.59,15.28,30.79,590.36,
-hisa_qwen3.5-9b_wo_pattern_4_T4,30.30,30.30,0.00,176.87,164.19,12.69,27.67,521.40,
-hisa_qwen3.5-9b_wo_pattern_2_T2,30.01,30.01,0.00,179.49,166.23,13.26,26.97,521.39,
-hisa2_qwen3.5-9b,33.04,33.04,0.00,232.79,220.36,12.42,27.87,383.32,
+Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s
+OSWorld/few (33),,,,,,,,
+hisa_qwen3.5-9b_wo_pattern,48.19,48.19,0.00,167.26,155.24,12.02,25.79,485.72
+hisa_qwen3.5-9b_wo_pattern_2_T4,42.42,39.39,0.00,135.56,125.94,9.62,20.09,433.06
+hisa_qwen3.5-9b_wo_pattern_3_T4,36.36,36.36,0.00,201.88,186.59,15.28,30.79,590.36
+hisa_qwen3.5-9b_wo_pattern_4_T4,30.30,30.30,0.00,176.87,164.19,12.69,27.67,521.40
+hisa_qwen3.5-9b_wo_pattern_2_T2,30.01,30.01,0.00,179.49,166.23,13.26,26.97,521.39
+hisa_qwen3.5-9b_wo_pattern_3_T2,42.13,36.07,0.00,193.90,179.26,14.64,30.18,572.35
+hisa1_qwen3.5-9b_subgoal_wo_pattern_judge,36.07,36.07,0.00,186.78,173.65,13.13,27.97,548.82
+hisa1_qwen3.5-9b_subgoal_wo_pattern_judge_2,39.10,36.07,0.00,209.95,195.20,14.74,30.18,579.91
+hisa1_qwen3.5-9b_subgoal_wo_pattern_judge_2_rerun,51.22,48.19,0.00,149.47,139.34,10.13,20.67,402.24
+hisa2_qwen3.5-9b,33.04,33.04,0.00,232.79,220.36,12.42,27.87,383.32
+hisa2_qwen3.5-9b_wo_pattern_judge,33.04,30.01,0.00,162.38,152.96,9.42,24.71,308.62
+hisa2_qwen3.5-9b_wo_pattern_judge_rerun,48.19,45.16,0.00,170.77,161.43,9.34,24.59,294.59
+hisa3_qwen3.5-9b_wo_pattern_judge,29.48,29.48,0.00,193.68,181.96,11.72,23.91,404.17
 ,,,,,,,,,
 OSWorld/medium (111),,,,,,,,,
-Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step
-computerRL_baseline,40.54,40.54,0.00,83.33,81.75,1.58,14.25,203.47,14.98
-computerRL_gta1-7b_restart,29.73,29.73,0.00,58.02,56.51,1.50,11.08,228.58,
-computerRL_gta1-7b_restart_ori_res,40.54,40.54,0.00,63.84,62.21,1.63,12.62,244.37,
-computerRL_qwen3.5-9b_gta1-7b_restart,27.06,27.06,0.00,108.14,103.71,4.43,22.89,337.74,
-hisa_qwen3.5-9b_wo_step_refinement_pattern,40.59,39.69,0.00,178.37,172.68,5.69,17.62,315.25,
-hisa_qwen3.5-9b_wo_step_refinement_pattern_nothink,19.40,19.40,0.00,486.15,477.92,8.23,40.66,633.20,
-hisa_qwen3.5-9b_wo_refinement_pattern,44.65,44.65,0.00,134.26,124.87,9.38,20.06,399.56,
-hisa_qwen3.5-9b_wo_pattern_tool,29.49,26.92,0.00,255.22,185.83,69.39,30.13,1737.87,
-hisa_qwen3.5-9b_wo_pattern,48.42,47.52,0.00,142.86,132.73,10.12,21.92,422.6,
-hisa_qwen3.5-9b_wo_pattern_2_T4,40.32,39.42,0.00,133.23,124.02,9.22,20.13,428.08,
-hisa_qwen3.5-9b_wo_pattern_3_T4,36.63,35.73,0.00,172.00,159.78,12.21,26.42,510.85,
-hisa_qwen3.5-9b_wo_pattern_2_T2,29.66,29.66,0.00,137.62,127.85,9.77,20.83,404.94,
-hisa_qwen3.5-9b,49.19,47.39,0.00,166.16,153.31,12.85,23.75,494.56,
-hisa2_qwen3.5-9b,33.25,33.25,0.00,180.40,169.87,10.53,20.49,332.04,
-hisa1_qwen3.5-9b_subgoal_wo_pattern,32.37,30.57,0.00,174.51,162.55,11.95,24.47,474.92,
-hisa1_qwen3.5-9b_subgoal_wo_pattern_rerun,41.88,39.18,0.00,183.64,170.74,12.89,25.86,509.52,
-hisa1_qwen3.5-9b_subgoal_wo_pattern_judge,36.67,35.77,0.00,162.66,151.39,11.26,22.96,452.23,
+computerRL_baseline,40.54,40.54,0.00,83.33,81.75,1.58,14.25,203.47
+computerRL_gta1-7b_restart,29.73,29.73,0.00,58.02,56.51,1.50,11.08,228.58
+computerRL_gta1-7b_restart_ori_res,40.54,40.54,0.00,63.84,62.21,1.63,12.62,244.37
+computerRL_qwen3.5-9b_gta1-7b_restart,27.06,27.06,0.00,108.14,103.71,4.43,22.89,337.74
+hisa_qwen3.5-9b_wo_step_refinement_pattern,40.59,39.69,0.00,178.37,172.68,5.69,17.62,315.25
+hisa_qwen3.5-9b_wo_step_refinement_pattern_nothink,19.40,19.40,0.00,486.15,477.92,8.23,40.66,633.20
+hisa_qwen3.5-9b_wo_refinement_pattern,44.65,44.65,0.00,134.26,124.87,9.38,20.06,399.56
+hisa_qwen3.5-9b_wo_pattern_tool,29.49,26.92,0.00,255.22,185.83,69.39,30.13,1737.87
+hisa_qwen3.5-9b_wo_pattern,48.42,47.52,0.00,142.86,132.73,10.12,21.92,422.6
+hisa_qwen3.5-9b_wo_pattern_2_T4,40.32,39.42,0.00,133.23,124.02,9.22,20.13,428.08
+hisa_qwen3.5-9b_wo_pattern_3_T4,36.63,35.73,0.00,172.00,159.78,12.21,26.42,510.85
+hisa_qwen3.5-9b_wo_pattern_2_T2,29.66,29.66,0.00,137.62,127.85,9.77,20.83,404.94
+hisa_qwen3.5-9b,49.19,47.39,0.00,166.16,153.31,12.85,23.75,494.56
+hisa2_qwen3.5-9b,33.25,33.25,0.00,180.40,169.87,10.53,20.49,332.04
+hisa1_qwen3.5-9b_subgoal_wo_pattern,32.37,30.57,0.00,174.51,162.55,11.95,24.47,474.92
+hisa1_qwen3.5-9b_subgoal_wo_pattern_rerun,41.88,39.18,0.00,183.64,170.74,12.89,25.86,509.52
+hisa1_qwen3.5-9b_subgoal_wo_pattern_judge,36.67,35.77,0.00,162.66,151.39,11.26,22.96,452.23
 ,,,,,,,,,
 OSWorld/all (369),,,,,,,,,
-Method,Score_100/%,Score_50/%,Avg Cost/$,Avg Tokens/M,Avg Prompt Tokens/k,Avg Completion Tokens/k,Avg Step,Avg Time/s,Avg Time/Step
-computerRL_baseline,40.826,38.387,0.000,114.787,112.738,2.049,18.349,239.470,14.98
-computerRL_gta1-7b_restart,32.967,32.967,0.000,74.119,72.385,1.734,12.929,249.948,
-computerRL_gta1-7b_restart_ori_res,41.37,40.83,0.00,75.63,73.88,1.74,13.02,258.52,
-hisa_qwen3.5-9b_wo_pattern,47.41,46.60,0.00,140.23,130.51,9.72,21.27,409.25,
-,,,,,,,,,
+computerRL_baseline,40.826,38.387,0.000,114.787,112.738,2.049,18.349,239.470
+computerRL_gta1-7b_restart,32.967,32.967,0.000,74.119,72.385,1.734,12.929,249.948
+computerRL_gta1-7b_restart_ori_res,41.37,40.83,0.00,75.63,73.88,1.74,13.02,258.52
+hisa_qwen3.5-9b_wo_pattern,47.41,46.60,0.00,140.23,130.51,9.72,21.27,409.25

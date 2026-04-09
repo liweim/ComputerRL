@@ -76,7 +76,7 @@ python run_autoglm_v_restart.py \
     --screen_height 1080 \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_medium.json \
+    --test_all_meta_path ./evaluation_examples/test_few.json \
     > nohup.out 2>&1 &
 
 nohup \
@@ -93,7 +93,7 @@ python run_autoglm_v_restart.py \
     --visual_grounder_model gta1-7b \
     --headless \
     --max_steps 100 \
-    --test_all_meta_path ./evaluation_examples/test_medium.json \
+    --test_all_meta_path ./evaluation_examples/test_few.json \
     > nohup.out 2>&1 &
 
 nohup \
@@ -106,7 +106,7 @@ python run_hisa.py \
   --wo_step \
   --wo_refinement \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -118,7 +118,7 @@ python run_hisa.py \
   --max_steps 100 \
   --wo_refinement \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -141,7 +141,7 @@ python run_hisa.py \
   --result_dir ./results/hisa_qwen3.5-9b \
   --headless \
   --max_steps 100 \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -149,23 +149,23 @@ python run_hisa1.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa1_qwen3.5-9b_subgoal_wo_pattern_judge \
+  --result_dir ./results/hisa1_qwen3.5-9b_subgoal_wo_pattern_judge_2 \
   --headless \
   --max_steps 100 \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_medium.json \
-  > nohup.out 2>&1 &
+  --test_all_meta_path ./evaluation_examples/test_few.json \
+  > nohup2.out 2>&1 &
 
 nohup \
 python run_hisa2.py \
   --provider_name docker \
   --vm_ram 8G \
   --path_to_vm /home/weimingli/projects/ubuntu_osworld/Ubuntu.qcow2 \
-  --result_dir ./results/hisa2_qwen3.5-9b_wo_pattern_judge \
+  --result_dir ./results/hisa2_qwen3.5-9b_wo_pattern_judge_rerun \
   --headless \
   --max_steps 100 \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_one.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup.out 2>&1 &
 
 nohup \
@@ -177,7 +177,7 @@ python run_hisa3.py \
   --headless \
   --max_steps 100 \
   --wo_pattern \
-  --test_all_meta_path ./evaluation_examples/test_one.json \
+  --test_all_meta_path ./evaluation_examples/test_few.json \
   > nohup2.out 2>&1 &
 
 # 杀进程
